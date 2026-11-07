@@ -1,0 +1,240 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:path_provider/path_provider.dart';
+import 'package:uuid/uuid.dart';
+
+import '../models/raven_project.dart';
+import 'audio_visibility_service.dart';
+
+class ProjectRepository {
+  ProjectRepository._(this._rootDirectory);
+
+  final Directory _rootDirectory;
+  final List<RavenProject> _projects = <RavenProject>[];
+  final Uuid _uuid = const Uuid();
+
+  List<RavenProject> get projects => List<RavenProject>.unmodifiable(_projects);
+  RavenProject? projectById(String id) {
+    for (final project in _projects) {
+      if (project.id == id) return project;
+    }
+    return null;
+  }
+  Directory get projectsDirectory => Directory('${_rootDirectory.path}/projects');
+
+  static Future<ProjectRepository> create() async {
+    final supportDirectory = await getApplicationSupportDirectory();
+    final ravenDirectory = Directory('${supportDirectory.path}/raven');
+    await ravenDirectory.create(recursive: true);
+    final repository = ProjectRepository._(ravenDirectory);
+    await repository.projectsDirectory.create(recursive: true);
+    await Directory('${ravenDirectory.path}/categories').create(recursive: true);
+    await repository.load();
+    return repository;
+  }
+
+  String newId() => _uuid.v4();
+
+  Future<Directory> createProjectDirectory(String projectId) async {
+    final directory = Directory('${projectsDirectory.path}/$projectId');
+    await directory.create(recursive: true);
+    for (final child in <String>['sessions', 'notes', 'attachments', 'exports', 'metadata']) {
+      await Directory('${directory.path}/$child').create(recursive: true);
+    }
+    return directory;
+  }
+
+  Future<void> load() async {
+    _projects.clear();
+    final indexFile = File('${_rootDirectory.path}/projects.json');
+    final backupFile = File('${_rootDirectory.path}/projects.json.bak');
+    final temporaryFile = File('${_rootDirectory.path}/projects.json.tmp');
+
+    // Try the primary index first, then the last known-good backup and the
+    // write-in-progress file. A damaged index must not make every project vanish.
+    for (final candidate in <File>[indexFile, backupFile, temporaryFile]) {
+      if (!await candidate.exists()) continue;
+      final recovered = await _tryReadProjects(candidate);
+      if (recovered == null) continue;
+
+      _projects
+        ..clear()
+        ..addAll(recovered)
+        ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+
+      if (candidate.path != indexFile.path) {
+        try {
+          if (await indexFile.exists()) {
+            final damagedCopy = File(
+              '${_rootDirectory.path}/projects.json.corrupt-${DateTime.now().millisecondsSinceEpoch}',
+            );
+            await indexFile.copy(damagedCopy.path);
+          }
+          await candidate.copy(indexFile.path);
+        } on FileSystemException {
+          // Keep recovered projects available in memory even if repair is blocked.
+        }
+      }
+      return;
+    }
+  }
+
+  Future<List<RavenProject>?> _tryReadProjects(File file) async {
+    try {
+      final decoded = jsonDecode(await file.readAsString());
+      if (decoded is! List) return null;
+      final projects = <RavenProject>[];
+      for (final item in decoded) {
+        if (item is! Map) continue;
+        try {
+          projects.add(RavenProject.fromJson(Map<String, Object?>.from(item)));
+        } on FormatException {
+          // Isolate one malformed entry instead of losing other projects.
+        } on TypeError {
+          // Isolate malformed legacy data.
+        }
+      }
+      return projects;
+    } on FormatException {
+      return null;
+    } on FileSystemException {
+      return null;
+    } on TypeError {
+      return null;
+    }
+  }
+
+  Future<void> saveAll() async {
+    final indexFile = File('${_rootDirectory.path}/projects.json');
+    final temporaryFile = File('${_rootDirectory.path}/projects.json.tmp');
+    final backupFile = File('${_rootDirectory.path}/projects.json.bak');
+    await temporaryFile.writeAsString(
+      jsonEncode(_projects.map((project) => project.toJson()).toList()),
+      flush: true,
+    );
+    if (await indexFile.exists()) {
+      await indexFile.copy(backupFile.path);
+    }
+    try {
+      // Rename avoids exposing a partially written JSON index on supported filesystems.
+      await temporaryFile.rename(indexFile.path);
+    } catch (_) {
+      // Preserve the previous index if replacing it fails on a platform/filesystem.
+      if (!await indexFile.exists() && await backupFile.exists()) {
+        await backupFile.copy(indexFile.path);
+      }
+      rethrow;
+    }
+    // Backup cleanup is housekeeping, not part of the durable write. If it
+    // fails, keep the valid new index and the old backup for recovery.
+    try {
+      if (await backupFile.exists()) await backupFile.delete();
+    } on FileSystemException {
+      // A stale backup is harmless and is replaced on the next successful save.
+    }
+  }
+
+  Future<void> add(RavenProject project) async {
+    final existingIndex = _projects.indexWhere((item) => item.id == project.id);
+    final previous = existingIndex < 0 ? null : _projects[existingIndex];
+    if (existingIndex < 0) {
+      _projects.add(project);
+    } else {
+      _projects[existingIndex] = project;
+    }
+    _projects.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    try {
+      await saveAll();
+      // Category manifests are derived indexes; a manifest write failure must
+      // not roll back or hide the canonical project record.
+      try { await _syncProjectManifest(project); } on FileSystemException { /* rebuilt on next update */ }
+    } catch (_) {
+      _projects.removeWhere((item) => item.id == project.id);
+      if (previous != null) _projects.add(previous);
+      _projects.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      rethrow;
+    }
+  }
+
+  Future<void> update(RavenProject project) async {
+    final existingIndex = _projects.indexWhere((item) => item.id == project.id);
+    final previous = existingIndex < 0 ? null : _projects[existingIndex];
+    if (existingIndex < 0) {
+      _projects.add(project);
+    } else {
+      _projects[existingIndex] = project;
+    }
+    _projects.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    try {
+      await saveAll();
+      try { await _syncProjectManifest(project); } on FileSystemException { /* rebuilt on next update */ }
+    } catch (_) {
+      _projects.removeWhere((item) => item.id == project.id);
+      if (previous != null) _projects.add(previous);
+      _projects.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      rethrow;
+    }
+  }
+
+
+  String _safeFolderName(String value) {
+    final cleaned = value.trim().replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_').replaceAll(RegExp(r'\s+'), '_');
+    return cleaned.isEmpty ? 'Uncategorized' : cleaned.substring(0, cleaned.length > 60 ? 60 : cleaned.length);
+  }
+
+  Future<void> _syncProjectManifest(RavenProject project) async {
+    final categoryDirectory = Directory('${_rootDirectory.path}/categories/${_safeFolderName(project.category)}');
+    await categoryDirectory.create(recursive: true);
+    final manifest = File('${categoryDirectory.path}/${project.id}.json');
+    await manifest.writeAsString(jsonEncode(<String, Object?>{
+      'projectId': project.id,
+      'title': project.title,
+      'category': project.category,
+      'updatedAt': project.updatedAt.toIso8601String(),
+      'projectDirectory': '${projectsDirectory.path}/${project.id}',
+    }), flush: true);
+    // Remove stale category pointers when a project moves; project files stay in
+    // their stable ID directory so categorisation can never break audio paths.
+    final categoriesRoot = Directory('${_rootDirectory.path}/categories');
+    if (await categoriesRoot.exists()) {
+      await for (final entity in categoriesRoot.list(followLinks: false)) {
+        if (entity is! Directory || entity.path == categoryDirectory.path) continue;
+        final stale = File('${entity.path}/${project.id}.json');
+        if (await stale.exists()) await stale.delete();
+      }
+    }
+  }
+
+  Future<void> moveToTrash(RavenProject project) async {
+    await update(project.copyWith(isTrashed: true));
+  }
+
+  Future<void> restore(RavenProject project) async {
+    await update(project.copyWith(isTrashed: false));
+  }
+
+  Future<void> deleteForever(RavenProject project) async {
+    // Remove any RAVEN-managed public copy before permanently deleting its project.
+    if (project.publicCopyLocation != null) {
+      await AudioVisibilityService().remove(project.publicCopyLocation!);
+    }
+    final existingIndex = _projects.indexWhere((item) => item.id == project.id);
+    if (existingIndex < 0) return;
+    final removed = _projects.removeAt(existingIndex);
+    try {
+      // Remove the record from the durable index first. If this write fails,
+      // roll back the in-memory list and leave the audio directory untouched.
+      await saveAll();
+    } catch (_) {
+      _projects.insert(existingIndex.clamp(0, _projects.length).toInt(), removed);
+      _projects.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      rethrow;
+    }
+
+    final directory = Directory('${projectsDirectory.path}/${project.id}');
+    if (await directory.exists()) {
+      await directory.delete(recursive: true);
+    }
+  }
+}

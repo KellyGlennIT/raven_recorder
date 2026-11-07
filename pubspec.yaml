@@ -1,0 +1,39 @@
+name: raven
+description: RAVEN — Record, Archive, Visualise, Edit, Notes.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+  flutter: '>=3.47.5'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  record: ^6.2.1
+  just_audio: ^0.9.46
+  ffmpeg_kit_flutter_new_audio: ^2.5.7
+  path: ^1.9.1
+  path_provider: ^2.1.5
+  shared_preferences: ^2.3.5
+  intl: ^0.20.2
+  uuid: ^4.5.1
+  flutter_secure_storage: ^9.2.4
+  cryptography: ^2.7.0
+  archive: ^4.0.7
+  file_picker: ^10.3.3
+  share_plus: ^12.0.1
+  pdf: ^3.11.3
+  printing: ^5.14.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/raven_logo.png
