@@ -82,7 +82,6 @@ class ProjectArchiveService {
     }
 
     final bytes = ZipEncoder().encode(archive);
-    if (bytes == null) throw const FileSystemException('Could not create project archive.');
     final temp = await getTemporaryDirectory();
     final output = File(p.join(temp.path, 'RAVEN-${_safeName(project.title)}-${project.id}.raven.zip'));
     await output.writeAsBytes(bytes, flush: true);
