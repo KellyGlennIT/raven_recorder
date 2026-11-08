@@ -42,6 +42,10 @@ RAVEN is a Flutter-first audio workspace for recording, organising, reviewing an
 - `lib/screens/scheduled_recordings_screen.dart` — schedule creation, date/time picker, upcoming schedules and cancellation.
 - `android/app/src/main/kotlin/com/raven/raven/ScheduledRecordingReceiver.kt` — exact-alarm receiver that posts a silent, visible reminder; it does not itself activate the microphone.
 - `lib/services/app_lock_service.dart` — PIN verifier derivation and verification using secure storage; no plaintext PIN is persisted.
+- `lib/services/category_service.dart` — category listing, safe renaming and category reassignment/deletion without touching audio directories.
+- `lib/services/attachment_service.dart` — sanitized attachment picking, project attachment listing and deletion.
+- `lib/services/project_archive_service.dart` — safe ZIP bundle export/import with path-traversal guards, staged extraction and ID remapping.
+- `lib/services/audio_visibility_service.dart` — optional public-copy publishing to Android MediaStore or Windows Downloads with verify/cleanup.
 - `lib/services/notes_pdf_service.dart` — PDF generation/print/share.
 - `lib/services/audio_timeline.dart` — deterministic mapping between internal sessions and the single user-facing playback timeline.
 - `lib/services/audio_merge_service.dart` — FFmpeg-backed, validated master-audio creation from retained source sessions.
@@ -127,7 +131,7 @@ The recording lifecycle follows Flutter’s official record-audio recipe for per
 
 ## Windows development (Flutter 3.47.5)
 
-Install Flutter 3.47.5, its bundled Dart SDK, Git and Visual Studio with **Desktop development with C++**. Open the `raven_flutter` folder itself in VS Code.
+Install Flutter 3.47.5, its bundled Dart SDK, Git and Visual Studio with **Desktop development with C++**. Open the repository root folder (`raven_recorder`) in VS Code.
 
 ```powershell
 flutter --version
