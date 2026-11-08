@@ -10,6 +10,9 @@ import '../models/raven_project.dart';
 import '../services/app_preferences.dart';
 import '../services/project_repository.dart';
 import '../services/audio_merge_service.dart';
+import '../services/recording_notification_service.dart';
+import '../services/wav_recovery_service.dart';
+import '../services/audio_visibility_service.dart';
 
 class RecorderScreen extends StatefulWidget {
   const RecorderScreen({
@@ -42,6 +45,8 @@ class RecorderScreen extends StatefulWidget {
 class _RecorderScreenState extends State<RecorderScreen> {
   final AudioRecorder _recorder = AudioRecorder();
   final Stopwatch _clock = Stopwatch();
+  final RecordingNotificationService _recordingNotification =
+      RecordingNotificationService();
   final List<double> _levels = List<double>.filled(42, 0.08);
   Timer? _ticker;
   StreamSubscription<Amplitude>? _amplitudeSubscription;
@@ -54,6 +59,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
   String? _projectId;
   String? _sessionId;
   String? _outputPath;
+  String? _recordingTitle;
+  int _lastNotificationSecond = -1;
   DateTime? _startedAt;
   Object? _lastError;
 
@@ -62,6 +69,13 @@ class _RecorderScreenState extends State<RecorderScreen> {
   @override
   void initState() {
     super.initState();
+    RecordingNotificationService.setActionHandler((action) async {
+      if (action == 'pause') {
+        await _togglePause();
+      } else if (action == 'stop') {
+        await _saveRecording();
+      }
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) => _startRecording());
   }
 
@@ -70,17 +84,26 @@ class _RecorderScreenState extends State<RecorderScreen> {
     _ticker?.cancel();
     _amplitudeSubscription?.cancel();
     _clock.stop();
+    RecordingNotificationService.setActionHandler(null);
     _recorder.dispose();
     super.dispose();
   }
 
   Future<void> _startRecording() async {
     if (_busy || _started || !mounted) return;
+    var notificationPermissionGranted = true;
     setState(() {
       _busy = true;
       _lastError = null;
     });
     try {
+      final notificationsAllowed =
+          await _recordingNotification.requestNotificationPermission();
+      notificationPermissionGranted = notificationsAllowed;
+      if (!notificationsAllowed) {
+        throw StateError(
+            'Allow notifications so the ongoing recording controls remain available in the background.');
+      }
       final hasPermission = await _recorder.hasPermission();
       if (!hasPermission) {
         _showMessage(tr(
@@ -110,7 +133,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
       await projectDirectory.create(recursive: true);
       final sessionDirectory = Directory('${projectDirectory.path}/sessions');
       await sessionDirectory.create(recursive: true);
-      final extension = widget.preferences.recordingFormat;
+      // Keep the active capture as PCM WAV so an interrupted process can be
+      // recovered even when the selected final export format is compressed.
+      const extension = 'wav';
       final filePath = '${sessionDirectory.path}/$sessionId.$extension';
       _projectId = projectId;
       _sessionId = sessionId;
@@ -123,12 +148,15 @@ class _RecorderScreenState extends State<RecorderScreen> {
           (scheduledTitle != null && scheduledTitle.isNotEmpty
               ? scheduledTitle
               : '${tr(widget.preferences, 'Recording', 'Enregistrement')} — $titleStamp');
+      _recordingTitle = draftTitle;
       final newSession = RavenAudioSession(
         id: sessionId,
         audioPath: filePath,
         createdAt: createdAt,
         durationMs: 0,
         format: extension,
+        sampleRate: widget.preferences.sampleRate,
+        recoverablePcm16: true,
       );
       // Persist a recoverable draft before starting the microphone. Continuing a
       // project preserves every prior session and only appends this new session.
@@ -139,6 +167,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
               createdAt: createdAt,
               updatedAt: createdAt,
               sessions: <RavenAudioSession>[newSession],
+              isStandalone: !shouldCreateProject,
               isDraft: true,
             )
           : existingProject.copyWith(
@@ -158,11 +187,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
 
       await _recorder.start(
         RecordConfig(
-          encoder: switch (widget.preferences.recordingFormat) {
-            'wav' => AudioEncoder.wav,
-            'flac' => AudioEncoder.flac,
-            _ => AudioEncoder.aacLc,
-          },
+          encoder: AudioEncoder.wav,
           sampleRate: widget.preferences.sampleRate,
           bitRate: widget.preferences.bitRate,
           numChannels: 1,
@@ -173,11 +198,17 @@ class _RecorderScreenState extends State<RecorderScreen> {
         path: filePath,
       );
 
+      _started = true;
       _clock
         ..reset()
         ..start();
       _ticker = Timer.periodic(const Duration(milliseconds: 250), (_) {
         if (!mounted) return;
+        final elapsedSecond = _clock.elapsed.inSeconds;
+        if (elapsedSecond != _lastNotificationSecond) {
+          _lastNotificationSecond = elapsedSecond;
+          _updateRecordingNotification();
+        }
         setState(() {
           _elapsed = _formatDuration(_clock.elapsed);
         });
@@ -195,15 +226,72 @@ class _RecorderScreenState extends State<RecorderScreen> {
         // Amplitude visualization is optional; recording must continue if it fails.
         _lastError = error;
       });
-      if (mounted) setState(() => _started = true);
+      await _recordingNotification.start(
+        title: _recordingTitle ??
+            tr(widget.preferences, 'Recording', 'Enregistrement'),
+        elapsedMs: 0,
+        paused: false,
+      );
+      if (mounted) setState(() {});
     } catch (error) {
       _lastError = error;
+      var preservedPartial = false;
+      if (_started) {
+        _clock.stop();
+        _ticker?.cancel();
+        try {
+          final stoppedPath = await _recorder.stop();
+          final path = stoppedPath ?? _outputPath;
+          if (path != null) {
+            final draft = _projectId == null
+                ? null
+                : widget.repository.projectById(_projectId!);
+            final sessionId = _sessionId;
+            if (draft != null && sessionId != null) {
+              final duration = await WavRecoveryService().repairPcm16File(
+                File(path),
+                sampleRate: widget.preferences.sampleRate,
+              );
+              if (duration != null) {
+                final sessions = draft.sessions
+                    .map((session) => session.id == sessionId
+                        ? session.copyWith(
+                            audioPath: path,
+                            durationMs: duration,
+                            recoverablePcm16: true,
+                            sampleRate: widget.preferences.sampleRate,
+                          )
+                        : session)
+                    .toList();
+                await widget.repository
+                    .update(draft.copyWith(sessions: sessions, isDraft: true));
+                preservedPartial = true;
+              }
+            }
+          }
+        } catch (recoveryError) {
+          _lastError = recoveryError;
+        }
+      }
+      try {
+        await _recordingNotification.stop();
+      } catch (_) {
+        // The recorder must still be preserved if Android cannot dismiss its notification.
+      }
       _showMessage(tr(
           widget.preferences,
-          'Could not start recording. Check microphone access and storage.',
-          'Impossible de démarrer l’enregistrement. Vérifiez le microphone et le stockage.'));
+          preservedPartial
+              ? 'Recording stopped unexpectedly. The recoverable audio draft was kept in your library.'
+              : !notificationPermissionGranted
+                  ? 'Allow notifications so RAVEN can keep recording controls available in the background.'
+                  : 'Could not start recording. Check microphone access and storage.',
+          preservedPartial
+              ? 'L’enregistrement s’est arrêté de façon inattendue. Le brouillon audio récupérable a été conservé dans votre bibliothèque.'
+              : !notificationPermissionGranted
+                  ? 'Autorisez les notifications pour que RAVEN garde les commandes d’enregistrement disponibles en arrière-plan.'
+                  : 'Impossible de démarrer l’enregistrement. Vérifiez le microphone et le stockage.'));
       final id = _projectId;
-      if (id != null) {
+      if (id != null && !preservedPartial) {
         try {
           if (widget.continueProject != null) {
             final original = widget.continueProject!;
@@ -234,6 +322,19 @@ class _RecorderScreenState extends State<RecorderScreen> {
     }
   }
 
+  Future<void> _updateRecordingNotification() async {
+    try {
+      await _recordingNotification.update(
+        title: _recordingTitle ??
+            tr(widget.preferences, 'Recording', 'Enregistrement'),
+        elapsedMs: _clock.elapsedMilliseconds,
+        paused: _paused,
+      );
+    } catch (error) {
+      _lastError = error;
+    }
+  }
+
   Future<void> _togglePause() async {
     if (!_started || _busy || _saving) return;
     setState(() => _busy = true);
@@ -247,6 +348,12 @@ class _RecorderScreenState extends State<RecorderScreen> {
         _clock.stop();
         if (mounted) setState(() => _paused = true);
       }
+      await _recordingNotification.update(
+        title: _recordingTitle ??
+            tr(widget.preferences, 'Recording', 'Enregistrement'),
+        elapsedMs: _clock.elapsedMilliseconds,
+        paused: _paused,
+      );
     } catch (error) {
       _showMessage(
           '${tr(widget.preferences, 'Recording control failed', 'Le contrôle de l’enregistrement a échoué')}: $error');
@@ -265,6 +372,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
       _clock.stop();
       _ticker?.cancel();
       final returnedPath = await _recorder.stop();
+      await _recordingNotification.stop();
       await _amplitudeSubscription?.cancel();
       final path = returnedPath ?? _outputPath;
       if (path == null || !await File(path).exists()) {
@@ -284,6 +392,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
       // Continuing clears the master pointer while source sessions are appended.
       // Keep the previous file until this new source session is durably committed.
       final previousMasterPath = widget.continueProject?.masterAudioPath;
+      final previousPublicCopy = widget.continueProject?.publicCopyLocation;
       var project = draft.copyWith(
         title: widget.continueProject?.title ??
             ((widget.initialTitle?.trim().isNotEmpty ?? false)
@@ -295,7 +404,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
                 ? session.copyWith(
                     audioPath: path,
                     durationMs: _clock.elapsedMilliseconds,
-                    format: widget.preferences.recordingFormat,
+                    format: 'wav',
+                    sampleRate: widget.preferences.sampleRate,
+                    recoverablePcm16: true,
                   )
                 : session)
             .toList(),
@@ -312,12 +423,32 @@ class _RecorderScreenState extends State<RecorderScreen> {
           sessions: project.sessions,
           outputDirectory: sessionDirectory,
           projectId: projectId,
-          format: project.sessions.last.format,
+          format: widget.preferences.recordingFormat,
           bitRate: widget.preferences.bitRate,
           sampleRate: widget.preferences.sampleRate,
         );
         project = project.copyWith(masterAudioPath: master.path);
         await widget.repository.update(project);
+        if (project.isAudioProtected || project.requiresAppPin) {
+          _showMessage(tr(
+            widget.preferences,
+            'Merged audio was saved privately because this recording is protected.',
+            'L’audio fusionné a été enregistré en privé, car cet enregistrement est protégé.',
+          ));
+        } else {
+          try {
+            project = await _publishMergedAudio(
+              project,
+              previousPublicCopy: previousPublicCopy,
+            );
+          } catch (publishError) {
+            _showMessage(tr(
+              widget.preferences,
+              'Merged audio is saved in RAVEN, but its public copy could not be updated: $publishError',
+              'L’audio fusionné est enregistré dans RAVEN, mais sa copie publique n’a pas pu être mise à jour : $publishError',
+            ));
+          }
+        }
       } catch (mergeError) {
         // Keep the successful recording even if an optional master rebuild fails.
         _showMessage(tr(
@@ -353,6 +484,42 @@ class _RecorderScreenState extends State<RecorderScreen> {
     }
   }
 
+  Future<RavenProject> _publishMergedAudio(
+    RavenProject project, {
+    String? previousPublicCopy,
+  }) async {
+    final visibility = AudioVisibilityService();
+    final location = await visibility.publish(
+      source: File(project.masterAudioPath!),
+      title: project.title,
+      projectId: project.id,
+    );
+    final published = project.copyWith(publicCopyLocation: location);
+    try {
+      await widget.repository.update(published);
+    } catch (error) {
+      try {
+        await visibility.remove(location);
+      } catch (cleanupError) {
+        throw StateError(
+            '$error The new public copy could not be cleaned up: $cleanupError');
+      }
+      rethrow;
+    }
+    if (previousPublicCopy != null && previousPublicCopy != location) {
+      try {
+        await visibility.remove(previousPublicCopy);
+      } catch (cleanupError) {
+        _showMessage(tr(
+          widget.preferences,
+          'The new merged audio was published, but its previous public copy could not be removed: $cleanupError',
+          'Le nouvel audio fusionné a été publié, mais l’ancienne copie publique n’a pas pu être supprimée : $cleanupError',
+        ));
+      }
+    }
+    return published;
+  }
+
   Future<void> _discardRecording({bool close = true}) async {
     if (_busy) return;
     setState(() => _busy = true);
@@ -363,6 +530,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
         } catch (_) {
           // Continue cleanup even if the recorder already stopped itself.
         }
+        await _recordingNotification.stop();
       }
       _ticker?.cancel();
       await _amplitudeSubscription?.cancel();

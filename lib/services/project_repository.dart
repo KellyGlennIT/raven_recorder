@@ -6,22 +6,27 @@ import 'package:uuid/uuid.dart';
 
 import '../models/raven_project.dart';
 import 'audio_visibility_service.dart';
+import 'wav_recovery_service.dart';
 
 class ProjectRepository {
   ProjectRepository._(this._rootDirectory);
 
   final Directory _rootDirectory;
   final List<RavenProject> _projects = <RavenProject>[];
+  final List<String> _categories = <String>['Uncategorized'];
   final Uuid _uuid = const Uuid();
 
   List<RavenProject> get projects => List<RavenProject>.unmodifiable(_projects);
+  List<String> get categories => List<String>.unmodifiable(_categories);
   RavenProject? projectById(String id) {
     for (final project in _projects) {
       if (project.id == id) return project;
     }
     return null;
   }
-  Directory get projectsDirectory => Directory('${_rootDirectory.path}/projects');
+
+  Directory get projectsDirectory =>
+      Directory('${_rootDirectory.path}/projects');
 
   static Future<ProjectRepository> create() async {
     final supportDirectory = await getApplicationSupportDirectory();
@@ -29,7 +34,8 @@ class ProjectRepository {
     await ravenDirectory.create(recursive: true);
     final repository = ProjectRepository._(ravenDirectory);
     await repository.projectsDirectory.create(recursive: true);
-    await Directory('${ravenDirectory.path}/categories').create(recursive: true);
+    await Directory('${ravenDirectory.path}/categories')
+        .create(recursive: true);
     await repository.load();
     return repository;
   }
@@ -39,7 +45,13 @@ class ProjectRepository {
   Future<Directory> createProjectDirectory(String projectId) async {
     final directory = Directory('${projectsDirectory.path}/$projectId');
     await directory.create(recursive: true);
-    for (final child in <String>['sessions', 'notes', 'attachments', 'exports', 'metadata']) {
+    for (final child in <String>[
+      'sessions',
+      'notes',
+      'attachments',
+      'exports',
+      'metadata'
+    ]) {
       await Directory('${directory.path}/$child').create(recursive: true);
     }
     return directory;
@@ -47,6 +59,7 @@ class ProjectRepository {
 
   Future<void> load() async {
     _projects.clear();
+    await _loadCategories();
     final indexFile = File('${_rootDirectory.path}/projects.json');
     final backupFile = File('${_rootDirectory.path}/projects.json.bak');
     final temporaryFile = File('${_rootDirectory.path}/projects.json.tmp');
@@ -76,8 +89,195 @@ class ProjectRepository {
           // Keep recovered projects available in memory even if repair is blocked.
         }
       }
+      await _recoverInterruptedDrafts();
+      await _includeProjectCategories();
       return;
     }
+    await _includeProjectCategories();
+  }
+
+  Future<void> _loadCategories() async {
+    _categories
+      ..clear()
+      ..add('Uncategorized');
+    final file = File('${_rootDirectory.path}/categories.json');
+    if (!await file.exists()) return;
+    try {
+      final decoded = jsonDecode(await file.readAsString());
+      if (decoded is List) {
+        for (final category in decoded.whereType<String>()) {
+          final clean = category.trim();
+          if (clean.isNotEmpty &&
+              !_categories.any((existing) =>
+                  existing.toLowerCase() == clean.toLowerCase())) {
+            _categories.add(clean);
+          }
+        }
+      }
+    } on FormatException {
+      // Rebuild the category index from project records below.
+    } on FileSystemException {
+      // Project records remain the source of truth if the category file is unavailable.
+    }
+  }
+
+  Future<void> _includeProjectCategories() async {
+    var changed = false;
+    for (final project in _projects) {
+      final category = project.category.trim();
+      if (category.isNotEmpty &&
+          !_categories.any(
+              (existing) => existing.toLowerCase() == category.toLowerCase())) {
+        _categories.add(category);
+        changed = true;
+      }
+    }
+    if (changed ||
+        !await File('${_rootDirectory.path}/categories.json').exists()) {
+      await _saveCategories();
+    }
+  }
+
+  Future<void> createCategory(String name) async {
+    final category = name.trim();
+    if (category.isEmpty || category.length > 60) {
+      throw ArgumentError('Category names must contain 1 to 60 characters.');
+    }
+    if (_categories
+        .any((existing) => existing.toLowerCase() == category.toLowerCase())) {
+      throw StateError('A category with this name already exists.');
+    }
+    _categories.add(category);
+    try {
+      await _saveCategories();
+    } catch (_) {
+      _categories.remove(category);
+      rethrow;
+    }
+  }
+
+  Future<void> renameCategory(String currentName, String newName) async {
+    if (currentName == 'Uncategorized') {
+      throw StateError('The Uncategorized category cannot be renamed.');
+    }
+    final replacement = newName.trim();
+    if (replacement.isEmpty || replacement.length > 60) {
+      throw ArgumentError('Category names must contain 1 to 60 characters.');
+    }
+    if (replacement.toLowerCase() != currentName.toLowerCase() &&
+        _categories.any((existing) =>
+            existing.toLowerCase() == replacement.toLowerCase())) {
+      throw StateError('A category with this name already exists.');
+    }
+    await _changeCategory(currentName, replacement);
+  }
+
+  Future<void> deleteCategory(String name) async {
+    if (name == 'Uncategorized') {
+      throw StateError('The Uncategorized category cannot be deleted.');
+    }
+    if (!_categories.contains(name)) return;
+    await _changeCategory(name, 'Uncategorized', removeCategory: true);
+  }
+
+  Future<void> _changeCategory(
+    String currentName,
+    String replacement, {
+    bool removeCategory = false,
+  }) async {
+    if (!_categories.contains(currentName)) {
+      throw StateError('The selected category no longer exists.');
+    }
+    final originalCategories = List<String>.of(_categories);
+    final originalProjects = List<RavenProject>.of(_projects);
+    if (removeCategory) {
+      _categories.remove(currentName);
+    } else {
+      _categories[_categories.indexOf(currentName)] = replacement;
+    }
+    for (var index = 0; index < _projects.length; index++) {
+      if (_projects[index].category == currentName) {
+        _projects[index] = _projects[index].copyWith(category: replacement);
+      }
+    }
+    try {
+      await saveAll();
+      await _saveCategories();
+      for (final project in _projects.where((item) =>
+          item.category == replacement &&
+          originalProjects.any(
+              (old) => old.id == item.id && old.category == currentName))) {
+        try {
+          await _syncProjectManifest(project);
+        } on FileSystemException {
+          // Project records remain canonical; manifests are rebuilt on update.
+        }
+      }
+    } catch (_) {
+      _categories
+        ..clear()
+        ..addAll(originalCategories);
+      _projects
+        ..clear()
+        ..addAll(originalProjects);
+      await saveAll();
+      await _saveCategories();
+      rethrow;
+    }
+  }
+
+  Future<void> _saveCategories() async {
+    final file = File('${_rootDirectory.path}/categories.json');
+    final temporary = File('${file.path}.tmp');
+    final backup = File('${file.path}.bak');
+    await temporary.writeAsString(jsonEncode(_categories), flush: true);
+    if (await backup.exists()) await backup.delete();
+    if (await file.exists()) await file.copy(backup.path);
+    try {
+      if (await file.exists()) await file.delete();
+      await temporary.rename(file.path);
+    } catch (_) {
+      if (!await file.exists() && await backup.exists()) {
+        await backup.copy(file.path);
+      }
+      rethrow;
+    } finally {
+      if (await backup.exists()) {
+        try {
+          await backup.delete();
+        } on FileSystemException {
+          // A stale backup is safe; the canonical category file is committed.
+        }
+      }
+    }
+  }
+
+  Future<void> _recoverInterruptedDrafts() async {
+    var changed = false;
+    final recovery = WavRecoveryService();
+    for (final project in List<RavenProject>.of(_projects)) {
+      if (!project.isDraft) continue;
+      final sessions = List<RavenAudioSession>.of(project.sessions);
+      var projectChanged = false;
+      for (var index = 0; index < sessions.length; index++) {
+        final session = sessions[index];
+        if (!session.recoverablePcm16) continue;
+        final durationMs = await recovery.repairPcm16File(
+          File(session.audioPath),
+          sampleRate: session.sampleRate,
+        );
+        if (durationMs == null) continue;
+        sessions[index] = session.copyWith(durationMs: durationMs);
+        projectChanged = true;
+      }
+      if (projectChanged) {
+        final recovered = project.copyWith(sessions: sessions);
+        _projects[_projects.indexWhere((item) => item.id == project.id)] =
+            recovered;
+        changed = true;
+      }
+    }
+    if (changed) await saveAll();
   }
 
   Future<List<RavenProject>?> _tryReadProjects(File file) async {
@@ -148,7 +348,9 @@ class ProjectRepository {
       await saveAll();
       // Category manifests are derived indexes; a manifest write failure must
       // not roll back or hide the canonical project record.
-      try { await _syncProjectManifest(project); } on FileSystemException { /* rebuilt on next update */ }
+      try {
+        await _syncProjectManifest(project);
+      } on FileSystemException {/* rebuilt on next update */}
     } catch (_) {
       _projects.removeWhere((item) => item.id == project.id);
       if (previous != null) _projects.add(previous);
@@ -168,7 +370,9 @@ class ProjectRepository {
     _projects.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     try {
       await saveAll();
-      try { await _syncProjectManifest(project); } on FileSystemException { /* rebuilt on next update */ }
+      try {
+        await _syncProjectManifest(project);
+      } on FileSystemException {/* rebuilt on next update */}
     } catch (_) {
       _projects.removeWhere((item) => item.id == project.id);
       if (previous != null) _projects.add(previous);
@@ -177,29 +381,37 @@ class ProjectRepository {
     }
   }
 
-
   String _safeFolderName(String value) {
-    final cleaned = value.trim().replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_').replaceAll(RegExp(r'\s+'), '_');
-    return cleaned.isEmpty ? 'Uncategorized' : cleaned.substring(0, cleaned.length > 60 ? 60 : cleaned.length);
+    final cleaned = value
+        .trim()
+        .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_')
+        .replaceAll(RegExp(r'\s+'), '_');
+    return cleaned.isEmpty
+        ? 'Uncategorized'
+        : cleaned.substring(0, cleaned.length > 60 ? 60 : cleaned.length);
   }
 
   Future<void> _syncProjectManifest(RavenProject project) async {
-    final categoryDirectory = Directory('${_rootDirectory.path}/categories/${_safeFolderName(project.category)}');
+    final categoryDirectory = Directory(
+        '${_rootDirectory.path}/categories/${_safeFolderName(project.category)}');
     await categoryDirectory.create(recursive: true);
     final manifest = File('${categoryDirectory.path}/${project.id}.json');
-    await manifest.writeAsString(jsonEncode(<String, Object?>{
-      'projectId': project.id,
-      'title': project.title,
-      'category': project.category,
-      'updatedAt': project.updatedAt.toIso8601String(),
-      'projectDirectory': '${projectsDirectory.path}/${project.id}',
-    }), flush: true);
+    await manifest.writeAsString(
+        jsonEncode(<String, Object?>{
+          'projectId': project.id,
+          'title': project.title,
+          'category': project.category,
+          'updatedAt': project.updatedAt.toIso8601String(),
+          'projectDirectory': '${projectsDirectory.path}/${project.id}',
+        }),
+        flush: true);
     // Remove stale category pointers when a project moves; project files stay in
     // their stable ID directory so categorisation can never break audio paths.
     final categoriesRoot = Directory('${_rootDirectory.path}/categories');
     if (await categoriesRoot.exists()) {
       await for (final entity in categoriesRoot.list(followLinks: false)) {
-        if (entity is! Directory || entity.path == categoryDirectory.path) continue;
+        if (entity is! Directory || entity.path == categoryDirectory.path)
+          continue;
         final stale = File('${entity.path}/${project.id}.json');
         if (await stale.exists()) await stale.delete();
       }
@@ -227,7 +439,8 @@ class ProjectRepository {
       // roll back the in-memory list and leave the audio directory untouched.
       await saveAll();
     } catch (_) {
-      _projects.insert(existingIndex.clamp(0, _projects.length).toInt(), removed);
+      _projects.insert(
+          existingIndex.clamp(0, _projects.length).toInt(), removed);
       _projects.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
       rethrow;
     }

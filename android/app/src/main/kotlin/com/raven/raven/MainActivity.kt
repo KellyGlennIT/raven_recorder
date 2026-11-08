@@ -20,12 +20,16 @@ import java.io.FileInputStream
 class MainActivity : FlutterActivity() {
     private val visibilityChannelName = "raven/audio_visibility"
     private val schedulerChannelName = "raven/scheduled_recording"
+    private val recordingControlChannelName = "raven/recording_controls"
     private var pendingScheduleId: String? = null
+    private var pendingRecordingAction: String? = null
+    private var recordingControlChannel: MethodChannel? = null
     private var notificationPermissionResult: MethodChannel.Result? = null
     private val notificationPermissionRequestCode = 7341
 
     override fun onCreate(savedInstanceState: Bundle?) {
         pendingScheduleId = intent?.getStringExtra(ScheduledRecordingReceiver.EXTRA_SCHEDULE_ID)
+        pendingRecordingAction = recordingAction(intent?.action)
         super.onCreate(savedInstanceState)
     }
 
@@ -33,10 +37,57 @@ class MainActivity : FlutterActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         pendingScheduleId = intent.getStringExtra(ScheduledRecordingReceiver.EXTRA_SCHEDULE_ID)
+        pendingRecordingAction = recordingAction(intent.action)
+        dispatchPendingRecordingAction()
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        recordingControlChannel =
+            MethodChannel(flutterEngine.dartExecutor.binaryMessenger, recordingControlChannelName)
+        recordingControlChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "start", "update" -> {
+                    val title = call.argument<String>("title")
+                    val elapsedMs = call.argument<Number>("elapsedMs")?.toLong()
+                    val paused = call.argument<Boolean>("paused")
+                    if (title.isNullOrBlank() || elapsedMs == null || paused == null) {
+                        result.error("BAD_ARGUMENTS", "Recording title, elapsed time and pause state are required.", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val action = if (call.method == "start") {
+                            RecordingForegroundService.ACTION_START
+                        } else {
+                            RecordingForegroundService.ACTION_UPDATE
+                        }
+                        val serviceIntent = Intent(this, RecordingForegroundService::class.java)
+                            .setAction(action)
+                            .putExtra(RecordingForegroundService.EXTRA_TITLE, title)
+                            .putExtra(RecordingForegroundService.EXTRA_ELAPSED_MS, elapsedMs)
+                            .putExtra(RecordingForegroundService.EXTRA_PAUSED, paused)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && call.method == "start") {
+                            startForegroundService(serviceIntent)
+                        } else {
+                            startService(serviceIntent)
+                        }
+                        result.success(null)
+                    } catch (error: Exception) {
+                        result.error("RECORDING_NOTIFICATION_FAILED", error.message ?: "Could not start recording notification.", null)
+                    }
+                }
+                "stop" -> {
+                    stopService(
+                        Intent(this, RecordingForegroundService::class.java)
+                            .setAction(RecordingForegroundService.ACTION_STOP),
+                    )
+                    result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        }
+        dispatchPendingRecordingAction()
+
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, visibilityChannelName)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -47,6 +98,31 @@ class MainActivity : FlutterActivity() {
                         if (sourcePath.isNullOrBlank() || fileName.isNullOrBlank() || mimeType.isNullOrBlank()) {
                             result.error("BAD_ARGUMENTS", "Missing source path or media metadata.", null)
                             return@setMethodCallHandler
+                        }
+
+                        private fun recordingAction(action: String?): String? = when (action) {
+                            RecordingForegroundService.ACTION_PAUSE -> "pause"
+                            RecordingForegroundService.ACTION_RESUME -> "pause"
+                            RecordingForegroundService.ACTION_STOP_RECORDING -> "stop"
+                            else -> null
+                        }
+
+                        private fun dispatchPendingRecordingAction() {
+                            val action = pendingRecordingAction ?: return
+                            val channel = recordingControlChannel ?: return
+                            channel.invokeMethod(action, null, object : MethodChannel.Result {
+                                override fun success(result: Any?) {
+                                    if (pendingRecordingAction == action) pendingRecordingAction = null
+                                }
+
+                                override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+                                    // Retain the action until the recorder's Dart handler is ready.
+                                }
+
+                                override fun notImplemented() {
+                                    // Retain the action until the recorder's Dart handler is ready.
+                                }
+                            })
                         }
                         var uri: Uri? = null
                         try {

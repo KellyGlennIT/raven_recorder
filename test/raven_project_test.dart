@@ -20,7 +20,8 @@ void main() {
   });
 
   group('RavenProject persistence model', () {
-    test('serializes and restores a project without changing its stable ID', () {
+    test('serializes and restores a project without changing its stable ID',
+        () {
       final createdAt = DateTime.utc(2026, 10, 28, 8, 30);
       final project = RavenProject(
         id: 'project-id-123',
@@ -31,7 +32,8 @@ void main() {
         sessions: <RavenAudioSession>[
           RavenAudioSession(
             id: 'session-id-123',
-            audioPath: '/private/raven/projects/project-id-123/sessions/session-id-123.m4a',
+            audioPath:
+                '/private/raven/projects/project-id-123/sessions/session-id-123.m4a',
             createdAt: createdAt,
             durationMs: 42000,
             format: 'm4a',
@@ -39,7 +41,8 @@ void main() {
         ],
         notes: 'Keep the opening exactly as recorded.',
         tags: const <String>['idea', 'sermon'],
-        masterAudioPath: '/private/raven/projects/project-id-123/sessions/project-id-123.master.m4a',
+        masterAudioPath:
+            '/private/raven/projects/project-id-123/sessions/project-id-123.master.m4a',
         publicCopyLocation: 'content://media/external/audio/media/123',
       );
 
@@ -51,7 +54,8 @@ void main() {
       expect(restored.title, project.title);
       expect(restored.createdAt, project.createdAt);
       expect(restored.sessions.single.id, project.sessions.single.id);
-      expect(restored.sessions.single.audioPath, project.sessions.single.audioPath);
+      expect(restored.sessions.single.audioPath,
+          project.sessions.single.audioPath);
       expect(restored.durationMs, 42000);
       expect(restored.notes, project.notes);
       expect(restored.tags, project.tags);
@@ -59,7 +63,6 @@ void main() {
       expect(restored.latestAudioPath, project.masterAudioPath);
       expect(restored.publicCopyLocation, project.publicCopyLocation);
     });
-
 
     test('persists timeline bookmarks and new optional metadata', () {
       final now = DateTime.utc(2026, 10, 28, 9);
@@ -86,16 +89,22 @@ void main() {
           ),
         ],
         isAudioProtected: true,
-        aiGeneratedContent: const <String, String>{'summary': 'Separate generated summary'},
+        aiGeneratedContent: const <String, String>{
+          'summary': 'Separate generated summary'
+        },
       );
-      final restored = RavenProject.fromJson(Map<String, Object?>.from(project.toJson()));
+      final restored =
+          RavenProject.fromJson(Map<String, Object?>.from(project.toJson()));
       expect(restored.bookmarks.single.positionMs, 15500);
       expect(restored.bookmarks.single.sessionId, 'session-1');
       expect(restored.isAudioProtected, isTrue);
-      expect(restored.aiGeneratedContent['summary'], 'Separate generated summary');
+      expect(
+          restored.aiGeneratedContent['summary'], 'Separate generated summary');
     });
 
-    test('continuing a project appends a session without changing project identity or title', () {
+    test(
+        'continuing a project appends a session without changing project identity or title',
+        () {
       final now = DateTime.utc(2026, 10, 28, 9);
       final first = RavenAudioSession(
         id: 'session-first',
@@ -129,7 +138,8 @@ void main() {
       expect(continued.durationMs, 90000);
     });
 
-    test('loads older project records with defaults for newly added fields', () {
+    test('loads older project records with defaults for newly added fields',
+        () {
       final now = DateTime.utc(2026, 10, 28);
       final restored = RavenProject.fromJson(<String, Object?>{
         'id': 'legacy',
@@ -138,13 +148,47 @@ void main() {
         'updatedAt': now.toIso8601String(),
         'sessions': <Object?>[],
       });
+
       expect(restored.bookmarks, isEmpty);
       expect(restored.isAudioProtected, isFalse);
       expect(restored.aiGeneratedContent, isEmpty);
       expect(restored.masterAudioPath, isNull);
     });
 
-    test('copying a project preserves identity and changes only requested fields', () {
+    test('loads older sessions with safe interrupted-recording defaults', () {
+      final session = RavenAudioSession.fromJson(<String, Object?>{
+        'id': 'legacy-session',
+        'audioPath': 'legacy.m4a',
+        'createdAt': DateTime.utc(2025).toIso8601String(),
+        'durationMs': 1200,
+      });
+
+      expect(session.sampleRate, 44100);
+      expect(session.recoverablePcm16, isFalse);
+    });
+
+    test('persists standalone recording identity across model copies', () {
+      final now = DateTime.utc(2026, 10, 28);
+      final recording = RavenProject(
+        id: 'standalone-recording',
+        title: 'Voice memo',
+        createdAt: now,
+        updatedAt: now,
+        sessions: const <RavenAudioSession>[],
+        isStandalone: true,
+      );
+
+      final restored = RavenProject.fromJson(
+        Map<String, Object?>.from(recording.toJson()),
+      );
+
+      expect(restored.isStandalone, isTrue);
+      expect(recording.copyWith(title: 'Renamed').isStandalone, isTrue);
+    });
+
+    test(
+        'copying a project preserves identity and changes only requested fields',
+        () {
       final now = DateTime.utc(2026, 10, 28);
       final project = RavenProject(
         id: 'stable-id',
@@ -159,14 +203,20 @@ void main() {
       expect(renamed.id, project.id);
       expect(renamed.createdAt, project.createdAt);
       expect(renamed.title, 'Renamed project');
-      expect(renamed.updatedAt.isAfter(project.updatedAt) || renamed.updatedAt == project.updatedAt, isTrue);
+      expect(
+          renamed.updatedAt.isAfter(project.updatedAt) ||
+              renamed.updatedAt == project.updatedAt,
+          isTrue);
     });
 
-    test('renaming never changes audio paths, session IDs, notes or master path', () {
+    test(
+        'renaming never changes audio paths, session IDs, notes or master path',
+        () {
       final now = DateTime.utc(2026, 10, 29, 10);
       final session = RavenAudioSession(
         id: 'session-stable',
-        audioPath: '/private/raven/projects/project-stable/sessions/session-stable.m4a',
+        audioPath:
+            '/private/raven/projects/project-stable/sessions/session-stable.m4a',
         createdAt: now,
         durationMs: 42000,
       );
@@ -177,7 +227,8 @@ void main() {
         updatedAt: now,
         sessions: <RavenAudioSession>[session],
         notes: 'These notes stay attached.',
-        masterAudioPath: '/private/raven/projects/project-stable/sessions/project-stable.master.m4a',
+        masterAudioPath:
+            '/private/raven/projects/project-stable/sessions/project-stable.master.m4a',
       );
 
       final renamed = project.copyWith(title: 'After rename');

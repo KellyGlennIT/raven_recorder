@@ -20,8 +20,8 @@ class AppLockService {
       await _storage.read(key: _verifierKey) != null;
 
   Future<void> setPin(String pin) async {
-    if (!RegExp(r'^\d{6,12}$').hasMatch(pin)) {
-      throw ArgumentError('Use a PIN containing 6 to 12 digits.');
+    if (!RegExp(r'^\d{4,12}$').hasMatch(pin)) {
+      throw ArgumentError('Use a PIN containing 4 to 12 digits.');
     }
     final salt = List<int>.generate(16, (_) => Random.secure().nextInt(256));
     final key = await _derive(pin, salt);

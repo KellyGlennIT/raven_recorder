@@ -29,7 +29,8 @@ class RavenBookmark {
         sessionId: json['sessionId'] as String? ?? '',
         positionMs: (json['positionMs'] as num?)?.toInt() ?? 0,
         label: json['label'] as String? ?? 'Bookmark',
-        createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0),
+        createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ??
+            DateTime.fromMillisecondsSinceEpoch(0),
       );
 }
 
@@ -40,6 +41,8 @@ class RavenAudioSession {
     required this.createdAt,
     required this.durationMs,
     this.format = 'm4a',
+    this.sampleRate = 44100,
+    this.recoverablePcm16 = false,
   });
 
   final String id;
@@ -47,12 +50,16 @@ class RavenAudioSession {
   final DateTime createdAt;
   final int durationMs;
   final String format;
+  final int sampleRate;
+  final bool recoverablePcm16;
 
   RavenAudioSession copyWith({
     String? audioPath,
     DateTime? createdAt,
     int? durationMs,
     String? format,
+    int? sampleRate,
+    bool? recoverablePcm16,
   }) {
     return RavenAudioSession(
       id: id,
@@ -60,6 +67,8 @@ class RavenAudioSession {
       createdAt: createdAt ?? this.createdAt,
       durationMs: durationMs ?? this.durationMs,
       format: format ?? this.format,
+      sampleRate: sampleRate ?? this.sampleRate,
+      recoverablePcm16: recoverablePcm16 ?? this.recoverablePcm16,
     );
   }
 
@@ -69,6 +78,8 @@ class RavenAudioSession {
         'createdAt': createdAt.toIso8601String(),
         'durationMs': durationMs,
         'format': format,
+        'sampleRate': sampleRate,
+        'recoverablePcm16': recoverablePcm16,
       };
 
   factory RavenAudioSession.fromJson(Map<String, Object?> json) {
@@ -78,6 +89,8 @@ class RavenAudioSession {
       createdAt: DateTime.parse(json['createdAt'] as String),
       durationMs: (json['durationMs'] as num?)?.toInt() ?? 0,
       format: json['format'] as String? ?? 'm4a',
+      sampleRate: (json['sampleRate'] as num?)?.toInt() ?? 44100,
+      recoverablePcm16: json['recoverablePcm16'] as bool? ?? false,
     );
   }
 }
@@ -90,6 +103,7 @@ class RavenProject {
     required this.createdAt,
     required this.updatedAt,
     required this.sessions,
+    this.isStandalone = false,
     this.category = 'Uncategorized',
     this.isFavorite = false,
     this.isTrashed = false,
@@ -109,6 +123,7 @@ class RavenProject {
   final DateTime createdAt;
   final DateTime updatedAt;
   final List<RavenAudioSession> sessions;
+  final bool isStandalone;
   final String category;
   final bool isFavorite;
   final bool isTrashed;
@@ -116,26 +131,33 @@ class RavenProject {
   final String notes;
   final List<String> tags;
   final List<RavenBookmark> bookmarks;
+
   /// Metadata flag only. Playback gating must be enforced by the security service.
   final bool isAudioProtected;
+
   /// Requires the configured RAVEN app PIN before opening this project.
   final bool requiresAppPin;
+
   /// AI outputs are stored separately from original notes/transcripts.
   final Map<String, String> aiGeneratedContent;
+
   /// Optional, automatically generated continuous master file. Session files remain as recovery sources.
   final String? masterAudioPath;
+
   /// URI or path for RAVEN-managed user-visible copy, separate from the private original.
   final String? publicCopyLocation;
 
   String? get latestAudioPath =>
       masterAudioPath ?? (sessions.isEmpty ? null : sessions.last.audioPath);
 
-  int get durationMs => sessions.fold<int>(0, (sum, session) => sum + session.durationMs);
+  int get durationMs =>
+      sessions.fold<int>(0, (sum, session) => sum + session.durationMs);
 
   RavenProject copyWith({
     String? title,
     DateTime? updatedAt,
     List<RavenAudioSession>? sessions,
+    bool? isStandalone,
     String? category,
     bool? isFavorite,
     bool? isTrashed,
@@ -157,6 +179,7 @@ class RavenProject {
       createdAt: createdAt,
       updatedAt: updatedAt ?? DateTime.now(),
       sessions: sessions ?? this.sessions,
+      isStandalone: isStandalone ?? this.isStandalone,
       category: category ?? this.category,
       isFavorite: isFavorite ?? this.isFavorite,
       isTrashed: isTrashed ?? this.isTrashed,
@@ -167,8 +190,12 @@ class RavenProject {
       isAudioProtected: isAudioProtected ?? this.isAudioProtected,
       requiresAppPin: requiresAppPin ?? this.requiresAppPin,
       aiGeneratedContent: aiGeneratedContent ?? this.aiGeneratedContent,
-      masterAudioPath: clearMasterAudioPath ? null : (masterAudioPath ?? this.masterAudioPath),
-      publicCopyLocation: clearPublicCopyLocation ? null : (publicCopyLocation ?? this.publicCopyLocation),
+      masterAudioPath: clearMasterAudioPath
+          ? null
+          : (masterAudioPath ?? this.masterAudioPath),
+      publicCopyLocation: clearPublicCopyLocation
+          ? null
+          : (publicCopyLocation ?? this.publicCopyLocation),
     );
   }
 
@@ -178,6 +205,7 @@ class RavenProject {
         'createdAt': createdAt.toIso8601String(),
         'updatedAt': updatedAt.toIso8601String(),
         'sessions': sessions.map((session) => session.toJson()).toList(),
+        'isStandalone': isStandalone,
         'category': category,
         'isFavorite': isFavorite,
         'isTrashed': isTrashed,
@@ -208,6 +236,7 @@ class RavenProject {
                   ))
               .toList()
           : <RavenAudioSession>[],
+      isStandalone: json['isStandalone'] as bool? ?? false,
       category: json['category'] as String? ?? 'Uncategorized',
       isFavorite: json['isFavorite'] as bool? ?? false,
       isTrashed: json['isTrashed'] as bool? ?? false,
@@ -216,12 +245,15 @@ class RavenProject {
       tags: (json['tags'] as List?)?.whereType<String>().toList() ?? <String>[],
       bookmarks: (json['bookmarks'] as List?)
               ?.whereType<Map>()
-              .map((item) => RavenBookmark.fromJson(Map<String, Object?>.from(item)))
-              .toList() ?? <RavenBookmark>[],
+              .map((item) =>
+                  RavenBookmark.fromJson(Map<String, Object?>.from(item)))
+              .toList() ??
+          <RavenBookmark>[],
       isAudioProtected: json['isAudioProtected'] as bool? ?? false,
       requiresAppPin: json['requiresAppPin'] as bool? ?? false,
       aiGeneratedContent: (json['aiGeneratedContent'] is Map)
-          ? (json['aiGeneratedContent'] as Map).map((key, value) => MapEntry(key.toString(), value.toString()))
+          ? (json['aiGeneratedContent'] as Map)
+              .map((key, value) => MapEntry(key.toString(), value.toString()))
           : <String, String>{},
       masterAudioPath: json['masterAudioPath'] as String?,
       publicCopyLocation: json['publicCopyLocation'] as String?,

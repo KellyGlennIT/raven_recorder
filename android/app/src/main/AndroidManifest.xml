@@ -41,6 +41,10 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+        <service
+            android:name=".RecordingForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
         <meta-data android:name="flutterEmbedding" android:value="2" />
     </application>
 </manifest>

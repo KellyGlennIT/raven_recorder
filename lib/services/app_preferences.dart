@@ -29,9 +29,25 @@ class AppPreferences {
   String aiProvider;
   String aiModel;
 
-  static const List<int> supportedSampleRates = <int>[16000, 22050, 44100, 48000];
-  static const List<int> supportedBitRates = <int>[64000, 96000, 128000, 192000, 256000];
-  static const List<String> supportedRecordingFormats = <String>['m4a', 'wav', 'flac'];
+  static const List<int> supportedSampleRates = <int>[
+    16000,
+    22050,
+    44100,
+    48000
+  ];
+  static const List<int> supportedBitRates = <int>[
+    64000,
+    96000,
+    128000,
+    192000,
+    256000
+  ];
+  static const List<String> supportedRecordingFormats = <String>[
+    'm4a',
+    'mp3',
+    'wav',
+    'flac'
+  ];
 
   static Future<AppPreferences> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -41,14 +57,22 @@ class AppPreferences {
     return AppPreferences(
       isDarkMode: prefs.getBool('raven.darkMode') ?? true,
       isFrench: prefs.getBool('raven.french') ?? false,
-      sampleRate: supportedSampleRates.contains(savedSampleRate) ? savedSampleRate! : 44100,
-      bitRate: supportedBitRates.contains(savedBitRate) ? savedBitRate! : 128000,
-      recordingFormat: supportedRecordingFormats.contains(savedFormat) ? savedFormat! : 'm4a',
+      sampleRate: supportedSampleRates.contains(savedSampleRate)
+          ? savedSampleRate!
+          : 44100,
+      bitRate:
+          supportedBitRates.contains(savedBitRate) ? savedBitRate! : 128000,
+      recordingFormat: supportedRecordingFormats.contains(savedFormat)
+          ? savedFormat!
+          : 'm4a',
       voiceProcessing: prefs.getBool('raven.voiceProcessing') ?? true,
-      hasCompletedOnboarding: prefs.getBool('raven.onboardingCompleted') ?? false,
+      hasCompletedOnboarding:
+          prefs.getBool('raven.onboardingCompleted') ?? false,
       appLockEnabled: prefs.getBool('raven.appLockEnabled') ?? false,
-      defaultPublicAudioVisible: prefs.getBool('raven.defaultPublicAudioVisible') ?? false,
-      newRecordingsCreateProject: prefs.getBool('raven.newRecordingsCreateProject') ?? true,
+      defaultPublicAudioVisible:
+          prefs.getBool('raven.defaultPublicAudioVisible') ?? false,
+      newRecordingsCreateProject:
+          prefs.getBool('raven.newRecordingsCreateProject') ?? true,
       aiProvider: prefs.getString('raven.aiProvider') ?? 'openrouter',
       aiModel: prefs.getString('raven.aiModel') ?? 'openrouter/free',
     );
@@ -64,8 +88,10 @@ class AppPreferences {
     await prefs.setBool('raven.voiceProcessing', voiceProcessing);
     await prefs.setBool('raven.onboardingCompleted', hasCompletedOnboarding);
     await prefs.setBool('raven.appLockEnabled', appLockEnabled);
-    await prefs.setBool('raven.defaultPublicAudioVisible', defaultPublicAudioVisible);
-    await prefs.setBool('raven.newRecordingsCreateProject', newRecordingsCreateProject);
+    await prefs.setBool(
+        'raven.defaultPublicAudioVisible', defaultPublicAudioVisible);
+    await prefs.setBool(
+        'raven.newRecordingsCreateProject', newRecordingsCreateProject);
     await prefs.setString('raven.aiProvider', aiProvider);
     await prefs.setString('raven.aiModel', aiModel);
   }

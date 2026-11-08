@@ -11,6 +11,7 @@ void main() {
     Size(320, 640),
     Size(360, 800),
     Size(600, 800),
+    Size(800, 800),
   ];
 
   testWidgets('home screen fits compact and expanded mobile widths',
@@ -46,6 +47,7 @@ void main() {
           home: Scaffold(
             body: LibraryScreen(
               projects: const <RavenProject>[],
+              categories: const <String>['Uncategorized'],
               preferences: AppPreferences(),
               onOpenProject: (_) {},
               onFavorite: (_) {},
@@ -54,12 +56,19 @@ void main() {
               onRestore: (_) {},
               onDelete: (_) {},
               onImportProject: () {},
+              onResumeProject: (_) {},
+              onCreateCategory: (_) async {},
+              onRenameCategory: (_, __) async {},
+              onDeleteCategory: (_) async {},
             ),
           ),
         ),
       );
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull, reason: 'Viewport: $size');
+      if (size.width >= 740) {
+        expect(find.text('Categories'), findsOneWidget);
+      }
     }
   });
 

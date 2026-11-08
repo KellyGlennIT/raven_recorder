@@ -9,6 +9,7 @@ enum LibraryFilter { all, favorites, trash }
 class LibraryScreen extends StatefulWidget {
   const LibraryScreen({
     required this.projects,
+    required this.categories,
     required this.preferences,
     required this.onOpenProject,
     required this.onFavorite,
@@ -17,10 +18,15 @@ class LibraryScreen extends StatefulWidget {
     required this.onRestore,
     required this.onDelete,
     required this.onImportProject,
+    required this.onResumeProject,
+    required this.onCreateCategory,
+    required this.onRenameCategory,
+    required this.onDeleteCategory,
     super.key,
   });
 
   final List<RavenProject> projects;
+  final List<String> categories;
   final AppPreferences preferences;
   final ValueChanged<RavenProject> onOpenProject;
   final ValueChanged<RavenProject> onFavorite;
@@ -29,6 +35,11 @@ class LibraryScreen extends StatefulWidget {
   final ValueChanged<RavenProject> onRestore;
   final ValueChanged<RavenProject> onDelete;
   final VoidCallback onImportProject;
+  final ValueChanged<RavenProject> onResumeProject;
+  final Future<void> Function(String name) onCreateCategory;
+  final Future<void> Function(String currentName, String newName)
+      onRenameCategory;
+  final Future<void> Function(String name) onDeleteCategory;
 
   @override
   State<LibraryScreen> createState() => _LibraryScreenState();
@@ -37,6 +48,7 @@ class LibraryScreen extends StatefulWidget {
 class _LibraryScreenState extends State<LibraryScreen> {
   final TextEditingController _searchController = TextEditingController();
   LibraryFilter _filter = LibraryFilter.all;
+  String? _selectedCategory;
 
   @override
   void dispose() {
@@ -55,6 +67,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
         LibraryFilter.trash => project.isTrashed,
       };
       if (!matchesFilter) return false;
+      if (_selectedCategory != null && project.category != _selectedCategory) {
+        return false;
+      }
       return project.title.toLowerCase().contains(query) ||
           project.category.toLowerCase().contains(query) ||
           project.tags.any((tag) => tag.toLowerCase().contains(query));
@@ -63,130 +78,201 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return SafeArea(
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final isCompact = constraints.maxWidth < 600;
+          final isCompact = constraints.maxWidth < 740;
           final horizontalPadding = isCompact ? 16.0 : 28.0;
+          final filterChips = SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: <Widget>[
+                _FilterChip(
+                  label: tr(widget.preferences, 'All', 'Tous'),
+                  selected: _filter == LibraryFilter.all,
+                  onTap: () => setState(() => _filter = LibraryFilter.all),
+                ),
+                const SizedBox(width: 8),
+                _FilterChip(
+                  label: tr(widget.preferences, 'Favourites', 'Favoris'),
+                  selected: _filter == LibraryFilter.favorites,
+                  onTap: () =>
+                      setState(() => _filter = LibraryFilter.favorites),
+                ),
+                const SizedBox(width: 8),
+                _FilterChip(
+                  label: tr(widget.preferences, 'Trash', 'Corbeille'),
+                  selected: _filter == LibraryFilter.trash,
+                  onTap: () => setState(() => _filter = LibraryFilter.trash),
+                ),
+              ],
+            ),
+          );
+          final header = Padding(
+            padding: EdgeInsets.fromLTRB(
+                horizontalPadding, isCompact ? 16 : 28, horizontalPadding, 10),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: Text(
+                        tr(widget.preferences, 'Library', 'Bibliothèque'),
+                        style: theme.textTheme.headlineMedium
+                            ?.copyWith(fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                    IconButton.filledTonal(
+                      tooltip: tr(widget.preferences, 'Manage categories',
+                          'Gérer les catégories'),
+                      onPressed: () => _manageCategories(context),
+                      icon: const Icon(Icons.folder_copy_outlined),
+                    ),
+                    const SizedBox(width: 4),
+                    IconButton.filledTonal(
+                      tooltip: tr(
+                          widget.preferences,
+                          'Import RAVEN project bundle',
+                          'Importer un projet RAVEN'),
+                      onPressed: widget.onImportProject,
+                      icon: const Icon(Icons.archive_outlined),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  tr(
+                      widget.preferences,
+                      'Browse projects, standalone recordings and recovered drafts.',
+                      'Parcourez les projets, les enregistrements autonomes et les brouillons récupérés.'),
+                  style: theme.textTheme.bodyMedium
+                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                ),
+                const SizedBox(height: 17),
+                TextField(
+                  controller: _searchController,
+                  onChanged: (_) => setState(() {}),
+                  decoration: InputDecoration(
+                    hintText: tr(
+                        widget.preferences,
+                        'Search title, category or tag',
+                        'Rechercher titre, catégorie ou étiquette'),
+                    prefixIcon: const Icon(Icons.search_rounded),
+                    suffixIcon: _searchController.text.isEmpty
+                        ? null
+                        : IconButton(
+                            icon: const Icon(Icons.clear_rounded),
+                            onPressed: () {
+                              _searchController.clear();
+                              setState(() {});
+                            },
+                          ),
+                    filled: true,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(18),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+                if (isCompact) ...<Widget>[
+                  const SizedBox(height: 13),
+                  filterChips,
+                  const SizedBox(height: 9),
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: <Widget>[
+                        _FilterChip(
+                          label: tr(widget.preferences, 'All categories',
+                              'Toutes les catégories'),
+                          selected: _selectedCategory == null,
+                          onTap: () => setState(() => _selectedCategory = null),
+                        ),
+                        for (final category in widget.categories) ...<Widget>[
+                          const SizedBox(width: 8),
+                          _FilterChip(
+                            label: category,
+                            selected: _selectedCategory == category,
+                            onTap: () => setState(
+                              () => _selectedCategory = category,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          );
+          final results = Expanded(
+            child: visible.isEmpty
+                ? _EmptyLibrary(
+                    preferences: widget.preferences, filter: _filter)
+                : ListView.separated(
+                    padding: EdgeInsets.fromLTRB(
+                        horizontalPadding, 8, horizontalPadding, 24),
+                    itemCount: visible.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 10),
+                    itemBuilder: (context, index) {
+                      final project = visible[index];
+                      return ProjectTile(
+                        project: project,
+                        preferences: widget.preferences,
+                        onTap: () => widget.onOpenProject(project),
+                        onFavorite: () => widget.onFavorite(project),
+                        onRename: () => _rename(context, project),
+                        onTrash: () => _confirmTrash(context, project),
+                        onRestore: () => widget.onRestore(project),
+                        onDelete: () => _confirmDelete(context, project),
+                        onResume: project.isStandalone &&
+                                !project.isTrashed &&
+                                !project.isAudioProtected
+                            ? () => widget.onResumeProject(project)
+                            : null,
+                      );
+                    },
+                  ),
+          );
           return Align(
             alignment: Alignment.topCenter,
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 820),
-              child: Column(
-                children: <Widget>[
-                  Padding(
-                    padding: EdgeInsets.fromLTRB(horizontalPadding,
-                        isCompact ? 16 : 28, horizontalPadding, 10),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+              constraints: const BoxConstraints(maxWidth: 940),
+              child: isCompact
+                  ? Column(children: <Widget>[header, results])
+                  : Row(
                       children: <Widget>[
-                        Row(
-                          children: <Widget>[
-                            Expanded(
-                                child: Text(
-                                    tr(widget.preferences, 'Library',
-                                        'Bibliothèque'),
-                                    style: theme.textTheme.headlineMedium
-                                        ?.copyWith(
-                                            fontWeight: FontWeight.w800))),
-                            IconButton.filledTonal(
-                              tooltip: tr(
-                                  widget.preferences,
-                                  'Import RAVEN project bundle',
-                                  'Importer un projet RAVEN'),
-                              onPressed: widget.onImportProject,
-                              icon: const Icon(Icons.archive_outlined),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                            tr(
-                                widget.preferences,
-                                'Every recording is kept as its own RAVEN project.',
-                                'Chaque enregistrement est conservé comme projet RAVEN.'),
-                            style: theme.textTheme.bodyMedium?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant)),
-                        const SizedBox(height: 17),
-                        TextField(
-                          controller: _searchController,
-                          onChanged: (_) => setState(() {}),
-                          decoration: InputDecoration(
-                            hintText: tr(
-                                widget.preferences,
-                                'Search title, category or tag',
-                                'Rechercher titre, catégorie ou étiquette'),
-                            prefixIcon: const Icon(Icons.search_rounded),
-                            suffixIcon: _searchController.text.isEmpty
-                                ? null
-                                : IconButton(
-                                    icon: const Icon(Icons.clear_rounded),
-                                    onPressed: () {
-                                      _searchController.clear();
-                                      setState(() {});
-                                    }),
-                            filled: true,
-                            border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(18),
-                                borderSide: BorderSide.none),
+                        SizedBox(
+                          width: 205,
+                          child: _LibrarySidebar(
+                            preferences: widget.preferences,
+                            categories: widget.categories,
+                            filter: _filter,
+                            selectedCategory: _selectedCategory,
+                            onFilter: (filter) => setState(() {
+                              _filter = filter;
+                              _selectedCategory = null;
+                            }),
+                            onCategory: (category) => setState(() {
+                              _filter = LibraryFilter.all;
+                              _selectedCategory = category;
+                            }),
                           ),
                         ),
-                        const SizedBox(height: 13),
-                        SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: Row(
+                        const VerticalDivider(width: 1),
+                        Expanded(
+                          child: Column(
                             children: <Widget>[
-                              _FilterChip(
-                                  label: tr(widget.preferences, 'All projects',
-                                      'Tous'),
-                                  selected: _filter == LibraryFilter.all,
-                                  onTap: () => setState(
-                                      () => _filter = LibraryFilter.all)),
-                              const SizedBox(width: 8),
-                              _FilterChip(
-                                  label: tr(widget.preferences, 'Favourites',
-                                      'Favoris'),
-                                  selected: _filter == LibraryFilter.favorites,
-                                  onTap: () => setState(
-                                      () => _filter = LibraryFilter.favorites)),
-                              const SizedBox(width: 8),
-                              _FilterChip(
-                                  label: tr(
-                                      widget.preferences, 'Trash', 'Corbeille'),
-                                  selected: _filter == LibraryFilter.trash,
-                                  onTap: () => setState(
-                                      () => _filter = LibraryFilter.trash)),
+                              header,
+                              Padding(
+                                padding:
+                                    const EdgeInsets.symmetric(horizontal: 28),
+                                child: filterChips,
+                              ),
+                              results,
                             ],
                           ),
                         ),
                       ],
                     ),
-                  ),
-                  Expanded(
-                    child: visible.isEmpty
-                        ? _EmptyLibrary(
-                            preferences: widget.preferences, filter: _filter)
-                        : ListView.separated(
-                            padding: EdgeInsets.fromLTRB(
-                                horizontalPadding, 8, horizontalPadding, 24),
-                            itemCount: visible.length,
-                            separatorBuilder: (_, __) =>
-                                const SizedBox(height: 10),
-                            itemBuilder: (context, index) {
-                              final project = visible[index];
-                              return ProjectTile(
-                                project: project,
-                                preferences: widget.preferences,
-                                onTap: () => widget.onOpenProject(project),
-                                onFavorite: () => widget.onFavorite(project),
-                                onRename: () => _rename(context, project),
-                                onTrash: () => _confirmTrash(context, project),
-                                onRestore: () => widget.onRestore(project),
-                                onDelete: () =>
-                                    _confirmDelete(context, project),
-                              );
-                            },
-                          ),
-                  ),
-                ],
-              ),
             ),
           );
         },
@@ -227,6 +313,191 @@ class _LibraryScreenState extends State<LibraryScreen> {
         title.trim() != project.title) {
       widget.onRename(project.copyWith(title: title.trim()));
     }
+  }
+
+  Future<void> _manageCategories(BuildContext context) async {
+    final controller = TextEditingController();
+    String? error;
+    late StateSetter setDialogState;
+
+    Future<void> createCategory() async {
+      try {
+        await widget.onCreateCategory(controller.text);
+        controller.clear();
+        setDialogState(() => error = null);
+      } catch (failure) {
+        setDialogState(() => error = failure.toString());
+      }
+    }
+
+    Future<void> renameCategory(String category) async {
+      final nameController = TextEditingController(text: category);
+      final replacement = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text(tr(
+              widget.preferences, 'Rename category', 'Renommer la catégorie')),
+          content: TextField(
+            controller: nameController,
+            autofocus: true,
+            maxLength: 60,
+            onSubmitted: (value) => Navigator.pop(dialogContext, value.trim()),
+            decoration: InputDecoration(
+              labelText: tr(widget.preferences, 'Category name', 'Nom'),
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, nameController.text.trim()),
+              child: Text(tr(widget.preferences, 'Save', 'Enregistrer')),
+            ),
+          ],
+        ),
+      );
+      nameController.dispose();
+      if (replacement == null || replacement.trim().isEmpty) return;
+      try {
+        await widget.onRenameCategory(category, replacement);
+        if (_selectedCategory == category) {
+          setState(() => _selectedCategory = replacement);
+        }
+        setDialogState(() => error = null);
+      } catch (failure) {
+        setDialogState(() => error = failure.toString());
+      }
+    }
+
+    Future<void> removeCategory(String category) async {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text(tr(widget.preferences, 'Delete category?',
+              'Supprimer la catégorie ?')),
+          content: Text(tr(
+            widget.preferences,
+            'Recordings in this category will move to Uncategorized.',
+            'Les enregistrements de cette catégorie seront déplacés dans « Non classé ». ',
+          )),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: Text(tr(widget.preferences, 'Delete', 'Supprimer')),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+      try {
+        await widget.onDeleteCategory(category);
+        if (_selectedCategory == category) {
+          setState(() => _selectedCategory = null);
+        }
+        setDialogState(() => error = null);
+      } catch (failure) {
+        setDialogState(() => error = failure.toString());
+      }
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, dialogState) {
+          setDialogState = dialogState;
+          return AlertDialog(
+            title: Text(tr(widget.preferences, 'Manage categories',
+                'Gérer les catégories')),
+            content: SizedBox(
+              width: 420,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: TextField(
+                          controller: controller,
+                          maxLength: 60,
+                          decoration: InputDecoration(
+                            labelText: tr(widget.preferences, 'New category',
+                                'Nouvelle catégorie'),
+                          ),
+                          onSubmitted: (_) => createCategory(),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip:
+                            tr(widget.preferences, 'Add category', 'Ajouter'),
+                        onPressed: createCategory,
+                        icon: const Icon(Icons.add_circle_outline_rounded),
+                      ),
+                    ],
+                  ),
+                  if (error != null)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        error!,
+                        style: TextStyle(
+                            color: Theme.of(context).colorScheme.error),
+                      ),
+                    ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: 240,
+                    child: ListView(
+                      shrinkWrap: true,
+                      children: widget.categories
+                          .where((category) => category != 'Uncategorized')
+                          .map(
+                            (category) => ListTile(
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              title: Text(category),
+                              trailing: Wrap(
+                                children: <Widget>[
+                                  IconButton(
+                                    tooltip: tr(widget.preferences, 'Rename',
+                                        'Renommer'),
+                                    onPressed: () => renameCategory(category),
+                                    icon: const Icon(Icons.edit_outlined),
+                                  ),
+                                  IconButton(
+                                    tooltip: tr(widget.preferences, 'Delete',
+                                        'Supprimer'),
+                                    onPressed: () => removeCategory(category),
+                                    icon: const Icon(
+                                        Icons.delete_outline_rounded),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: Text(tr(widget.preferences, 'Done', 'Terminé')),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    controller.dispose();
   }
 
   Future<void> _confirmTrash(BuildContext context, RavenProject project) async {
@@ -289,6 +560,7 @@ class ProjectTile extends StatelessWidget {
     this.onTrash,
     this.onRestore,
     this.onDelete,
+    this.onResume,
     super.key,
   });
 
@@ -300,6 +572,7 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback? onTrash;
   final VoidCallback? onRestore;
   final VoidCallback? onDelete;
+  final VoidCallback? onResume;
 
   @override
   Widget build(BuildContext context) {
@@ -330,7 +603,9 @@ class ProjectTile extends StatelessWidget {
                 child: Icon(
                     project.isTrashed
                         ? Icons.delete_outline_rounded
-                        : Icons.audio_file_outlined,
+                        : project.isStandalone
+                            ? Icons.mic_none_rounded
+                            : Icons.audio_file_outlined,
                     color: theme.colorScheme.primary),
               ),
               const SizedBox(width: 13),
@@ -380,7 +655,8 @@ class ProjectTile extends StatelessWidget {
                           ? theme.colorScheme.tertiary
                           : null),
                 ),
-              if (onRename != null ||
+              if (onResume != null ||
+                  onRename != null ||
                   onTrash != null ||
                   onRestore != null ||
                   onDelete != null)
@@ -391,6 +667,9 @@ class ProjectTile extends StatelessWidget {
                     switch (action) {
                       case 'rename':
                         onRename?.call();
+                        break;
+                      case 'resume':
+                        onResume?.call();
                         break;
                       case 'trash':
                         onTrash?.call();
@@ -404,6 +683,12 @@ class ProjectTile extends StatelessWidget {
                     }
                   },
                   itemBuilder: (context) => <PopupMenuEntry<String>>[
+                    if (onResume != null)
+                      PopupMenuItem(
+                        value: 'resume',
+                        child: Text(tr(preferences, 'Resume recording',
+                            'Reprendre l’enregistrement')),
+                      ),
                     if (!project.isTrashed && onRename != null)
                       PopupMenuItem(
                           value: 'rename',
@@ -452,6 +737,102 @@ class _FilterChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) => ChoiceChip(
       label: Text(label), selected: selected, onSelected: (_) => onTap());
+}
+
+class _LibrarySidebar extends StatelessWidget {
+  const _LibrarySidebar({
+    required this.preferences,
+    required this.categories,
+    required this.filter,
+    required this.selectedCategory,
+    required this.onFilter,
+    required this.onCategory,
+  });
+
+  final AppPreferences preferences;
+  final List<String> categories;
+  final LibraryFilter filter;
+  final String? selectedCategory;
+  final ValueChanged<LibraryFilter> onFilter;
+  final ValueChanged<String> onCategory;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 24, 8, 24),
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 8, 8),
+          child: Text(
+            tr(preferences, 'Browse', 'Parcourir'),
+            style: theme.textTheme.labelLarge
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+        ),
+        _sidebarItem(
+          context,
+          icon: Icons.library_music_outlined,
+          title: tr(preferences, 'All recordings', 'Tous les enregistrements'),
+          selected: filter == LibraryFilter.all && selectedCategory == null,
+          onTap: () => onFilter(LibraryFilter.all),
+        ),
+        _sidebarItem(
+          context,
+          icon: Icons.star_outline_rounded,
+          title: tr(preferences, 'Favourites', 'Favoris'),
+          selected: filter == LibraryFilter.favorites,
+          onTap: () => onFilter(LibraryFilter.favorites),
+        ),
+        _sidebarItem(
+          context,
+          icon: Icons.delete_outline_rounded,
+          title: tr(preferences, 'Trash', 'Corbeille'),
+          selected: filter == LibraryFilter.trash,
+          onTap: () => onFilter(LibraryFilter.trash),
+        ),
+        const Divider(height: 28),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 8, 8),
+          child: Text(
+            tr(preferences, 'Categories', 'Catégories'),
+            style: theme.textTheme.labelLarge
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+        ),
+        for (final category in categories)
+          _sidebarItem(
+            context,
+            icon: category == 'Uncategorized'
+                ? Icons.folder_open_outlined
+                : Icons.folder_outlined,
+            title: category == 'Uncategorized'
+                ? tr(preferences, 'Uncategorized', 'Non classé')
+                : category,
+            selected: selectedCategory == category,
+            onTap: () => onCategory(category),
+          ),
+      ],
+    );
+  }
+
+  Widget _sidebarItem(
+    BuildContext context, {
+    required IconData icon,
+    required String title,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return ListTile(
+      dense: true,
+      selected: selected,
+      leading: Icon(icon, size: 20),
+      title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      onTap: onTap,
+    );
+  }
 }
 
 class _EmptyLibrary extends StatelessWidget {

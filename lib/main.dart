@@ -10,6 +10,7 @@ import 'models/raven_project.dart';
 import 'screens/home_screen.dart';
 import 'screens/library_screen.dart';
 import 'screens/player_screen.dart';
+import 'screens/standalone_recording_screen.dart';
 import 'screens/recorder_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/scheduled_recordings_screen.dart';
@@ -612,6 +613,29 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     if (!mounted) return;
     await navigator.push<void>(
       MaterialPageRoute<void>(
+        builder: (_) => project.isStandalone &&
+                !project.isDraft &&
+                !project.isAudioProtected
+            ? StandaloneRecordingScreen(
+                project: project,
+                preferences: widget.preferences,
+                onResume: () => _resumeStandaloneFromPlayer(project),
+                onOpenDetails: () => _openProjectDetails(project),
+              )
+            : PlayerScreen(
+                project: project,
+                repository: widget.repository,
+                preferences: widget.preferences,
+                onProjectChanged: (_) => _refreshProjects(),
+              ),
+      ),
+    );
+    await _refreshProjects();
+  }
+
+  Future<void> _openProjectDetails(RavenProject project) async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
         builder: (_) => PlayerScreen(
           project: project,
           repository: widget.repository,
@@ -621,6 +645,39 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
       ),
     );
     await _refreshProjects();
+  }
+
+  Future<void> _resumeStandalone(
+    RavenProject project, {
+    bool alreadyUnlocked = false,
+  }) async {
+    if (_recordingRouteActive || project.isAudioProtected) return;
+    if (project.requiresAppPin && !alreadyUnlocked) {
+      await _openProject(project);
+      return;
+    }
+    _recordingRouteActive = true;
+    try {
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (_) => RecorderScreen(
+            repository: widget.repository,
+            preferences: widget.preferences,
+            onSaved: _refreshProjects,
+            continueProject: project,
+            createProject: false,
+          ),
+        ),
+      );
+    } finally {
+      _recordingRouteActive = false;
+      await _refreshProjects();
+    }
+  }
+
+  Future<void> _resumeStandaloneFromPlayer(RavenProject project) async {
+    Navigator.of(context).pop();
+    await _resumeStandalone(project, alreadyUnlocked: true);
   }
 
   Future<void> _renameProject(RavenProject project) async {
@@ -646,6 +703,21 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
 
   Future<void> _deleteForever(RavenProject project) async {
     await widget.repository.deleteForever(project);
+    await _refreshProjects();
+  }
+
+  Future<void> _createCategory(String name) async {
+    await widget.repository.createCategory(name);
+    await _refreshProjects();
+  }
+
+  Future<void> _renameCategory(String currentName, String newName) async {
+    await widget.repository.renameCategory(currentName, newName);
+    await _refreshProjects();
+  }
+
+  Future<void> _deleteCategory(String name) async {
+    await widget.repository.deleteCategory(name);
     await _refreshProjects();
   }
 
@@ -678,6 +750,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
       ),
       LibraryScreen(
         projects: projects,
+        categories: widget.repository.categories,
         preferences: preferences,
         onOpenProject: _openProject,
         onFavorite: _toggleFavorite,
@@ -686,6 +759,10 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         onRestore: _restore,
         onDelete: _deleteForever,
         onImportProject: _importProjectBundle,
+        onResumeProject: _resumeStandalone,
+        onCreateCategory: _createCategory,
+        onRenameCategory: _renameCategory,
+        onDeleteCategory: _deleteCategory,
       ),
       SettingsScreen(
         preferences: preferences,

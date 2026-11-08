@@ -229,6 +229,8 @@ class SettingsScreen extends StatelessWidget {
                               DropdownMenuItem(
                                   value: 'm4a', child: Text('M4A / AAC')),
                               DropdownMenuItem(
+                                  value: 'mp3', child: Text('MP3')),
+                              DropdownMenuItem(
                                   value: 'wav', child: Text('WAV / PCM')),
                               DropdownMenuItem(
                                   value: 'flac', child: Text('FLAC')),
@@ -395,8 +397,8 @@ class SettingsScreen extends StatelessWidget {
                           'Verrouiller RAVEN avec un code PIN')),
                       subtitle: Text(tr(
                           preferences,
-                          'Require a 6–12 digit PIN when RAVEN opens or returns from the background. This locks the app interface; it does not encrypt audio files.',
-                          'Demander un code PIN de 6 à 12 chiffres à l’ouverture ou au retour de RAVEN. Cela verrouille l’interface, sans chiffrer les fichiers audio.')),
+                          'Require a 4–12 digit PIN when RAVEN opens or returns from the background. This locks the app interface; it does not encrypt audio files.',
+                          'Demander un code PIN de 4 à 12 chiffres à l’ouverture ou au retour de RAVEN. Cela verrouille l’interface, sans chiffrer les fichiers audio.')),
                       value: preferences.appLockEnabled,
                       onChanged: (enabled) async {
                         final changed = await _configureAppLock(
@@ -539,8 +541,8 @@ Future<bool> _configureAppLock(
             if (enable) ...<Widget>[
               Text(tr(
                   preferences,
-                  'Choose 6 to 12 digits. If you forget this PIN, you may need to clear app data to regain access; keep your recordings backed up.',
-                  'Choisissez 6 à 12 chiffres. Si vous oubliez ce code, il peut être nécessaire d’effacer les données de l’application pour retrouver l’accès ; sauvegardez vos enregistrements.')),
+                  'Choose 4 to 12 digits. If you forget this PIN, you may need to clear app data to regain access; keep your recordings backed up.',
+                  'Choisissez 4 à 12 chiffres. Si vous oubliez ce code, il peut être nécessaire d’effacer les données de l’application pour retrouver l’accès ; sauvegardez vos enregistrements.')),
               const SizedBox(height: 12),
               TextField(
                   controller: pinController,

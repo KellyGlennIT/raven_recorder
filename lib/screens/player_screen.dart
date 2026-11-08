@@ -520,9 +520,67 @@ class _PlayerScreenState extends State<PlayerScreen> {
             outputDirectory: Directory(
                 '${widget.repository.projectsDirectory.path}/${_project.id}/sessions'),
             projectId: _project.id,
-            format: _project.sessions.last.format,
+            format: widget.preferences.recordingFormat,
           );
           await _saveProject(_project.copyWith(masterAudioPath: master.path));
+          if (_project.requiresAppPin) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                content: Text(tr(
+                  widget.preferences,
+                  'Recovered audio remains private because this recording requires a PIN.',
+                  'L’audio récupéré reste privé, car cet enregistrement exige un code PIN.',
+                )),
+              ));
+            }
+          } else {
+            final previousPublicCopy = _project.publicCopyLocation;
+            String? newPublicCopy;
+            try {
+              newPublicCopy = await AudioVisibilityService().publish(
+                source: File(master.path),
+                title: _project.title,
+                projectId: _project.id,
+              );
+              await _saveProject(_project.copyWith(
+                publicCopyLocation: newPublicCopy,
+              ));
+              if (previousPublicCopy != null &&
+                  previousPublicCopy != newPublicCopy) {
+                try {
+                  await AudioVisibilityService().remove(previousPublicCopy);
+                } catch (cleanupError) {
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                      content: Text(
+                          'The new audio was published, but the previous public copy could not be removed: $cleanupError'),
+                    ));
+                  }
+                }
+              }
+            } catch (publishError) {
+              Object failure = publishError;
+              if (newPublicCopy != null &&
+                  _project.publicCopyLocation != newPublicCopy) {
+                try {
+                  await AudioVisibilityService().remove(newPublicCopy);
+                } catch (cleanupError) {
+                  failure = StateError(
+                    '$publishError The new public copy could not be cleaned up: $cleanupError',
+                  );
+                }
+              }
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  content: Text(tr(
+                    widget.preferences,
+                    'Recovered audio is saved in RAVEN, but could not be published: $failure',
+                    'L’audio récupéré est enregistré dans RAVEN, mais n’a pas pu être publié : $failure',
+                  )),
+                ));
+              }
+            }
+          }
         } catch (mergeError) {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(SnackBar(
