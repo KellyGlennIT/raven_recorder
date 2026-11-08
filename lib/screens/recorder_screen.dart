@@ -25,10 +25,13 @@ class RecorderScreen extends StatefulWidget {
   final ProjectRepository repository;
   final AppPreferences preferences;
   final VoidCallback onSaved;
+
   /// When set, this recording becomes another session in the existing project.
   final RavenProject? continueProject;
+
   /// Optional display title for a user-created scheduled recording.
   final String? initialTitle;
+
   /// Controls whether a fresh recording starts as a new project or a single take.
   final bool createProject;
 
@@ -80,7 +83,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
     try {
       final hasPermission = await _recorder.hasPermission();
       if (!hasPermission) {
-        _showMessage(tr(widget.preferences, 'Microphone permission is required.',
+        _showMessage(tr(
+            widget.preferences,
+            'Microphone permission is required.',
             'L’autorisation du microphone est nécessaire.'));
         if (mounted) Navigator.of(context).pop();
         return;
@@ -88,16 +93,19 @@ class _RecorderScreenState extends State<RecorderScreen> {
 
       final existingProject = widget.continueProject;
       if (existingProject?.isAudioProtected == true) {
-        throw StateError('Decrypt this project before adding another recording session.');
+        throw StateError(
+            'Decrypt this project before adding another recording session.');
       }
       final projectId = existingProject?.id ?? widget.repository.newId();
-      final shouldCreateProject = existingProject != null || widget.createProject;
+      final shouldCreateProject =
+          existingProject != null || widget.createProject;
       final sessionId = const Uuid().v4();
       final createdAt = DateTime.now();
       final projectDirectory = shouldCreateProject
           ? (existingProject == null
               ? await widget.repository.createProjectDirectory(projectId)
-              : Directory('${widget.repository.projectsDirectory.path}/$projectId'))
+              : Directory(
+                  '${widget.repository.projectsDirectory.path}/$projectId'))
           : Directory('${widget.repository.projectsDirectory.path}/$projectId');
       await projectDirectory.create(recursive: true);
       final sessionDirectory = Directory('${projectDirectory.path}/sessions');
@@ -108,7 +116,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
       _sessionId = sessionId;
       _outputPath = filePath;
       _startedAt = createdAt;
-      final titleStamp = DateFormat('dd MMM yyyy, HH:mm', 'en').format(createdAt);
+      final titleStamp =
+          DateFormat('dd MMM yyyy, HH:mm', 'en').format(createdAt);
       final scheduledTitle = widget.initialTitle?.trim();
       final draftTitle = existingProject?.title ??
           (scheduledTitle != null && scheduledTitle.isNotEmpty
@@ -134,7 +143,10 @@ class _RecorderScreenState extends State<RecorderScreen> {
             )
           : existingProject.copyWith(
               updatedAt: createdAt,
-              sessions: <RavenAudioSession>[...existingProject.sessions, newSession],
+              sessions: <RavenAudioSession>[
+                ...existingProject.sessions,
+                newSession
+              ],
               isDraft: true,
               clearMasterAudioPath: true,
             );
@@ -186,7 +198,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
       if (mounted) setState(() => _started = true);
     } catch (error) {
       _lastError = error;
-      _showMessage(tr(widget.preferences, 'Could not start recording. Check microphone access and storage.',
+      _showMessage(tr(
+          widget.preferences,
+          'Could not start recording. Check microphone access and storage.',
           'Impossible de démarrer l’enregistrement. Vérifiez le microphone et le stockage.'));
       final id = _projectId;
       if (id != null) {
@@ -195,14 +209,19 @@ class _RecorderScreenState extends State<RecorderScreen> {
             final original = widget.continueProject!;
             await widget.repository.update(original);
             final partial = _outputPath == null ? null : File(_outputPath!);
-            if (partial != null && await partial.exists()) await partial.delete();
+            if (partial != null && await partial.exists()) {
+              await partial.delete();
+            }
           } else {
             final draft = widget.repository.projectById(id);
             if (draft != null) {
               await widget.repository.deleteForever(draft);
             } else {
-              final directory = Directory('${widget.repository.projectsDirectory.path}/$id');
-              if (await directory.exists()) await directory.delete(recursive: true);
+              final directory =
+                  Directory('${widget.repository.projectsDirectory.path}/$id');
+              if (await directory.exists()) {
+                await directory.delete(recursive: true);
+              }
             }
           }
         } catch (_) {
@@ -229,7 +248,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
         if (mounted) setState(() => _paused = true);
       }
     } catch (error) {
-      _showMessage('${tr(widget.preferences, 'Recording control failed', 'Le contrôle de l’enregistrement a échoué')}: $error');
+      _showMessage(
+          '${tr(widget.preferences, 'Recording control failed', 'Le contrôle de l’enregistrement a échoué')}: $error');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -258,7 +278,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
         throw StateError('Missing recording identity.');
       }
       final draft = widget.repository.projectById(projectId);
-      if (draft == null) throw StateError('Recoverable project draft is missing.');
+      if (draft == null) {
+        throw StateError('Recoverable project draft is missing.');
+      }
       // Continuing clears the master pointer while source sessions are appended.
       // Keep the previous file until this new source session is durably committed.
       final previousMasterPath = widget.continueProject?.masterAudioPath;
@@ -268,13 +290,15 @@ class _RecorderScreenState extends State<RecorderScreen> {
                 ? widget.initialTitle!.trim()
                 : '${tr(widget.preferences, 'Recording', 'Enregistrement')} — ${DateFormat('dd MMM yyyy, HH:mm', 'en').format(createdAt)}'),
         updatedAt: DateTime.now(),
-        sessions: draft.sessions.map((session) => session.id == sessionId
-            ? session.copyWith(
-                audioPath: path,
-                durationMs: _clock.elapsedMilliseconds,
-                format: widget.preferences.recordingFormat,
-              )
-            : session).toList(),
+        sessions: draft.sessions
+            .map((session) => session.id == sessionId
+                ? session.copyWith(
+                    audioPath: path,
+                    durationMs: _clock.elapsedMilliseconds,
+                    format: widget.preferences.recordingFormat,
+                  )
+                : session)
+            .toList(),
         isDraft: false,
         clearMasterAudioPath: true,
       );
@@ -282,7 +306,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
       // interrupted, the original segments remain playable and recoverable.
       await widget.repository.update(project);
       try {
-        final sessionDirectory = Directory('${widget.repository.projectsDirectory.path}/$projectId/sessions');
+        final sessionDirectory = Directory(
+            '${widget.repository.projectsDirectory.path}/$projectId/sessions');
         final master = await AudioMergeService().mergeProject(
           sessions: project.sessions,
           outputDirectory: sessionDirectory,
@@ -295,14 +320,16 @@ class _RecorderScreenState extends State<RecorderScreen> {
         await widget.repository.update(project);
       } catch (mergeError) {
         // Keep the successful recording even if an optional master rebuild fails.
-        _showMessage(tr(widget.preferences,
-          'Recording saved. RAVEN will play the parts in sequence because the master merge could not finish: $mergeError',
-          'Enregistrement sauvegardé. RAVEN lira les parties à la suite, car la fusion principale n’a pas abouti : $mergeError'));
+        _showMessage(tr(
+            widget.preferences,
+            'Recording saved. RAVEN will play the parts in sequence because the master merge could not finish: $mergeError',
+            'Enregistrement sauvegardé. RAVEN lira les parties à la suite, car la fusion principale n’a pas abouti : $mergeError'));
       }
       // The segment files are now the durable source of truth and the project
       // index no longer refers to the old master. Clean it up only after commit;
       // do not delete a path that the new project is still using.
-      if (previousMasterPath != null && previousMasterPath != project.masterAudioPath) {
+      if (previousMasterPath != null &&
+          previousMasterPath != project.masterAudioPath) {
         try {
           final previousMaster = File(previousMasterPath);
           if (await previousMaster.exists()) await previousMaster.delete();
@@ -314,7 +341,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
       if (mounted) Navigator.of(context).pop();
     } catch (error) {
       _lastError = error;
-      _showMessage('${tr(widget.preferences, 'Could not save this recording', 'Impossible d’enregistrer ce fichier')}: $error');
+      _showMessage(
+          '${tr(widget.preferences, 'Could not save this recording', 'Impossible d’enregistrer ce fichier')}: $error');
     } finally {
       if (mounted) {
         setState(() {
@@ -349,15 +377,19 @@ class _RecorderScreenState extends State<RecorderScreen> {
           if (draft != null) {
             await widget.repository.deleteForever(draft);
           } else {
-            final directory = Directory('${widget.repository.projectsDirectory.path}/$id');
-            if (await directory.exists()) await directory.delete(recursive: true);
+            final directory =
+                Directory('${widget.repository.projectsDirectory.path}/$id');
+            if (await directory.exists()) {
+              await directory.delete(recursive: true);
+            }
           }
         }
       }
       _clock.stop();
       if (close && mounted) Navigator.of(context).pop();
     } catch (error) {
-      _showMessage('${tr(widget.preferences, 'Could not discard recording', 'Impossible d’annuler l’enregistrement')}: $error');
+      _showMessage(
+          '${tr(widget.preferences, 'Could not discard recording', 'Impossible d’annuler l’enregistrement')}: $error');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -372,8 +404,10 @@ class _RecorderScreenState extends State<RecorderScreen> {
     final discard = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: Text(tr(widget.preferences, 'Discard recording?', 'Annuler l’enregistrement ?')),
-        content: Text(tr(widget.preferences,
+        title: Text(tr(widget.preferences, 'Discard recording?',
+            'Annuler l’enregistrement ?')),
+        content: Text(tr(
+            widget.preferences,
             'The audio that has not been saved will be deleted.',
             'L’audio non enregistré sera supprimé.')),
         actions: <Widget>[
@@ -406,7 +440,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
     final hours = duration.inHours;
     final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
     final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
-    if (hours > 0) return '${hours.toString().padLeft(2, '0')}:$minutes:$seconds';
+    if (hours > 0) {
+      return '${hours.toString().padLeft(2, '0')}:$minutes:$seconds';
+    }
     return '$minutes:$seconds';
   }
 
@@ -427,7 +463,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
       child: Scaffold(
         appBar: AppBar(
           leading: IconButton(
-            tooltip: tr(widget.preferences, 'Close recorder', 'Fermer l’enregistreur'),
+            tooltip: tr(
+                widget.preferences, 'Close recorder', 'Fermer l’enregistreur'),
             onPressed: () async {
               final shouldClose = await _requestExit();
               if (!context.mounted) return;
@@ -435,125 +472,198 @@ class _RecorderScreenState extends State<RecorderScreen> {
             },
             icon: const Icon(Icons.close_rounded),
           ),
-          title: Text(tr(widget.preferences, 'New recording', 'Nouvel enregistrement')),
+          title: Text(
+              tr(widget.preferences, 'New recording', 'Nouvel enregistrement')),
           centerTitle: true,
         ),
         body: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(24, 12, 24, 28),
-            child: Column(
-              children: <Widget>[
-                const Spacer(flex: 2),
-                Container(
-                  width: 92,
-                  height: 92,
-                  decoration: BoxDecoration(
-                    color: accent.withValues(alpha: 0.12),
-                    shape: BoxShape.circle,
-                    border: Border.all(color: accent.withValues(alpha: 0.35)),
-                  ),
-                  child: Icon(Icons.graphic_eq_rounded, size: 44, color: accent),
-                ),
-                const SizedBox(height: 28),
-                Text(
-                  _paused
-                      ? tr(widget.preferences, 'Recording paused', 'Enregistrement en pause')
-                      : _started
-                          ? tr(widget.preferences, 'Recording in progress', 'Enregistrement en cours')
-                          : tr(widget.preferences, 'Preparing microphone…', 'Préparation du microphone…'),
-                  style: theme.textTheme.titleMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-                ),
-                const SizedBox(height: 12),
-                Semantics(
-                  label: tr(widget.preferences, 'Elapsed time', 'Temps écoulé'),
-                  child: Text(
-                    _elapsed,
-                    style: theme.textTheme.displayMedium?.copyWith(
-                      fontFeatures: const <FontFeature>[FontFeature.tabularFigures()],
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 2,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final isCompact = constraints.maxHeight < 600;
+              return SingleChildScrollView(
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                  child: Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      isCompact ? 16 : 24,
+                      isCompact ? 8 : 12,
+                      isCompact ? 16 : 24,
+                      isCompact ? 12 : 28,
                     ),
-                  ),
-                ),
-                const SizedBox(height: 26),
-                SizedBox(
-                  height: 86,
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: List<Widget>.generate(_levels.length, (index) {
-                      final level = _paused ? 0.10 : _levels[index];
-                      return AnimatedContainer(
-                        duration: const Duration(milliseconds: 100),
-                        width: 3.2,
-                        height: 10 + (level * 72),
-                        decoration: BoxDecoration(
-                          color: accent.withValues(alpha: 0.35 + (level * 0.65)),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                      );
-                    }),
-                  ),
-                ),
-                const SizedBox(height: 22),
-                Text(
-                  _lastError == null
-                      ? tr(widget.preferences, 'Saved privately on this device', 'Enregistré en privé sur cet appareil')
-                      : tr(widget.preferences, 'Visualization is unavailable; recording can continue.', 'Visualisation indisponible ; l’enregistrement peut continuer.'),
-                  textAlign: TextAlign.center,
-                  style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-                ),
-                const Spacer(flex: 3),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                  children: <Widget>[
-                    _RoundAction(
-                      icon: Icons.delete_outline_rounded,
-                      label: tr(widget.preferences, 'Discard', 'Annuler'),
-                      onPressed: (!_started || _busy) ? null : () async {
-                        final confirmed = await showDialog<bool>(
-                          context: context,
-                          builder: (dialogContext) => AlertDialog(
-                            title: Text(tr(widget.preferences, 'Discard recording?', 'Annuler l’enregistrement ?')),
-                            content: Text(tr(widget.preferences, 'This recording will be deleted.', 'Cet enregistrement sera supprimé.')),
-                            actions: <Widget>[
-                              TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: Text(tr(widget.preferences, 'Keep', 'Garder'))),
-                              FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: Text(tr(widget.preferences, 'Discard', 'Annuler'))),
-                            ],
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: <Widget>[
+                        Container(
+                          width: isCompact ? 72 : 92,
+                          height: isCompact ? 72 : 92,
+                          decoration: BoxDecoration(
+                            color: accent.withValues(alpha: 0.12),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                                color: accent.withValues(alpha: 0.35)),
                           ),
-                        );
-                        if (confirmed == true) await _discardRecording();
-                      },
-                    ),
-                    GestureDetector(
-                      onTap: (!_started || _busy) ? null : _togglePause,
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 180),
-                        width: 88,
-                        height: 88,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: accent,
-                          boxShadow: <BoxShadow>[
-                            BoxShadow(color: accent.withValues(alpha: 0.28), blurRadius: 26, spreadRadius: 2),
+                          child: Icon(Icons.graphic_eq_rounded,
+                              size: isCompact ? 36 : 44, color: accent),
+                        ),
+                        SizedBox(height: isCompact ? 10 : 24),
+                        Text(
+                          _paused
+                              ? tr(widget.preferences, 'Recording paused',
+                                  'Enregistrement en pause')
+                              : _started
+                                  ? tr(
+                                      widget.preferences,
+                                      'Recording in progress',
+                                      'Enregistrement en cours')
+                                  : tr(
+                                      widget.preferences,
+                                      'Preparing microphone…',
+                                      'Préparation du microphone…'),
+                          style: theme.textTheme.titleMedium?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant),
+                        ),
+                        const SizedBox(height: 12),
+                        Semantics(
+                          label: tr(widget.preferences, 'Elapsed time',
+                              'Temps écoulé'),
+                          child: Text(
+                            _elapsed,
+                            style: theme.textTheme.displayMedium?.copyWith(
+                              fontFeatures: const <FontFeature>[
+                                FontFeature.tabularFigures()
+                              ],
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: 2,
+                            ),
+                          ),
+                        ),
+                        SizedBox(height: isCompact ? 8 : 20),
+                        SizedBox(
+                          height: isCompact ? 56 : 76,
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                            children:
+                                List<Widget>.generate(_levels.length, (index) {
+                              final level = _paused ? 0.10 : _levels[index];
+                              return AnimatedContainer(
+                                duration: const Duration(milliseconds: 100),
+                                width: 3.2,
+                                height: 8 + (level * (isCompact ? 46 : 64)),
+                                decoration: BoxDecoration(
+                                  color: accent.withValues(
+                                      alpha: 0.35 + (level * 0.65)),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                              );
+                            }),
+                          ),
+                        ),
+                        SizedBox(height: isCompact ? 8 : 18),
+                        Text(
+                          _lastError == null
+                              ? tr(
+                                  widget.preferences,
+                                  'Saved privately on this device',
+                                  'Enregistré en privé sur cet appareil')
+                              : tr(
+                                  widget.preferences,
+                                  'Visualization is unavailable; recording can continue.',
+                                  'Visualisation indisponible ; l’enregistrement peut continuer.'),
+                          textAlign: TextAlign.center,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant),
+                        ),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                          children: <Widget>[
+                            _RoundAction(
+                              icon: Icons.delete_outline_rounded,
+                              label:
+                                  tr(widget.preferences, 'Discard', 'Annuler'),
+                              onPressed: (!_started || _busy)
+                                  ? null
+                                  : () async {
+                                      final confirmed = await showDialog<bool>(
+                                        context: context,
+                                        builder: (dialogContext) => AlertDialog(
+                                          title: Text(tr(
+                                              widget.preferences,
+                                              'Discard recording?',
+                                              'Annuler l’enregistrement ?')),
+                                          content: Text(tr(
+                                              widget.preferences,
+                                              'This recording will be deleted.',
+                                              'Cet enregistrement sera supprimé.')),
+                                          actions: <Widget>[
+                                            TextButton(
+                                                onPressed: () => Navigator.pop(
+                                                    dialogContext, false),
+                                                child: Text(tr(
+                                                    widget.preferences,
+                                                    'Keep',
+                                                    'Garder'))),
+                                            FilledButton(
+                                                onPressed: () => Navigator.pop(
+                                                    dialogContext, true),
+                                                child: Text(tr(
+                                                    widget.preferences,
+                                                    'Discard',
+                                                    'Annuler'))),
+                                          ],
+                                        ),
+                                      );
+                                      if (confirmed == true) {
+                                        await _discardRecording();
+                                      }
+                                    },
+                            ),
+                            GestureDetector(
+                              onTap: (!_started || _busy) ? null : _togglePause,
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 180),
+                                width: isCompact ? 72 : 88,
+                                height: isCompact ? 72 : 88,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: accent,
+                                  boxShadow: <BoxShadow>[
+                                    BoxShadow(
+                                        color: accent.withValues(alpha: 0.28),
+                                        blurRadius: 26,
+                                        spreadRadius: 2),
+                                  ],
+                                ),
+                                child: _busy
+                                    ? const Padding(
+                                        padding: EdgeInsets.all(28),
+                                        child: CircularProgressIndicator(
+                                            strokeWidth: 2.4))
+                                    : Icon(
+                                        _paused
+                                            ? Icons.play_arrow_rounded
+                                            : Icons.pause_rounded,
+                                        size: 42,
+                                        color: theme.colorScheme.onPrimary),
+                              ),
+                            ),
+                            _RoundAction(
+                              icon: Icons.check_rounded,
+                              label:
+                                  tr(widget.preferences, 'Save', 'Enregistrer'),
+                              isPrimary: true,
+                              onPressed: (!_started || _busy || _saving)
+                                  ? null
+                                  : _saveRecording,
+                            ),
                           ],
                         ),
-                        child: _busy
-                            ? const Padding(padding: EdgeInsets.all(28), child: CircularProgressIndicator(strokeWidth: 2.4))
-                            : Icon(_paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
-                                size: 42, color: theme.colorScheme.onPrimary),
-                      ),
+                      ],
                     ),
-                    _RoundAction(
-                      icon: Icons.check_rounded,
-                      label: tr(widget.preferences, 'Save', 'Enregistrer'),
-                      isPrimary: true,
-                      onPressed: (!_started || _busy || _saving) ? null : _saveRecording,
-                    ),
-                  ],
+                  ),
                 ),
-              ],
-            ),
+              );
+            },
           ),
         ),
       ),
@@ -587,12 +697,15 @@ class _RoundAction extends StatelessWidget {
             iconSize: 26,
             style: IconButton.styleFrom(
               fixedSize: const Size(54, 54),
-              backgroundColor: isPrimary ? theme.colorScheme.primaryContainer : null,
-              foregroundColor: isPrimary ? theme.colorScheme.onPrimaryContainer : null,
+              backgroundColor:
+                  isPrimary ? theme.colorScheme.primaryContainer : null,
+              foregroundColor:
+                  isPrimary ? theme.colorScheme.onPrimaryContainer : null,
             ),
           ),
           const SizedBox(height: 7),
-          Text(label, textAlign: TextAlign.center, style: theme.textTheme.labelSmall),
+          Text(label,
+              textAlign: TextAlign.center, style: theme.textTheme.labelSmall),
         ],
       ),
     );
