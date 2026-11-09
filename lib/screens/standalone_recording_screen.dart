@@ -1,11 +1,15 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
 import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../models/raven_project.dart';
 import '../services/app_preferences.dart';
+import '../services/playback_service.dart';
 
 class StandaloneRecordingScreen extends StatefulWidget {
   const StandaloneRecordingScreen({
@@ -18,6 +22,8 @@ class StandaloneRecordingScreen extends StatefulWidget {
     required this.onRename,
     required this.onToggleEncryption,
     required this.onToggleVisibility,
+    this.onTogglePin,
+    this.autoPlay = false,
     super.key,
   });
 
@@ -30,6 +36,8 @@ class StandaloneRecordingScreen extends StatefulWidget {
   final Future<bool> Function(String title) onRename;
   final Future<void> Function() onToggleEncryption;
   final Future<String?> Function() onToggleVisibility;
+  final Future<void> Function()? onTogglePin;
+  final bool autoPlay;
 
   @override
   State<StandaloneRecordingScreen> createState() =>
@@ -37,8 +45,9 @@ class StandaloneRecordingScreen extends StatefulWidget {
 }
 
 class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
-  final AudioPlayer _player = AudioPlayer();
+  AudioPlayer get _player => PlaybackService().player;
   late String _title;
+  late bool _requiresPin;
   String? _publicCopyLocation;
   String? _error;
   bool _loading = true;
@@ -47,6 +56,7 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
   void initState() {
     super.initState();
     _title = widget.project.title;
+    _requiresPin = widget.project.requiresAppPin;
     _publicCopyLocation = widget.project.publicFolderLocation ??
         widget.project.publicCopyLocation;
     _loadAudio();
@@ -54,15 +64,59 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
 
   @override
   void dispose() {
-    _player.dispose();
+    // Shared global player lives across screens and processes background playback.
     super.dispose();
   }
 
-  Future<void> _loadAudio() async {
+  Future<Uri?> _artUri() async {
     try {
+      final temp = await getTemporaryDirectory();
+      final cached = File('${temp.path}/raven_notification_logo.png');
+      if (!await cached.exists()) {
+        final bytes = await rootBundle.load('assets/images/raven_logo.png');
+        await cached.writeAsBytes(bytes.buffer.asUint8List(), flush: true);
+      }
+      return Uri.file(cached.path);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _loadAudio() async {
+    final masterPath = widget.project.masterAudioPath;
+    final masterExists = masterPath != null && await File(masterPath).exists();
+    if (widget.project.sessions.isEmpty && !masterExists) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = tr(widget.preferences, 'This standalone recording has no audio yet.',
+              'Cet enregistrement ne contient pas encore d’audio.');
+        });
+      }
+      return;
+    }
+    try {
+      Uri? artUri;
+      try {
+        artUri = await _artUri().timeout(const Duration(milliseconds: 400),
+            onTimeout: () => null);
+      } catch (_) {}
+      final mediaItem = MediaItem(
+        id: widget.project.id,
+        title: _title,
+        album: 'RAVEN',
+        duration: widget.project.sessions.isNotEmpty
+            ? Duration(milliseconds: widget.project.sessions.first.durationMs)
+            : null,
+        artUri: artUri,
+      );
+
       final master = widget.project.masterAudioPath;
       if (master != null && await File(master).exists()) {
-        await _player.setAudioSource(AudioSource.uri(Uri.file(master)));
+        await _player.setAudioSource(
+          AudioSource.uri(Uri.file(master), tag: mediaItem),
+          initialPosition: Duration.zero,
+        );
       } else {
         final sources = <AudioSource>[];
         for (final session in widget.project.sessions) {
@@ -71,7 +125,7 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
             throw FileSystemException(
                 'A recording segment is missing.', file.path);
           }
-          sources.add(AudioSource.uri(Uri.file(file.path)));
+          sources.add(AudioSource.uri(Uri.file(file.path), tag: mediaItem));
         }
         if (sources.isEmpty) {
           throw StateError('This standalone recording has no audio yet.');
@@ -83,7 +137,11 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
                   children: sources,
                   useLazyPreparation: true,
                 ),
+          initialPosition: Duration.zero,
         );
+      }
+      if (widget.autoPlay && mounted) {
+        await _player.play();
       }
     } catch (error) {
       _error = error.toString();
@@ -118,6 +176,10 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
               if (action == 'create_project') widget.onCreateProject();
               if (action == 'share') await widget.onShare();
               if (action == 'rename') await _renameRecording();
+              if (action == 'pin' && widget.onTogglePin != null) {
+                await widget.onTogglePin!();
+                if (mounted) setState(() => _requiresPin = !_requiresPin);
+              }
               if (action == 'encryption') {
                 await _player.pause();
                 await widget.onToggleEncryption();
@@ -138,6 +200,16 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
               }
             },
             itemBuilder: (context) => <PopupMenuEntry<String>>[
+              PopupMenuItem<String>(
+                value: 'pin',
+                child: Text(tr(
+                  widget.preferences,
+                  _requiresPin ? 'Remove PIN lock' : 'Require PIN to open',
+                  _requiresPin
+                      ? 'Retirer le verrouillage PIN'
+                      : 'Exiger un PIN pour ouvrir',
+                )),
+              ),
               PopupMenuItem<String>(
                 value: 'share',
                 child: Text(
@@ -351,25 +423,30 @@ class _RenameRecordingDialogState extends State<_RenameRecordingDialog> {
   }
 
   @override
-  Widget build(BuildContext context) => AlertDialog(
-        title: Text(tr(widget.preferences, 'Rename recording', 'Renommer')),
-        content: TextField(
-          controller: _controller,
-          autofocus: true,
-          maxLength: 80,
-          decoration: InputDecoration(
-              labelText: tr(widget.preferences, 'Recording title', 'Titre')),
-          onSubmitted: (value) => Navigator.pop(context, value.trim()),
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(tr(
+          widget.preferences, 'Rename recording', 'Renommer l’enregistrement')),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        maxLength: 80,
+        decoration: InputDecoration(
+          labelText: tr(widget.preferences, 'Recording title',
+              'Titre de l’enregistrement'),
         ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, _controller.text.trim()),
-            child: Text(tr(widget.preferences, 'Save', 'Enregistrer')),
-          ),
-        ],
-      );
+        onSubmitted: (value) => Navigator.pop(context, value.trim()),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _controller.text.trim()),
+          child: Text(tr(widget.preferences, 'Save', 'Enregistrer')),
+        ),
+      ],
+    );
+  }
 }

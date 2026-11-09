@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:intl/intl.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 
@@ -17,11 +18,11 @@ import '../services/audio_encryption_service.dart';
 import '../services/project_repository.dart';
 import '../services/ai_provider_service.dart';
 import '../services/ai_key_vault.dart';
-import '../services/audio_merge_service.dart';
 import '../services/audio_visibility_service.dart';
 import '../services/audio_share_service.dart';
 import '../services/audio_protection_service.dart';
 import '../services/document_export_service.dart';
+import '../services/playback_service.dart';
 import '../widgets/audio_password_dialog.dart';
 import 'recorder_screen.dart';
 
@@ -43,11 +44,15 @@ class PlayerScreen extends StatefulWidget {
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends State<PlayerScreen> {
-  final AudioPlayer _player = AudioPlayer();
+class _PlayerScreenState extends State<PlayerScreen>
+    with SingleTickerProviderStateMixin {
+  // Shared, app-wide player — playback survives navigating away from this
+  // screen and backgrounding the app. Do NOT dispose here.
+  AudioPlayer get _player => PlaybackService().player;
+
   final AudioEncryptionService _encryption = AudioEncryptionService();
-  final List<String> _temporaryDecryptedPaths = <String>[];
   final TextEditingController _notesController = TextEditingController();
+  late TabController _tabController;
   late RavenProject _project;
   bool _loading = true;
   bool _savingNotes = false;
@@ -55,9 +60,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   String? _error;
   String? _securityWarning;
 
-  /// Index of the recording currently loaded in the player. Each recording is
-  /// played on its own: tapping a recording loads only that file, so the
-  /// position, duration and seek bar always refer to a single recording.
+  List<File> _attachments = const <File>[];
+
   int _activeIndex = 0;
 
   @override
@@ -65,8 +69,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
     super.initState();
     _project = widget.project;
     _notesController.text = _project.notes;
+    _notesController.addListener(_onNotesChanged);
+    _tabController = TabController(length: 4, vsync: this);
     _activeIndex = _project.sessions.isEmpty ? 0 : _project.sessions.length - 1;
     _loadSelectedSession();
+    _loadAttachments();
+  }
+
+  void _onNotesChanged() {
+    if (mounted) setState(() {});
+  }
+
+  int get _notesWordCount {
+    final text = _notesController.text.trim();
+    if (text.isEmpty) return 0;
+    return text.split(RegExp(r'\s+')).where((s) => s.isNotEmpty).length;
+  }
+
+  int get _totalProjectDurationMs {
+    return _project.sessions.fold<int>(0, (sum, s) => sum + s.durationMs);
+  }
+
+  Future<void> _seekRelative(int seconds) async {
+    if (_project.sessions.isEmpty) return;
+    final current = _player.position;
+    final target = current + Duration(seconds: seconds);
+    final maxDuration = Duration(milliseconds: _activeDurationMs);
+    final clamped = target < Duration.zero
+        ? Duration.zero
+        : (target > maxDuration ? maxDuration : target);
+    await _player.seek(clamped);
   }
 
   @override
@@ -79,19 +111,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _activeIndex =
           _project.sessions.isEmpty ? 0 : _project.sessions.length - 1;
       _loadSelectedSession();
+      _loadAttachments();
     }
   }
 
   @override
   void dispose() {
+    _notesController.removeListener(_onNotesChanged);
     _notesController.dispose();
-    _player.dispose();
-    // Best-effort cleanup: the OS may also remove temporary files after exit.
-    for (final tempPath in _temporaryDecryptedPaths) {
-      File(tempPath)
-          .delete()
-          .catchError((Object _, StackTrace __) => File(tempPath));
-    }
+    _tabController.dispose();
+    // NOTE: do NOT dispose `_player` here — it's global and used for
+    // background playback. `AudioEncryptionService.cleanupAbandonedPlaybackFiles()`
+    // on next launch cleans any leftover temp decrypted files.
     super.dispose();
   }
 
@@ -99,8 +130,58 @@ class _PlayerScreenState extends State<PlayerScreen> {
       ? null
       : _project.sessions[_activeIndex.clamp(0, _project.sessions.length - 1)];
 
-  /// Loads one recording into the player. Only the selected recording is
-  /// played; the other recordings in the project stay untouched on disk.
+  /// Album art for the media notification:
+  /// 1. The project's first image attachment, if any.
+  /// 2. Otherwise the RAVEN logo, cached to a temp file.
+  Future<Uri?> _artUriForSession(RavenAudioSession session) async {
+    final images = _attachments.where(_isImageAttachment);
+    if (images.isNotEmpty) {
+      return Uri.file(images.first.path);
+    }
+    try {
+      final temp = await getTemporaryDirectory();
+      final cached = File('${temp.path}/raven_notification_logo.png');
+      if (!await cached.exists()) {
+        final bytes = await rootBundle.load('assets/images/raven_logo.png');
+        await cached.writeAsBytes(bytes.buffer.asUint8List(), flush: true);
+      }
+      return Uri.file(cached.path);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Builds the [MediaItem] shown in the notification for [session].
+  Future<MediaItem> _mediaItemFor(
+    RavenAudioSession session, {
+    String? overrideTitle,
+  }) async {
+    final sessionNumber =
+        _project.sessions.indexWhere((s) => s.id == session.id) + 1;
+    final title = overrideTitle ??
+        (session.name.isEmpty
+            ? tr(widget.preferences, 'Recording $sessionNumber',
+                'Enregistrement $sessionNumber')
+            : session.name);
+    return MediaItem(
+      id: session.id,
+      title: title,
+      album: _project.title,
+      duration: Duration(milliseconds: session.durationMs),
+      artUri: await _artUriForSession(session),
+    );
+  }
+
+  Future<void> _loadAttachments() async {
+    try {
+      final files = await AttachmentService(widget.repository).list(_project.id);
+      if (!mounted) return;
+      setState(() => _attachments = files);
+    } catch (_) {
+      if (mounted) setState(() => _attachments = const <File>[]);
+    }
+  }
+
   Future<void> _playRecording(int index) async {
     if (_project.sessions.isEmpty) return;
     final target = index.clamp(0, _project.sessions.length - 1);
@@ -210,7 +291,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return null;
   }
 
-  /// Position inside the recording that is currently loaded.
   int _globalPositionMs(int? index, Duration localPosition) =>
       localPosition.inMilliseconds;
 
@@ -219,7 +299,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await _player.seek(Duration(milliseconds: milliseconds));
   }
 
-  /// Duration of the recording currently loaded in the player.
   int get _activeDurationMs {
     final session = _session;
     if (session == null) return 0;
@@ -262,30 +341,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final masterExists =
           masterPath != null && await File(masterPath).exists();
 
-      // Protected projects must never use a plaintext master. If a stale master
-      // exists, attempt cleanup, but keep source sessions as the recovery path.
       if (masterPath != null && (_project.isAudioProtected || !masterExists)) {
         if (_project.isAudioProtected && masterExists) {
           try {
             await File(masterPath).delete();
           } on FileSystemException {
-            // A later cleanup may succeed after the player releases old handles.
+            // A later cleanup may succeed after the player releases handles.
           }
         }
         final withoutMaster = _project.copyWith(clearMasterAudioPath: true);
         try {
           await _saveProject(withoutMaster);
         } catch (_) {
-          // Playback should not be blocked by a failed metadata write. Keep the
-          // corrected state in memory and report persistence via later saves.
           _project = withoutMaster;
           widget.onProjectChanged(withoutMaster);
         }
       }
 
-      // Each recording is played on its own. The merged master is only used
-      // when the project holds a single recording, so tapping a recording never
-      // plays the other recordings of the project.
       final selected = _session;
       if (selected == null) {
         _error = tr(
@@ -294,21 +366,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
             'Ce projet ne contient pas encore de session audio.');
         return false;
       }
+
       final useMaster = masterPath != null &&
           !_project.isAudioProtected &&
           masterExists &&
           _project.sessions.length == 1;
       if (useMaster) {
         try {
+          final mediaItem = await _mediaItemFor(
+            selected,
+            overrideTitle: _project.title,
+          );
           await _player.setAudioSource(
-            AudioSource.uri(Uri.file(masterPath), tag: 'master'),
+            AudioSource.uri(Uri.file(masterPath), tag: mediaItem),
             initialPosition: Duration.zero,
           );
           loaded = true;
         } catch (_) {
           try {
             await _player.stop();
-          } catch (_) {}
+          } catch (_) {
+            // Best-effort: a failed stop leaves the player in an
+            // inconsistent state but the fallback session path works.
+          }
           final withoutMaster = _project.copyWith(clearMasterAudioPath: true);
           try {
             await _saveProject(withoutMaster);
@@ -337,18 +417,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
           if (await temp.exists()) await temp.delete();
           await _encryption.decryptFile(
               input: source, output: temp, key: _audioKey);
-          _temporaryDecryptedPaths.add(temp.path);
+          PlaybackService().registerTemp(temp.path);
           playbackPath = temp.path;
         }
+        final mediaItem = await _mediaItemFor(selected);
         await _player.setAudioSource(
-          AudioSource.uri(Uri.file(playbackPath), tag: selected.id),
+          AudioSource.uri(Uri.file(playbackPath), tag: mediaItem),
           initialPosition: Duration.zero,
         );
         loaded = true;
       }
 
-      // If a previous protection attempt or process crash left plaintext files,
-      // retry their cleanup only after the player has switched to safe sources.
       if (loaded && _project.isAudioProtected) {
         var cleanupFailed = false;
         for (final audioSession in _project.sessions) {
@@ -392,9 +471,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  /// Opens the attachments manager. Attachments live in their own expandable
-  /// panel on the project screen; this sheet adds full multi-select support so
-  /// several files can be selected, shared or removed at once.
   Future<void> _manageAttachments() async {
     final service = AttachmentService(widget.repository);
     final messenger = ScaffoldMessenger.of(context);
@@ -562,11 +638,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                                   Icons.broken_image_outlined),
                                         ),
                                       )
-                                    : const Icon(Icons.attach_file_rounded),
+                                    : Icon(_iconForFile(file)),
                                 title: Text(file.uri.pathSegments.last,
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis),
-                                subtitle: Text(_formatBytes(file.lengthSync())),
+                                subtitle:
+                                    Text(_formatBytes(file.lengthSync())),
                                 selected: isSelected,
                                 onTap: () {
                                   if (selecting) {
@@ -657,6 +734,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
         ),
       );
+
+      await _loadAttachments();
     } catch (error) {
       messenger.showSnackBar(SnackBar(
           content: Text(
@@ -678,6 +757,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
         path.endsWith('.gif') ||
         path.endsWith('.webp') ||
         path.endsWith('.bmp');
+  }
+
+  IconData _iconForFile(File file) {
+    final p = file.path.toLowerCase();
+    if (p.endsWith('.pdf')) return Icons.picture_as_pdf_rounded;
+    if (p.endsWith('.mp3') ||
+        p.endsWith('.m4a') ||
+        p.endsWith('.wav') ||
+        p.endsWith('.flac') ||
+        p.endsWith('.ogg')) {
+      return Icons.audiotrack_rounded;
+    }
+    if (p.endsWith('.mp4') || p.endsWith('.mov') || p.endsWith('.mkv')) {
+      return Icons.videocam_rounded;
+    }
+    if (p.endsWith('.txt') || p.endsWith('.md')) {
+      return Icons.description_rounded;
+    }
+    if (p.endsWith('.doc') || p.endsWith('.docx')) return Icons.article_rounded;
+    if (p.endsWith('.xls') || p.endsWith('.xlsx')) {
+      return Icons.table_chart_rounded;
+    }
+    return Icons.insert_drive_file_rounded;
   }
 
   Future<void> _previewAttachment(BuildContext context, File file) async {
@@ -717,6 +819,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
+  Future<void> _openAttachment(File file) async {
+    if (_isImageAttachment(file)) {
+      await _previewAttachment(context, file);
+    } else {
+      await _manageAttachments();
+    }
+  }
+
   Future<void> _continueRecording() async {
     final messenger = ScaffoldMessenger.of(context);
     final navigator = Navigator.of(context);
@@ -733,7 +843,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       builder: (_) => RecorderScreen(
         repository: widget.repository,
         preferences: widget.preferences,
-        continueProject: _project,
+        existingProject: _project,
         onSaved: () {},
       ),
     ));
@@ -742,9 +852,49 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (refreshed != null) {
       setState(() {
         _project = refreshed;
+        _activeIndex = refreshed.sessions.isEmpty
+            ? 0
+            : refreshed.sessions.length - 1;
       });
       widget.onProjectChanged(refreshed);
       await _loadSelectedSession();
+      await _loadAttachments();
+    }
+  }
+
+  Future<void> _resumeSession(RavenAudioSession session) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    if (_project.isAudioProtected) {
+      messenger.showSnackBar(SnackBar(
+          content: Text(tr(
+              widget.preferences,
+              'Decrypt this project before resuming its recording.',
+              'Déchiffrez ce projet avant de reprendre son enregistrement.'))));
+      return;
+    }
+    await _player.pause();
+    await navigator.push<void>(MaterialPageRoute<void>(
+      builder: (_) => RecorderScreen(
+        repository: widget.repository,
+        preferences: widget.preferences,
+        existingProject: _project,
+        resumeSessionId: session.id,
+        onSaved: () {},
+      ),
+    ));
+    if (!mounted) return;
+    final refreshed = widget.repository.projectById(_project.id);
+    if (refreshed != null) {
+      setState(() {
+        _project = refreshed;
+        if (_activeIndex >= refreshed.sessions.length) {
+          _activeIndex = refreshed.sessions.length - 1;
+        }
+      });
+      widget.onProjectChanged(refreshed);
+      await _loadSelectedSession();
+      await _loadAttachments();
     }
   }
 
@@ -772,8 +922,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  /// Writes the notes as a real UTF-8 `.txt` file that Notepad, Word or any
-  /// text editor can open, then offers the share sheet as a second option.
   Future<void> _exportNotesTxt() async {
     final messenger = ScaffoldMessenger.of(context);
     final notes = _notesController.text;
@@ -791,11 +939,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final fileName = DocumentExportService.safeFileName(
           '${_project.title.trim()} notes');
 
-      // The .txt lives inside the project folder, next to the audio, so it is
-      // part of the project and travels with project exports.
-      final projectDirectory = Directory(
-          '${widget.repository.projectsDirectory.path}/${_project.id}');
-      final notesDirectory = Directory('${projectDirectory.path}/notes');
+      final projectFolder =
+          await widget.repository.ensureProjectFolder(_project);
+      final notesDirectory = Directory('${projectFolder.path}/notes');
       await notesDirectory.create(recursive: true);
       final notesFile = File('${notesDirectory.path}/$fileName.txt');
       await notesFile.writeAsBytes(
@@ -849,6 +995,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     switch (action) {
       case 'play':
         await _playRecording(index);
+      case 'resume':
+        await _resumeSession(session);
       case 'share':
         try {
           await AudioShareService()
@@ -962,8 +1110,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final sessions = List<RavenAudioSession>.of(_project.sessions);
     sessions[index] = session.copyWith(name: name.trim());
     try {
-      // Bookmarks store a sessionId; renaming a part must keep those links
-      // valid so the bookmark panel still shows the right recording part.
       final validIds = sessions.map((s) => s.id).toSet();
       final bookmarks = _project.bookmarks
           .where((b) => b.sessionId.isEmpty || validIds.contains(b.sessionId))
@@ -1026,24 +1172,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         return;
       }
 
-      final previousPublicLocation = _project.publicFolderLocation;
-      final previousAudioCopy = _project.publicCopyLocation;
-      if (previousPublicLocation != null || previousAudioCopy != null) {
-        if (previousPublicLocation != null) {
-          await AudioVisibilityService().removeFolder(previousPublicLocation);
-        }
-        if (previousAudioCopy != null) {
-          await AudioVisibilityService().remove(previousAudioCopy);
-        }
-        await _saveProject(_project.copyWith(
-          clearPublicCopyLocation: true,
-          clearPublicFolderLocation: true,
-        ));
-      }
       final oldMasterPath = _project.masterAudioPath;
       final sessions = List<RavenAudioSession>.of(_project.sessions)
         ..removeAt(index);
-      // Keep the player pointing at a recording that still exists.
       final nextActive = sessions.isEmpty
           ? 0
           : (_activeIndex > index ? _activeIndex - 1 : _activeIndex)
@@ -1060,51 +1191,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
         final oldMaster = File(oldMasterPath);
         if (await oldMaster.exists()) await oldMaster.delete();
       }
-
-      String? mergeFailure;
-      if (sessions.length > 1 && !_project.isAudioProtected) {
-        try {
-          final merged = await AudioMergeService().mergeProject(
-            sessions: sessions,
-            outputDirectory: Directory(
-                '${widget.repository.projectsDirectory.path}/${_project.id}/sessions'),
-            projectId: _project.id,
-            format: widget.preferences.recordingFormat,
-            bitRate: widget.preferences.bitRate,
-            sampleRate: widget.preferences.sampleRate,
-          );
-          await _saveProject(_project.copyWith(masterAudioPath: merged.path));
-        } catch (error) {
-          mergeFailure = '$error';
-        }
-      }
-      if (previousPublicLocation != null &&
-          sessions.isNotEmpty &&
-          !_project.isAudioProtected &&
-          !_project.requiresAppPin) {
-        try {
-          final folder = await widget.repository.ensureProjectFolder(_project);
-          final location = await AudioVisibilityService().publishFolder(
-            source: folder,
-            folderName: widget.repository.projectFolderName(_project),
-          );
-          await _saveProject(
-              _project.copyWith(publicFolderLocation: location));
-        } catch (error) {
-          if (!mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(
-                'Recording deleted, but the public folder was not recreated: $error'),
-          ));
-          return;
-        }
-      }
-      if (mergeFailure != null && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(
-              'Session deleted, but the continuous audio could not be rebuilt: $mergeFailure'),
-        ));
-      }
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -1113,106 +1199,463 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  Widget _buildSessionsSection(ThemeData theme) {
+  Widget _buildSessionsTab(ThemeData theme) {
     final colorScheme = theme.colorScheme;
-    return Card(
-      child: ExpansionTile(
-        initiallyExpanded: true,
-        leading: Icon(Icons.multitrack_audio_rounded,
-            color: colorScheme.primary),
-        title: Text(tr(
-          widget.preferences,
-          'Recordings (${_project.sessions.length})',
-          'Enregistrements (${_project.sessions.length})',
-        )),
-        subtitle: Text(tr(
-          widget.preferences,
-          'Tap a recording to play only that recording. Use its menu to rename, share or delete it.',
-          'Touchez un enregistrement pour lire uniquement celui-ci. Utilisez son menu pour le renommer, le partager ou le supprimer.',
-        )),
-        children: _project.sessions.asMap().entries.map((entry) {
+    final count = _project.sessions.length;
+
+    if (_project.sessions.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Icon(Icons.mic_none_rounded,
+                  size: 52,
+                  color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5)),
+              const SizedBox(height: 14),
+              Text(
+                tr(widget.preferences, 'No recordings in this project yet',
+                    'Aucun enregistrement dans ce projet'),
+                style: theme.textTheme.titleMedium
+                    ?.copyWith(fontWeight: FontWeight.w700),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                tr(widget.preferences, 'Tap below to record the first take.',
+                    'Touchez ci-dessous pour enregistrer la première prise.'),
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: colorScheme.onSurfaceVariant),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 20),
+              FilledButton.icon(
+                onPressed: _loading || _project.isTrashed
+                    ? null
+                    : _continueRecording,
+                icon: const Icon(Icons.mic_rounded),
+                label: Text(tr(widget.preferences, 'Record take',
+                    'Enregistrer une prise')),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 80),
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.only(bottom: 10, left: 4, right: 4),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: <Widget>[
+              Text(
+                count == 1
+                    ? tr(widget.preferences, '1 Take', '1 Prise')
+                    : '$count ${tr(widget.preferences, 'Takes', 'Prises')}',
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+              Text(
+                tr(widget.preferences, 'Tap to play · Tap mic to resume',
+                    'Touchez pour lire · Micro pour reprendre'),
+                style: theme.textTheme.labelSmall
+                    ?.copyWith(color: colorScheme.onSurfaceVariant),
+              ),
+            ],
+          ),
+        ),
+        ..._project.sessions.asMap().entries.map((entry) {
           final index = entry.key;
           final session = entry.value;
           final isActive = index == _activeIndex;
           final title = session.name.isEmpty
-              ? tr(widget.preferences, 'Recording ${index + 1}',
-                  'Enregistrement ${index + 1}')
+              ? tr(widget.preferences, 'Take ${index + 1}',
+                  'Prise ${index + 1}')
               : session.name;
-          return Container(
-            margin: const EdgeInsets.fromLTRB(8, 2, 8, 6),
-            decoration: BoxDecoration(
-              color: isActive
-                  ? colorScheme.primaryContainer.withValues(alpha: 0.55)
-                  : colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
-              borderRadius: BorderRadius.circular(14),
-              border: isActive
-                  ? Border.all(color: colorScheme.primary, width: 1.2)
-                  : null,
-            ),
-            child: ListTile(
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14)),
-              leading: CircleAvatar(
-                backgroundColor: isActive
+          final dateStr =
+              DateFormat('dd MMM yyyy · HH:mm', widget.preferences.isFrench ? 'fr' : 'en')
+                  .format(session.createdAt);
+
+          return Card(
+            margin: const EdgeInsets.only(bottom: 10),
+            elevation: isActive ? 2 : 0,
+            color: isActive
+                ? colorScheme.primaryContainer.withValues(alpha: 0.45)
+                : colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+              side: BorderSide(
+                color: isActive
                     ? colorScheme.primary
-                    : colorScheme.surfaceContainerHighest,
-                foregroundColor: isActive
-                    ? colorScheme.onPrimary
-                    : colorScheme.onSurfaceVariant,
-                child: isActive
-                    ? const Icon(Icons.graphic_eq_rounded, size: 20)
-                    : Text('${index + 1}'),
+                    : colorScheme.outlineVariant.withValues(alpha: 0.4),
+                width: isActive ? 1.5 : 1,
               ),
-              title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
-              subtitle: Text(
-                '${_formatDuration(session.durationMs)} · ${session.format.toUpperCase()} · ${DateFormat('dd MMM yyyy, HH:mm', widget.preferences.isFrench ? 'fr' : 'en').format(session.createdAt)}',
-                maxLines: 2,
-              ),
+            ),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(16),
               onTap: _loading
                   ? null
                   : () => _handleSessionAction('play', session, index),
-              trailing: PopupMenuButton<String>(
-                tooltip: tr(widget.preferences, 'Recording actions',
-                    'Actions de l’enregistrement'),
-                onSelected: (action) =>
-                    _handleSessionAction(action, session, index),
-                itemBuilder: (context) => <PopupMenuEntry<String>>[
-                  PopupMenuItem(
-                    value: 'play',
-                    child: Text(tr(widget.preferences, 'Play this recording',
-                        'Lire cet enregistrement')),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  children: <Widget>[
+                    CircleAvatar(
+                      radius: 20,
+                      backgroundColor: isActive
+                          ? colorScheme.primary
+                          : colorScheme.surfaceContainerHighest,
+                      foregroundColor: isActive
+                          ? colorScheme.onPrimary
+                          : colorScheme.onSurfaceVariant,
+                      child: isActive
+                          ? const Icon(Icons.graphic_eq_rounded, size: 20)
+                          : Text('${index + 1}',
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.w700)),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Row(
+                            children: <Widget>[
+                              Flexible(
+                                child: Text(
+                                  title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.bodyLarge?.copyWith(
+                                    fontWeight: isActive
+                                        ? FontWeight.w800
+                                        : FontWeight.w600,
+                                    color: isActive
+                                        ? colorScheme.primary
+                                        : colorScheme.onSurface,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: colorScheme.surfaceContainerHighest,
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Text(
+                                  session.format.toUpperCase(),
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w800,
+                                    color: colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '${_formatDuration(session.durationMs)}  ·  $dateStr',
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton.filledTonal(
+                      tooltip: tr(widget.preferences,
+                          'Resume recording this take',
+                          'Reprendre cet enregistrement'),
+                      onPressed: _loading || _project.isTrashed
+                          ? null
+                          : () => _resumeSession(session),
+                      icon: const Icon(Icons.mic_rounded, size: 20),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    PopupMenuButton<String>(
+                      tooltip: tr(widget.preferences, 'Recording actions',
+                          'Actions de l’enregistrement'),
+                      onSelected: (action) =>
+                          _handleSessionAction(action, session, index),
+                      itemBuilder: (context) => <PopupMenuEntry<String>>[
+                        PopupMenuItem(
+                          value: 'play',
+                          child: Row(
+                            children: <Widget>[
+                              const Icon(Icons.play_arrow_rounded, size: 18),
+                              const SizedBox(width: 10),
+                              Text(tr(widget.preferences, 'Play', 'Lire')),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem(
+                          value: 'resume',
+                          child: Row(
+                            children: <Widget>[
+                              const Icon(Icons.mic_rounded, size: 18),
+                              const SizedBox(width: 10),
+                              Text(tr(widget.preferences, 'Resume take',
+                                  'Reprendre la prise')),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem(
+                          value: 'share',
+                          child: Row(
+                            children: <Widget>[
+                              const Icon(Icons.share_outlined, size: 18),
+                              const SizedBox(width: 10),
+                              Text(tr(widget.preferences, 'Share audio',
+                                  'Partager l’audio')),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem(
+                          value: 'rename',
+                          child: Row(
+                            children: <Widget>[
+                              const Icon(Icons.edit_outlined, size: 18),
+                              const SizedBox(width: 10),
+                              Text(tr(widget.preferences, 'Rename take',
+                                  'Renommer la prise')),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem(
+                          value: 'details',
+                          child: Row(
+                            children: <Widget>[
+                              const Icon(Icons.info_outline_rounded, size: 18),
+                              const SizedBox(width: 10),
+                              Text(tr(widget.preferences, 'Details', 'Détails')),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem(
+                          value: 'delete',
+                          child: Row(
+                            children: <Widget>[
+                              Icon(Icons.delete_outline_rounded,
+                                  size: 18, color: colorScheme.error),
+                              const SizedBox(width: 10),
+                              Text(
+                                tr(
+                                  widget.preferences,
+                                  _project.sessions.length == 1
+                                      ? 'Move project to Trash'
+                                      : 'Delete this take',
+                                  _project.sessions.length == 1
+                                      ? 'Mettre dans la corbeille'
+                                      : 'Supprimer cette prise',
+                                ),
+                                style: TextStyle(color: colorScheme.error),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed:
+              _loading || _project.isTrashed ? null : _continueRecording,
+          style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 14),
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16)),
+          ),
+          icon: const Icon(Icons.add_rounded),
+          label: Text(
+            tr(widget.preferences, 'Add another take to this project',
+                'Ajouter une autre prise à ce projet'),
+            style: const TextStyle(fontWeight: FontWeight.w700),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAttachmentsTab(ThemeData theme) {
+    final colorScheme = theme.colorScheme;
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 80),
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.only(bottom: 12, left: 4, right: 4),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: <Widget>[
+              Text(
+                _attachments.isEmpty
+                    ? tr(widget.preferences, 'No files attached',
+                        'Aucun fichier joint')
+                    : '${_attachments.length} ${tr(widget.preferences, _attachments.length == 1 ? 'attachment' : 'attachments', _attachments.length == 1 ? 'pièce jointe' : 'pièces jointes')}',
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+              FilledButton.tonalIcon(
+                onPressed: _loading ? null : _manageAttachments,
+                icon: Icon(
+                    _attachments.isEmpty
+                        ? Icons.add_rounded
+                        : Icons.tune_rounded,
+                    size: 18),
+                label: Text(
+                  _attachments.isEmpty
+                      ? tr(widget.preferences, 'Add files', 'Ajouter')
+                      : tr(widget.preferences, 'Manage', 'Gérer'),
+                ),
+                style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact),
+              ),
+            ],
+          ),
+        ),
+        if (_attachments.isEmpty)
+          Card(
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(18),
+              side: BorderSide(
+                  color: colorScheme.outlineVariant.withValues(alpha: 0.5)),
+            ),
+            color: colorScheme.surfaceContainerLowest,
+            child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: Column(
+                children: <Widget>[
+                  Icon(Icons.attachment_rounded,
+                      size: 48,
+                      color: colorScheme.primary.withValues(alpha: 0.6)),
+                  const SizedBox(height: 12),
+                  Text(
+                    tr(widget.preferences,
+                        'Keep reference materials together',
+                        'Gardez vos documents de référence ensemble'),
+                    style: theme.textTheme.titleSmall
+                        ?.copyWith(fontWeight: FontWeight.w700),
+                    textAlign: TextAlign.center,
                   ),
-                  PopupMenuItem(
-                    value: 'share',
-                    child: Text(tr(widget.preferences, 'Share recording',
-                        'Partager l’enregistrement')),
-                  ),
-                  PopupMenuItem(
-                    value: 'details',
-                    child: Text(tr(widget.preferences, 'Details', 'Détails')),
-                  ),
-                  PopupMenuItem(
-                    value: 'rename',
-                    child: Text(tr(widget.preferences, 'Rename recording',
-                        'Renommer l’enregistrement')),
-                  ),
-                  PopupMenuItem(
-                    value: 'delete',
-                    child: Text(tr(
+                  const SizedBox(height: 6),
+                  Text(
+                    tr(
                       widget.preferences,
-                      _project.sessions.length == 1
-                          ? 'Move recording to Trash'
-                          : 'Delete recording',
-                      _project.sessions.length == 1
-                          ? 'Mettre dans la corbeille'
-                          : 'Supprimer l’enregistrement',
-                    )),
+                      'Attach lyrics, photos of whiteboards, sheet music, interview outlines, or reference audio to this project workspace.',
+                      'Joignez des paroles, des photos de tableau, des partitions, des plans d’interview ou des références audio à cet espace de projet.',
+                    ),
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: colorScheme.onSurfaceVariant),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 16),
+                  FilledButton.tonal(
+                    onPressed: _loading ? null : _manageAttachments,
+                    child: Text(tr(widget.preferences,
+                        'Choose files or photos',
+                        'Choisir des fichiers ou photos')),
                   ),
                 ],
               ),
             ),
-          );
-        }).toList(),
+          )
+        else
+          for (final file in _attachments) _buildAttachmentRow(theme, file),
+      ],
+    );
+  }
+
+  Widget _buildAttachmentRow(ThemeData theme, File file) {
+    final colorScheme = theme.colorScheme;
+    final isImage = _isImageAttachment(file);
+    int? size;
+    try {
+      size = file.lengthSync();
+    } on FileSystemException {
+      size = null;
+    }
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(
+            color: colorScheme.outlineVariant.withValues(alpha: 0.4)),
+      ),
+      color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+      child: ListTile(
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14)),
+        leading: isImage
+            ? ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Image.file(
+                  file,
+                  width: 44,
+                  height: 44,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Icon(_iconForFile(file),
+                      color: colorScheme.primary),
+                ),
+              )
+            : Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: colorScheme.primaryContainer.withValues(alpha: 0.5),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(_iconForFile(file),
+                    color: colorScheme.primary, size: 22),
+              ),
+        title: Text(
+          file.uri.pathSegments.last,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.bodyMedium
+              ?.copyWith(fontWeight: FontWeight.w600),
+        ),
+        subtitle: size == null
+            ? null
+            : Text(_formatBytes(size), style: theme.textTheme.bodySmall),
+        onTap: () => _openAttachment(file),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            IconButton(
+              tooltip: tr(widget.preferences, 'Share file',
+                  'Partager le fichier'),
+              onPressed: () async {
+                try {
+                  await AudioShareService().shareFile(file);
+                } catch (error) {
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Text(
+                        '${tr(widget.preferences, 'Could not share file', 'Impossible de partager le fichier')}: $error'),
+                  ));
+                }
+              },
+              icon: const Icon(Icons.share_outlined, size: 18),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1252,6 +1695,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  /// Reads duration from a recovered draft's file WITHOUT touching the global
+  /// player (which would briefly show stale data in the notification).
+  /// Recovered drafts are always PCM16 WAV because the recorder captures WAV.
   Future<int> _measureSessionDuration(RavenAudioSession selected) async {
     final original = File(selected.audioPath);
     if (!await original.exists()) {
@@ -1259,7 +1705,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           'The recovered audio file is missing.', original.path);
     }
 
-    var pathToMeasure = original.path;
+    var fileToMeasure = original;
     File? temporaryPlaintext;
     if (_project.isAudioProtected) {
       final cache = await getTemporaryDirectory();
@@ -1273,26 +1719,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (await temporaryPlaintext.exists()) await temporaryPlaintext.delete();
       await _encryption.decryptFile(
           input: original, output: temporaryPlaintext, key: _audioKey);
-      pathToMeasure = temporaryPlaintext.path;
+      fileToMeasure = temporaryPlaintext;
     }
 
-    final probe = AudioPlayer();
     try {
-      // The main player is positioned at the first item of a concatenated
-      // playlist; its duration is not necessarily the recovered final segment.
-      await probe.setFilePath(pathToMeasure);
-      final duration = probe.duration;
-      if (duration == null || duration.inMilliseconds <= 0) {
-        throw StateError(
-            'RAVEN could not determine the recovered audio duration.');
-      }
-      return duration.inMilliseconds;
+      final ms = await PlaybackService.readWavDurationMs(fileToMeasure);
+      if (ms > 0) return ms;
+      throw StateError(
+          'RAVEN could not determine the recovered audio duration.');
     } finally {
-      await probe.dispose();
       if (temporaryPlaintext != null && await temporaryPlaintext.exists()) {
         try {
           await temporaryPlaintext.delete();
-        } on FileSystemException {/* cleaned on next startup */}
+        } on FileSystemException {
+          // Best-effort: the encryption service cleans stale probe files
+          // on next app launch if this delete fails.
+        }
       }
     }
   }
@@ -1302,9 +1744,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (selected == null || !_project.isDraft || _loading) return;
     setState(() => _loading = true);
     try {
-      // A crash can leave the draft's last session at duration 0. Measure that
-      // session individually rather than reading the main playlist's duration,
-      // which may refer to the first segment.
       final durationMs = selected.durationMs > 0
           ? selected.durationMs
           : await _measureSessionDuration(selected);
@@ -1313,90 +1752,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ? item.copyWith(durationMs: durationMs)
               : item)
           .toList();
-      await _saveProject(
-          _project.copyWith(isDraft: false, sessions: updatedSessions));
-
-      // Rebuild the one-file master where possible. Source sessions remain the
-      // durable recovery copy if encoding fails or the platform lacks FFmpeg.
-      if (!_project.isAudioProtected) {
-        try {
-          final master = await AudioMergeService().mergeProject(
-            sessions: _project.sessions,
-            outputDirectory: Directory(
-                '${widget.repository.projectsDirectory.path}/${_project.id}/sessions'),
-            projectId: _project.id,
-            format: widget.preferences.recordingFormat,
-          );
-          await _saveProject(_project.copyWith(masterAudioPath: master.path));
-          if (_project.requiresAppPin) {
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                content: Text(tr(
-                  widget.preferences,
-                  'Recovered audio remains private because this recording requires a PIN.',
-                  'L’audio récupéré reste privé, car cet enregistrement exige un code PIN.',
-                )),
-              ));
-            }
-          } else {
-            final previousPublicCopy = _project.publicCopyLocation;
-            String? newPublicCopy;
-            try {
-              newPublicCopy = await AudioVisibilityService().publish(
-                source: File(master.path),
-                title: _project.title,
-                projectId: _project.id,
-              );
-              await _saveProject(_project.copyWith(
-                publicCopyLocation: newPublicCopy,
-              ));
-              if (previousPublicCopy != null &&
-                  previousPublicCopy != newPublicCopy) {
-                try {
-                  await AudioVisibilityService().remove(previousPublicCopy);
-                } catch (cleanupError) {
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                      content: Text(
-                          'The new audio was published, but the previous public copy could not be removed: $cleanupError'),
-                    ));
-                  }
-                }
-              }
-            } catch (publishError) {
-              Object failure = publishError;
-              if (newPublicCopy != null &&
-                  _project.publicCopyLocation != newPublicCopy) {
-                try {
-                  await AudioVisibilityService().remove(newPublicCopy);
-                } catch (cleanupError) {
-                  failure = StateError(
-                    '$publishError The new public copy could not be cleaned up: $cleanupError',
-                  );
-                }
-              }
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                  content: Text(tr(
-                    widget.preferences,
-                    'Recovered audio is saved in RAVEN, but could not be published: $failure',
-                    'L’audio récupéré est enregistré dans RAVEN, mais n’a pas pu être publié : $failure',
-                  )),
-                ));
-              }
-            }
-          }
-        } catch (mergeError) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                content: Text(tr(
-              widget.preferences,
-              'Draft recovered. RAVEN will play its parts in sequence because the master merge failed.',
-              'Brouillon récupéré. RAVEN lira les parties à la suite car la fusion principale a échoué.',
-            ))));
-          }
-        }
-      }
+      await _saveProject(_project.copyWith(
+        isDraft: false,
+        sessions: updatedSessions,
+        clearMasterAudioPath: true,
+      ));
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -1417,9 +1777,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  /// Adds a bookmark at the current playback position. Works even while audio
-  /// is paused (uses the paused position) and always records the position on the
-  /// single continuous project timeline.
   Future<void> _addBookmark({RavenBookmark? existing}) async {
     if (_project.sessions.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -1431,13 +1788,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    // Bookmarks belong to the recording that is currently loaded, so the
-    // stored position is always local to that recording.
     final activeSession = _session ?? _project.sessions.last;
     final globalPosition = existing?.positionMs ??
         _globalPositionMs(_activeIndex, _player.position);
-    final sessionNumber = _project.sessions.indexWhere(
-            (s) => s.id == activeSession.id) +
+    final sessionNumber = _project.sessions
+            .indexWhere((s) => s.id == activeSession.id) +
         1;
 
     final wasPlaying = _player.playing;
@@ -1566,7 +1921,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('${tr(widget.preferences, 'Could not save bookmark', 'Impossible d’enregistrer le repère')}: $error'),
+        content: Text(
+            '${tr(widget.preferences, 'Could not save bookmark', 'Impossible d’enregistrer le repère')}: $error'),
       ));
     }
   }
@@ -1577,7 +1933,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       builder: (dialogContext) => AlertDialog(
         title: Text(tr(widget.preferences, 'Delete bookmark?',
             'Supprimer le repère ?')),
-        content: Text('${bookmark.label}\n${_formatBookmarkTime(bookmark.positionMs)}'),
+        content: Text(
+            '${bookmark.label}\n${_formatBookmarkTime(bookmark.positionMs)}'),
         actions: <Widget>[
           TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
@@ -1589,21 +1946,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
       ),
     );
     if (confirmed != true || !mounted) return;
-    final remaining = _project.bookmarks
-        .where((b) => b.id != bookmark.id)
-        .toList();
+    final remaining =
+        _project.bookmarks.where((b) => b.id != bookmark.id).toList();
     try {
       await _saveProject(_project.copyWith(bookmarks: remaining));
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('${tr(widget.preferences, 'Could not delete bookmark', 'Impossible de supprimer le repère')}: $error'),
+        content: Text(
+            '${tr(widget.preferences, 'Could not delete bookmark', 'Impossible de supprimer le repère')}: $error'),
       ));
     }
   }
 
   Future<void> _jumpToBookmark(RavenBookmark bookmark) async {
-    // A bookmark points at one recording; load that recording before seeking.
     final index = _project.sessions
         .indexWhere((session) => session.id == bookmark.sessionId);
     if (index >= 0 && index != _activeIndex) {
@@ -1724,7 +2080,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 await Clipboard.setData(ClipboardData(text: result));
                 if (!dialogContext.mounted) return;
                 clipboardMessenger.showSnackBar(SnackBar(
-                    content: Text(tr(widget.preferences, 'Copied to clipboard.',
+                    content: Text(tr(widget.preferences,
+                        'Copied to clipboard.',
                         'Copié dans le presse-papiers.'))));
               },
               icon: const Icon(Icons.copy_rounded),
@@ -1808,12 +2165,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _toggleProjectPin() async {
     final messenger = ScaffoldMessenger.of(context);
     if (_loading) return;
-    if (!_project.requiresAppPin && _project.publicCopyLocation != null) {
+    if (!_project.requiresAppPin &&
+        (_project.hasPublicFolder || _project.hasPublicCopy)) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text(tr(
         widget.preferences,
-        'Remove the public copy before locking this recording with a PIN. Public copies can be opened outside RAVEN.',
-        'Supprimez la copie publique avant de verrouiller cet enregistrement par code PIN. Les copies publiques peuvent être ouvertes hors de RAVEN.',
+        'Make this project private first. Public copies can be opened outside RAVEN.',
+        'Rendez d’abord ce projet privé. Les copies publiques peuvent être ouvertes hors de RAVEN.',
       ))));
       return;
     }
@@ -1858,91 +2216,93 @@ class _PlayerScreenState extends State<PlayerScreen> {
               'Aucun audio enregistré à afficher dans les dossiers pour le moment.'))));
       return;
     }
-    final existingLocation = _project.publicFolderLocation;
-    final existingAudioCopy = _project.publicCopyLocation;
-    final enabling = existingLocation == null && existingAudioCopy == null;
+
+    final enabling = !_project.isPublic;
     if (enabling && (_project.isAudioProtected || _project.requiresAppPin)) {
       final message = _project.isAudioProtected
           ? tr(
               widget.preferences,
-              'Decrypt this recording before making a public copy. Protected recordings cannot be published.',
-              'Déchiffrez ce projet avant de créer une copie publique. Les enregistrements protégés ne peuvent pas être publiés.')
+              'Decrypt this recording before making it public. Protected recordings cannot be published.',
+              'Déchiffrez ce projet avant de le rendre public. Les enregistrements protégés ne peuvent pas être publiés.')
           : tr(
               widget.preferences,
-              'Remove the individual PIN lock before making a public copy. A public copy could bypass RAVEN’s project lock.',
-              'Retirez le verrouillage PIN individuel avant de créer une copie publique. Une copie publique contournerait le verrou du projet.');
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(message)));
+              'Remove the individual PIN lock before making it public. A public folder could bypass RAVEN’s project lock.',
+              'Retirez le verrouillage PIN individuel avant de rendre ce projet public. Un dossier public contournerait le verrou du projet.');
+      messenger.showSnackBar(SnackBar(content: Text(message)));
       return;
     }
+
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: Text(tr(
             widget.preferences,
             enabling ? 'Make project public?' : 'Make project private?',
-            enabling ? 'Rendre le projet public ?' : 'Rendre le projet privé ?')),
+            enabling
+                ? 'Rendre le projet public ?'
+                : 'Rendre le projet privé ?')),
         content: Text(tr(
             widget.preferences,
             enabling
-                ? 'RAVEN will copy this project’s folder (audio, notes and attachments) into Music/RAVEN (Android) or Downloads/RAVEN (Windows). Other apps and people with access to those folders may be able to see it. Your private RAVEN original remains in place. This is not available for encrypted or individually PIN-locked recordings.'
-                : 'RAVEN will remove the public folder it created. Your private original and project remain inside RAVEN. If you shared or copied the public files elsewhere, those other copies are not removed.',
+                ? 'RAVEN will move this project’s folder (audio, notes and attachments) into the device’s public RAVEN folder so it can be browsed with a file manager. The project stays playable inside RAVEN.'
+                : 'RAVEN will move this project’s folder back into its private app storage. It stays playable inside RAVEN.',
             enabling
-                ? 'RAVEN copiera le dossier de ce projet (audio, notes et pièces jointes) dans Music/RAVEN (Android) ou Downloads/RAVEN (Windows). D’autres applications ou personnes ayant accès à ces dossiers pourront le voir. L’original privé reste dans RAVEN. Cette option n’est pas disponible pour les enregistrements chiffrés ou verrouillés par un PIN individuel.'
-                : 'RAVEN supprimera le dossier public créé par l’application. L’original privé et le projet resteront dans RAVEN. Les fichiers partagés ou copiés ailleurs ne seront pas supprimés.')),
+                ? 'RAVEN déplacera le dossier de ce projet (audio, notes et pièces jointes) dans le dossier RAVEN public de l’appareil afin qu’il soit visible dans un gestionnaire de fichiers. Le projet reste lisible dans RAVEN.'
+                : 'RAVEN replacera le dossier de ce projet dans le stockage privé de l’application. Il reste lisible dans RAVEN.')),
         actions: <Widget>[
           TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
               child: Text(tr(widget.preferences, 'Cancel', 'Annuler'))),
           FilledButton(
               onPressed: () => Navigator.pop(dialogContext, true),
-              child: Text(tr(
-                  widget.preferences,
-                  enabling ? 'Continue' : 'Remove public copy',
-                  enabling ? 'Continuer' : 'Supprimer la copie publique'))),
+              child: Text(tr(widget.preferences, 'Continue', 'Continuer'))),
         ],
       ),
     );
     if (confirmed != true || !mounted) return;
+
     setState(() => _loading = true);
-    final visibility = AudioVisibilityService();
     try {
-      if (enabling) {
-        final folder = await widget.repository.ensureProjectFolder(_project);
-        final location = await visibility.publishFolder(
-          source: folder,
-          folderName: widget.repository.projectFolderName(_project),
-        );
+      final legacyFolder = _project.publicFolderLocation;
+      if (legacyFolder != null &&
+          AudioVisibilityService.isContentUri(legacyFolder)) {
         try {
-          await _saveProject(_project.copyWith(publicFolderLocation: location));
+          await AudioVisibilityService().removeFolder(legacyFolder);
         } catch (_) {
-          try {
-            await visibility.removeFolder(location);
-          } catch (_) {}
-          rethrow;
+          // Legacy content:// folders are orphaned at worst; the real
+          // audio lives in the private canonical folder and remains safe.
         }
-      } else {
-        if (existingLocation != null) {
-          await visibility.removeFolder(existingLocation);
-        }
-        if (existingAudioCopy != null) {
-          await visibility.remove(existingAudioCopy);
-        }
-        await _saveProject(_project.copyWith(
-          clearPublicCopyLocation: true,
-          clearPublicFolderLocation: true,
-        ));
+        final cleared = _project.copyWith(clearPublicFolderLocation: true);
+        await _saveProject(cleared);
       }
+      final legacyCopy = _project.publicCopyLocation;
+      if (!enabling && legacyCopy != null) {
+        try {
+          await AudioVisibilityService().remove(legacyCopy);
+        } catch (_) {
+          // Best-effort: an orphaned public file is disk waste, not loss.
+        }
+        await _saveProject(_project.copyWith(clearPublicCopyLocation: true));
+      }
+
+      final updated = await widget.repository.toggleVisibility(
+        _project,
+        makePublic: enabling,
+      );
+      await _saveProject(updated);
+
+      await _loadAttachments();
+
       if (!mounted) return;
       messenger.showSnackBar(SnackBar(
           content: Text(tr(
               widget.preferences,
               enabling
-                  ? 'Project folder published. The private original is unchanged.'
-                  : 'Public folder removed. The private original is unchanged.',
+                  ? 'Project folder moved to your device’s public RAVEN folder.'
+                  : 'Project folder moved back into RAVEN’s private storage.',
               enabling
-                  ? 'Dossier du projet publié. L’original privé est inchangé.'
-                  : 'Dossier public supprimé. L’original privé est inchangé.'))));
+                  ? 'Dossier du projet déplacé dans le dossier RAVEN public de l’appareil.'
+                  : 'Dossier du projet replacé dans le stockage privé de RAVEN.'))));
     } catch (error) {
       if (!mounted) return;
       messenger.showSnackBar(SnackBar(
@@ -1953,30 +2313,1109 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  Widget _buildWorkspaceHeader(ThemeData theme) {
+    final colorScheme = theme.colorScheme;
+    final createdLabel = DateFormat(
+      'dd MMM yyyy · HH:mm',
+      widget.preferences.isFrench ? 'fr' : 'en',
+    ).format(_project.createdAt);
+    final totalDuration = _formatDuration(_totalProjectDurationMs);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: <Widget>[
+            Expanded(
+              child: InkWell(
+                onTap: _renameProject,
+                borderRadius: BorderRadius.circular(10),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Row(
+                    children: <Widget>[
+                      Flexible(
+                        child: Text(
+                          _project.title,
+                          style: theme.textTheme.headlineSmall?.copyWith(
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: -0.5,
+                          ),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Icon(
+                        Icons.edit_outlined,
+                        size: 18,
+                        color: colorScheme.onSurfaceVariant
+                            .withValues(alpha: 0.6),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            FilledButton.tonalIcon(
+              onPressed: _loading || _project.isTrashed
+                  ? null
+                  : _continueRecording,
+              icon: const Icon(Icons.mic_rounded, size: 18),
+              label: Text(
+                  tr(widget.preferences, 'New take', 'Nouvelle prise')),
+              style: FilledButton.styleFrom(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: <Widget>[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color:
+                    colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                    color: colorScheme.outlineVariant.withValues(alpha: 0.4)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Icon(Icons.folder_outlined,
+                      size: 13, color: colorScheme.primary),
+                  const SizedBox(width: 5),
+                  Text(
+                    _project.category,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: colorScheme.onSurface,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color:
+                    colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                    color: colorScheme.outlineVariant.withValues(alpha: 0.4)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Icon(Icons.timer_outlined,
+                      size: 13, color: colorScheme.onSurfaceVariant),
+                  const SizedBox(width: 5),
+                  Text(
+                    '$totalDuration · ${_project.sessions.length} ${tr(widget.preferences, _project.sessions.length == 1 ? 'take' : 'takes', _project.sessions.length == 1 ? 'prise' : 'prises')}',
+                    style: theme.textTheme.labelSmall
+                        ?.copyWith(color: colorScheme.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: _project.isPublic
+                    ? colorScheme.primaryContainer.withValues(alpha: 0.6)
+                    : colorScheme.surfaceContainerHighest
+                        .withValues(alpha: 0.5),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Icon(
+                    _project.isPublic
+                        ? Icons.public_rounded
+                        : Icons.lock_outline_rounded,
+                    size: 13,
+                    color: _project.isPublic
+                        ? colorScheme.primary
+                        : colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 5),
+                  Text(
+                    _project.isPublic
+                        ? tr(widget.preferences, 'Public · Music/RAVEN',
+                            'Public · Musique/RAVEN')
+                        : tr(widget.preferences, 'App private',
+                            'Privé application'),
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: _project.isPublic
+                          ? colorScheme.onPrimaryContainer
+                          : colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (_project.isAudioProtected)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: colorScheme.tertiaryContainer.withValues(alpha: 0.7),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Icon(Icons.enhanced_encryption_rounded,
+                        size: 13, color: colorScheme.onTertiaryContainer),
+                    const SizedBox(width: 5),
+                    Text(
+                      tr(widget.preferences, 'Encrypted', 'Chiffré'),
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                        color: colorScheme.onTertiaryContainer,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            if (_project.requiresAppPin)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: colorScheme.secondaryContainer.withValues(alpha: 0.7),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Icon(Icons.pin_rounded,
+                        size: 13, color: colorScheme.onSecondaryContainer),
+                    const SizedBox(width: 5),
+                    Text(
+                      tr(widget.preferences, 'PIN locked',
+                          'Verrouillé PIN'),
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                        color: colorScheme.onSecondaryContainer,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            Text(
+              createdLabel,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: colorScheme.onSurfaceVariant.withValues(alpha: 0.7),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildHeroAudioConsole(ThemeData theme) {
+    final colorScheme = theme.colorScheme;
+    final session = _session;
+
+    return Card(
+      elevation: 2,
+      shadowColor: colorScheme.shadow.withValues(alpha: 0.08),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(24),
+        side: BorderSide(
+            color: colorScheme.outlineVariant.withValues(alpha: 0.5)),
+      ),
+      color: theme.brightness == Brightness.dark
+          ? colorScheme.surfaceContainerHigh
+          : colorScheme.surface,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: <Widget>[
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: <Widget>[
+                Flexible(
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color:
+                          colorScheme.primaryContainer.withValues(alpha: 0.45),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Icon(Icons.graphic_eq_rounded,
+                            size: 16, color: colorScheme.primary),
+                        const SizedBox(width: 7),
+                        Flexible(
+                          child: Text(
+                            _project.sessions.isEmpty
+                                ? tr(widget.preferences, 'No recording yet',
+                                    'Aucun enregistrement')
+                                : '${session?.name.isNotEmpty == true ? session!.name : tr(widget.preferences, 'Take ${_activeIndex + 1}', 'Prise ${_activeIndex + 1}')} (${_activeIndex + 1}/${_project.sessions.length})',
+                            style: theme.textTheme.labelMedium?.copyWith(
+                              fontWeight: FontWeight.w700,
+                              color: colorScheme.primary,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (session != null) ...[
+                          const SizedBox(width: 6),
+                          Text(
+                            '· ${session.format.toUpperCase()}',
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              color: colorScheme.onSurfaceVariant,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+                if (_project.sessions.length > 1)
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      IconButton(
+                        icon: const Icon(Icons.skip_previous_rounded),
+                        iconSize: 22,
+                        visualDensity: VisualDensity.compact,
+                        tooltip: tr(widget.preferences, 'Previous take',
+                            'Prise précédente'),
+                        onPressed: _loading || _activeIndex <= 0
+                            ? null
+                            : () => _playRecording(_activeIndex - 1),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.skip_next_rounded),
+                        iconSize: 22,
+                        visualDensity: VisualDensity.compact,
+                        tooltip: tr(widget.preferences, 'Next take',
+                            'Prise suivante'),
+                        onPressed: _loading ||
+                                _activeIndex >= _project.sessions.length - 1
+                            ? null
+                            : () => _playRecording(_activeIndex + 1),
+                      ),
+                    ],
+                  ),
+              ],
+            ),
+            if (_securityWarning != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: colorScheme.errorContainer,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    _securityWarning!,
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: colorScheme.onErrorContainer),
+                  ),
+                ),
+              ),
+            const SizedBox(height: 14),
+            if (_loading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 20),
+                child: CircularProgressIndicator(),
+              )
+            else if (_error != null)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                child: Text(
+                  _error!,
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodyMedium
+                      ?.copyWith(color: colorScheme.error),
+                ),
+              )
+            else ...<Widget>[
+              StreamBuilder<Duration>(
+                stream: _player.positionStream,
+                builder: (context, positionSnapshot) {
+                  final position = positionSnapshot.data ?? Duration.zero;
+                  final duration = Duration(milliseconds: _activeDurationMs);
+                  final maxMs = duration.inMilliseconds > 0
+                      ? duration.inMilliseconds.toDouble()
+                      : 1.0;
+                  final currentMs =
+                      position.inMilliseconds.toDouble().clamp(0.0, maxMs);
+
+                  return Column(
+                    children: <Widget>[
+                      SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 5,
+                          thumbShape: const RoundSliderThumbShape(
+                              enabledThumbRadius: 7),
+                          overlayShape: const RoundSliderOverlayShape(
+                              overlayRadius: 16),
+                          activeTrackColor: colorScheme.primary,
+                          inactiveTrackColor:
+                              colorScheme.primary.withValues(alpha: 0.15),
+                          thumbColor: colorScheme.primary,
+                        ),
+                        child: Slider(
+                          min: 0,
+                          max: maxMs,
+                          value: currentMs,
+                          onChanged: (value) => _seekGlobal(value.round()),
+                        ),
+                      ),
+                      if (_project.bookmarks.isNotEmpty &&
+                          _activeDurationMs > 0)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 14),
+                          child: _BookmarkTimelineStrip(
+                            bookmarks: _project.bookmarks,
+                            totalMs: _activeDurationMs,
+                            onTap: _seekGlobal,
+                          ),
+                        ),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: <Widget>[
+                            Text(
+                              _formatDuration(position.inMilliseconds),
+                              style: theme.textTheme.labelMedium?.copyWith(
+                                fontWeight: FontWeight.w700,
+                                fontFeatures: const [
+                                  FontFeature.tabularFigures()
+                                ],
+                                color: colorScheme.onSurface,
+                              ),
+                            ),
+                            Text(
+                              _formatDuration(duration.inMilliseconds),
+                              style: theme.textTheme.labelMedium?.copyWith(
+                                fontWeight: FontWeight.w600,
+                                fontFeatures: const [
+                                  FontFeature.tabularFigures()
+                                ],
+                                color: colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+              const SizedBox(height: 12),
+              StreamBuilder<PlayerState>(
+                stream: _player.playerStateStream,
+                builder: (context, snapshot) {
+                  final playing = snapshot.data?.playing ?? false;
+                  return Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: <Widget>[
+                      IconButton(
+                        tooltip: tr(widget.preferences, 'Restart',
+                            'Recommencer'),
+                        onPressed: () => _seekGlobal(0),
+                        icon: const Icon(Icons.replay_rounded),
+                        iconSize: 24,
+                      ),
+                      IconButton(
+                        tooltip: '-10s',
+                        onPressed: () => _seekRelative(-10),
+                        icon: const Icon(Icons.replay_10_rounded),
+                        iconSize: 26,
+                      ),
+                      SizedBox(
+                        width: 64,
+                        height: 64,
+                        child: FilledButton(
+                          style: FilledButton.styleFrom(
+                            shape: const CircleBorder(),
+                            padding: EdgeInsets.zero,
+                            elevation: 3,
+                            shadowColor: colorScheme.primary
+                                .withValues(alpha: 0.35),
+                          ),
+                          onPressed: _loading || _error != null
+                              ? null
+                              : () async {
+                                  if (playing) {
+                                    await _player.pause();
+                                  } else {
+                                    unawaited(_player.play());
+                                  }
+                                },
+                          child: Icon(
+                            playing
+                                ? Icons.pause_rounded
+                                : Icons.play_arrow_rounded,
+                            size: 34,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: '+10s',
+                        onPressed: () => _seekRelative(10),
+                        icon: const Icon(Icons.forward_10_rounded),
+                        iconSize: 26,
+                      ),
+                      IconButton.filledTonal(
+                        tooltip: tr(widget.preferences, 'Add bookmark',
+                            'Ajouter un repère'),
+                        onPressed: _loading || _error != null
+                            ? null
+                            : () => _addBookmark(),
+                        icon: const Icon(Icons.bookmark_add_rounded),
+                        iconSize: 22,
+                      ),
+                      PopupMenuButton<double>(
+                        tooltip: tr(widget.preferences, 'Playback speed',
+                            'Vitesse de lecture'),
+                        onSelected: (speed) => _player.setSpeed(speed),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 5),
+                          decoration: BoxDecoration(
+                            color: colorScheme.surfaceContainerHighest
+                                .withValues(alpha: 0.6),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: StreamBuilder<double>(
+                            stream: _player.speedStream,
+                            builder: (context, speedSnap) {
+                              final currentSpeed = speedSnap.data ?? 1.0;
+                              return Text(
+                                '$currentSpeed×',
+                                style: theme.textTheme.labelMedium?.copyWith(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                        itemBuilder: (_) => <PopupMenuEntry<double>>[
+                          for (final speed in <double>[
+                            0.5,
+                            0.75,
+                            1,
+                            1.25,
+                            1.5,
+                            2
+                          ])
+                            PopupMenuItem<double>(
+                              value: speed,
+                              child: Text('$speed×'),
+                            ),
+                        ],
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ],
+            if (_project.isDraft) ...<Widget>[
+              const SizedBox(height: 14),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: colorScheme.tertiaryContainer.withValues(alpha: 0.8),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Row(
+                  children: <Widget>[
+                    Icon(Icons.warning_amber_rounded,
+                        color: colorScheme.onTertiaryContainer),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        tr(
+                          widget.preferences,
+                          'Recovered draft — verify audio before finalising.',
+                          'Brouillon récupéré — vérifiez l’audio avant de finaliser.',
+                        ),
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: colorScheme.onTertiaryContainer,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    FilledButton.tonal(
+                      onPressed: _loading || _error != null
+                          ? null
+                          : _finalizeRecoveredDraft,
+                      child: Text(tr(
+                          widget.preferences, 'Finalise', 'Finaliser')),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNotesTab(ThemeData theme) {
+    final colorScheme = theme.colorScheme;
+    final wordCount = _notesWordCount;
+    final charCount = _notesController.text.length;
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 80),
+      children: <Widget>[
+        Card(
+          elevation: 0,
+          color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.4),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: BorderSide(
+                color: colorScheme.outlineVariant.withValues(alpha: 0.4)),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            child: Row(
+              children: <Widget>[
+                PopupMenuButton<String>(
+                  tooltip: tr(widget.preferences, 'AI tools for notes',
+                      'Outils IA pour les notes'),
+                  child: Padding(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Icon(Icons.auto_awesome_rounded,
+                            size: 18, color: colorScheme.primary),
+                        const SizedBox(width: 6),
+                        Text(
+                          'AI Tools',
+                          style: TextStyle(
+                            color: colorScheme.primary,
+                            fontWeight: FontWeight.w800,
+                            fontSize: 12,
+                          ),
+                        ),
+                        const SizedBox(width: 2),
+                        Icon(Icons.arrow_drop_down_rounded,
+                            size: 18, color: colorScheme.primary),
+                      ],
+                    ),
+                  ),
+                  onSelected: (task) => _runAiTask(task),
+                  itemBuilder: (context) => <PopupMenuEntry<String>>[
+                    PopupMenuItem(
+                      value: 'summary',
+                      child: Row(
+                        children: <Widget>[
+                          const Icon(Icons.summarize_outlined, size: 18),
+                          const SizedBox(width: 10),
+                          Text(tr(widget.preferences, 'Summarize notes',
+                              'Résumer les notes')),
+                        ],
+                      ),
+                    ),
+                    PopupMenuItem(
+                      value: 'organize',
+                      child: Row(
+                        children: <Widget>[
+                          const Icon(Icons.auto_fix_high_rounded, size: 18),
+                          const SizedBox(width: 10),
+                          Text(tr(widget.preferences, 'Organize and polish',
+                              'Organiser et améliorer')),
+                        ],
+                      ),
+                    ),
+                    PopupMenuItem(
+                      value: 'translate',
+                      child: Row(
+                        children: <Widget>[
+                          const Icon(Icons.translate_rounded, size: 18),
+                          const SizedBox(width: 10),
+                          Text(tr(widget.preferences, 'Translate notes',
+                              'Traduire les notes')),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const Spacer(),
+                Text(
+                  '$wordCount ${tr(widget.preferences, wordCount == 1 ? 'word' : 'words', wordCount == 1 ? 'mot' : 'mots')} · $charCount ${tr(widget.preferences, 'chars', 'car.')}',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: tr(widget.preferences, 'Save .txt file',
+                      'Enregistrer .txt'),
+                  icon: const Icon(Icons.description_outlined, size: 20),
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _exportNotesTxt,
+                ),
+                FilledButton.tonalIcon(
+                  onPressed: _savingNotes ? null : _saveNotes,
+                  icon: _savingNotes
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.save_outlined, size: 16),
+                  label: Text(tr(widget.preferences, 'Save', 'Sauvegarder')),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 6),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _notesController,
+          minLines: 8,
+          maxLines: 25,
+          textCapitalization: TextCapitalization.sentences,
+          style: theme.textTheme.bodyLarge?.copyWith(height: 1.5),
+          decoration: InputDecoration(
+            hintText: tr(
+              widget.preferences,
+              'Add project notes, context, ideas, lyrics, timestamps or follow-up tasks…\n\nNotes stay inside this project and can be exported as real .txt files.',
+              'Ajoutez des notes de projet, contexte, idées, paroles, repères temporels ou tâches…\n\nLes notes restent dans ce projet et s’exportent en vrais fichiers .txt.',
+            ),
+            hintStyle: theme.textTheme.bodyMedium?.copyWith(
+              color: colorScheme.onSurfaceVariant.withValues(alpha: 0.6),
+              height: 1.5,
+            ),
+            alignLabelWithHint: true,
+            filled: true,
+            fillColor: colorScheme.surfaceContainerLowest,
+            contentPadding: const EdgeInsets.all(18),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(20),
+              borderSide: BorderSide(
+                  color: colorScheme.outlineVariant.withValues(alpha: 0.4)),
+            ),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(20),
+              borderSide: BorderSide(
+                  color: colorScheme.outlineVariant.withValues(alpha: 0.4)),
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(20),
+              borderSide: BorderSide(color: colorScheme.primary, width: 1.5),
+            ),
+          ),
+        ),
+        if (_project.aiGeneratedContent.isNotEmpty) ...<Widget>[
+          const SizedBox(height: 16),
+          Card(
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+              side: BorderSide(
+                  color: colorScheme.outlineVariant.withValues(alpha: 0.5)),
+            ),
+            color: colorScheme.surfaceContainerLow,
+            child: ExpansionTile(
+              initiallyExpanded: false,
+              leading: Icon(Icons.auto_awesome_rounded,
+                  color: colorScheme.primary),
+              title: Text(
+                tr(widget.preferences, 'Saved AI insights',
+                    'Résultats IA enregistrés'),
+                style: theme.textTheme.titleSmall
+                    ?.copyWith(fontWeight: FontWeight.w700),
+              ),
+              subtitle: Text(
+                '${_project.aiGeneratedContent.length} ${tr(widget.preferences, 'item(s) saved', 'élément(s) sauvegardé(s)')}',
+                style: theme.textTheme.labelSmall
+                    ?.copyWith(color: colorScheme.onSurfaceVariant),
+              ),
+              childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              children: _project.aiGeneratedContent.entries.map((entry) {
+                return Container(
+                  margin: const EdgeInsets.only(top: 8),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: colorScheme.surfaceContainerHighest
+                        .withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: <Widget>[
+                          Text(
+                            entry.key.split('_').first.toUpperCase(),
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w800,
+                              color: colorScheme.primary,
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.copy_rounded, size: 16),
+                            visualDensity: VisualDensity.compact,
+                            onPressed: () async {
+                              final messenger =
+                                  ScaffoldMessenger.of(context);
+                              await Clipboard.setData(
+                                  ClipboardData(text: entry.value));
+                              messenger.showSnackBar(SnackBar(
+                                content: Text(tr(widget.preferences,
+                                    'Copied to clipboard.', 'Copié.')),
+                              ));
+                            },
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      SelectableText(
+                        entry.value,
+                        style: theme.textTheme.bodySmall?.copyWith(height: 1.4),
+                      ),
+                    ],
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+        ],
+        const SizedBox(height: 16),
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: colorScheme.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+                color: colorScheme.outlineVariant.withValues(alpha: 0.3)),
+          ),
+          child: Row(
+            children: <Widget>[
+              Icon(Icons.shield_outlined,
+                  size: 20, color: colorScheme.primary),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  tr(
+                    widget.preferences,
+                    'Project notes and recordings stay together in your project workspace. Private by default; exported copies are separate.',
+                    'Les notes et prises restent ensemble dans votre espace de projet. Privé par défaut ; les exports sont distincts.',
+                  ),
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildBookmarksTab(ThemeData theme) {
+    final colorScheme = theme.colorScheme;
+    final bookmarks = List<RavenBookmark>.of(_project.bookmarks)
+      ..sort((a, b) => a.positionMs.compareTo(b.positionMs));
+    final totalMs = _activeDurationMs;
+
+    String partLabel(RavenBookmark bookmark) {
+      final index = _project.sessions
+          .indexWhere((session) => session.id == bookmark.sessionId);
+      if (index < 0) return '';
+      final session = _project.sessions[index];
+      return session.name.isEmpty ? 'Part ${index + 1}' : session.name;
+    }
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 80),
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.only(bottom: 12, left: 4, right: 4),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: <Widget>[
+              Text(
+                bookmarks.isEmpty
+                    ? tr(widget.preferences, 'No bookmarks', 'Aucun repère')
+                    : '${bookmarks.length} ${tr(widget.preferences, bookmarks.length == 1 ? 'bookmark' : 'bookmarks', bookmarks.length == 1 ? 'repère' : 'repères')}',
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+              FilledButton.tonalIcon(
+                onPressed:
+                    _loading || _error != null || _project.sessions.isEmpty
+                        ? null
+                        : () => _addBookmark(),
+                icon: const Icon(Icons.bookmark_add_rounded, size: 18),
+                label: Text(tr(widget.preferences, 'Add bookmark here',
+                    'Ajouter ici')),
+                style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact),
+              ),
+            ],
+          ),
+        ),
+        if (bookmarks.isEmpty)
+          Card(
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(18),
+              side: BorderSide(
+                  color: colorScheme.outlineVariant.withValues(alpha: 0.5)),
+            ),
+            color: colorScheme.surfaceContainerLowest,
+            child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: Column(
+                children: <Widget>[
+                  Icon(Icons.bookmarks_outlined,
+                      size: 48,
+                      color: colorScheme.primary.withValues(alpha: 0.6)),
+                  const SizedBox(height: 12),
+                  Text(
+                    tr(widget.preferences,
+                        'Pin key moments in the audio timeline',
+                        'Épingler des moments clés dans la timeline'),
+                    style: theme.textTheme.titleSmall
+                        ?.copyWith(fontWeight: FontWeight.w700),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    tr(
+                      widget.preferences,
+                      'While listening, tap Add bookmark to save timestamps for solos, chorus, important quotes, or discussion points.',
+                      'Pendant l’écoute, touchez Ajouter un repère pour marquer les moments importants, refrains, citations ou solos.',
+                    ),
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: colorScheme.onSurfaceVariant),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 16),
+                  FilledButton.tonal(
+                    onPressed: _loading ||
+                            _error != null ||
+                            _project.sessions.isEmpty
+                        ? null
+                        : () => _addBookmark(),
+                    child: Text(tr(widget.preferences,
+                        'Add first bookmark', 'Ajouter un premier repère')),
+                  ),
+                ],
+              ),
+            ),
+          )
+        else ...<Widget>[
+          if (bookmarks.length > 1 && totalMs > 0)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Card(
+                color: colorScheme.surfaceContainerLowest,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  side: BorderSide(
+                      color: colorScheme.outlineVariant
+                          .withValues(alpha: 0.3)),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Text(
+                        tr(widget.preferences, 'Timeline map',
+                            'Carte temporelle'),
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                          color: colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      _BookmarkTimelineStrip(
+                        bookmarks: bookmarks,
+                        totalMs: totalMs,
+                        onTap: _seekGlobal,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          for (final bookmark in bookmarks)
+            Card(
+              margin: const EdgeInsets.only(bottom: 8),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+                side: BorderSide(
+                    color: colorScheme.outlineVariant.withValues(alpha: 0.4)),
+              ),
+              color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(14),
+                onTap: () => _jumpToBookmark(bookmark),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+                  child: Row(
+                    children: <Widget>[
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: colorScheme.primary,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            const Icon(Icons.play_arrow_rounded,
+                                size: 14, color: Colors.white),
+                            const SizedBox(width: 4),
+                            Text(
+                              _formatBookmarkTime(bookmark.positionMs),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w700,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            Text(
+                              bookmark.label,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.bodyMedium
+                                  ?.copyWith(fontWeight: FontWeight.w700),
+                            ),
+                            if (partLabel(bookmark).isNotEmpty)
+                              Text(
+                                partLabel(bookmark),
+                                style: theme.textTheme.labelSmall?.copyWith(
+                                    color: colorScheme.onSurfaceVariant),
+                              ),
+                          ],
+                        ),
+                      ),
+                      PopupMenuButton<String>(
+                        tooltip: tr(widget.preferences, 'Bookmark actions',
+                            'Actions du repère'),
+                        onSelected: (action) {
+                          switch (action) {
+                            case 'play':
+                              _jumpToBookmark(bookmark);
+                            case 'rename':
+                              _addBookmark(existing: bookmark);
+                            case 'delete':
+                              _deleteBookmark(bookmark);
+                          }
+                        },
+                        itemBuilder: (context) => <PopupMenuEntry<String>>[
+                          PopupMenuItem(
+                            value: 'play',
+                            child: Row(
+                              children: <Widget>[
+                                const Icon(Icons.play_arrow_rounded, size: 18),
+                                const SizedBox(width: 8),
+                                Text(tr(widget.preferences,
+                                    'Play from here',
+                                    'Lire à partir d’ici')),
+                              ],
+                            ),
+                          ),
+                          PopupMenuItem(
+                            value: 'rename',
+                            child: Row(
+                              children: <Widget>[
+                                const Icon(Icons.edit_outlined, size: 18),
+                                const SizedBox(width: 8),
+                                Text(tr(widget.preferences, 'Rename',
+                                    'Renommer')),
+                              ],
+                            ),
+                          ),
+                          PopupMenuItem(
+                            value: 'delete',
+                            child: Row(
+                              children: <Widget>[
+                                Icon(Icons.delete_outline_rounded,
+                                    size: 18, color: colorScheme.error),
+                                const SizedBox(width: 8),
+                                Text(tr(widget.preferences, 'Delete',
+                                    'Supprimer'),
+                                    style:
+                                        TextStyle(color: colorScheme.error)),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final createdLabel = DateFormat('EEEE, dd MMM yyyy · HH:mm',
-            widget.preferences.isFrench ? 'fr' : 'en')
-        .format(_project.createdAt);
+    final colorScheme = theme.colorScheme;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(tr(widget.preferences, 'Project', 'Projet')),
+        title: Text(tr(widget.preferences, 'Project Workspace', 'Espace projet')),
         actions: <Widget>[
           IconButton(
-              tooltip: tr(widget.preferences, 'Add another recording session',
-                  'Ajouter une session d’enregistrement'),
-              onPressed:
-                  _loading || _project.isTrashed ? null : _continueRecording,
-              icon: const Icon(Icons.mic_none_rounded)),
-          IconButton(
-            tooltip: tr(widget.preferences, 'Add bookmark at current position',
-                'Ajouter un repère à la position actuelle'),
-            onPressed: _loading || _error != null || _project.sessions.isEmpty
-                ? null
-                : () => _addBookmark(),
-            icon: const Icon(Icons.bookmark_add_rounded),
+            tooltip: tr(
+              widget.preferences,
+              'Add a new take to this project',
+              'Ajouter une nouvelle prise à ce projet',
+            ),
+            onPressed:
+                _loading || _project.isTrashed ? null : _continueRecording,
+            icon: const Icon(Icons.mic_rounded),
           ),
           IconButton(
             tooltip: _project.isFavorite
@@ -1987,10 +3426,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
             onPressed: () => _saveProject(
                 _project.copyWith(isFavorite: !_project.isFavorite)),
             icon: Icon(
-                _project.isFavorite
-                    ? Icons.star_rounded
-                    : Icons.star_border_rounded,
-                color: _project.isFavorite ? theme.colorScheme.tertiary : null),
+              _project.isFavorite
+                  ? Icons.star_rounded
+                  : Icons.star_border_rounded,
+              color: _project.isFavorite ? colorScheme.tertiary : null,
+            ),
           ),
           PopupMenuButton<String>(
             tooltip:
@@ -2083,425 +3523,136 @@ class _PlayerScreenState extends State<PlayerScreen> {
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isCompact = constraints.maxWidth < 600;
-            final horizontalPadding = isCompact ? 16.0 : 28.0;
-            return Align(
-              alignment: Alignment.topCenter,
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 820),
-                child: ListView(
-                  padding: EdgeInsets.fromLTRB(
-                    horizontalPadding,
-                    12,
-                    horizontalPadding,
-                    26,
+            final isWide = constraints.maxWidth >= 850;
+
+            final tabBar = Container(
+              margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              decoration: BoxDecoration(
+                color:
+                    colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: TabBar(
+                controller: _tabController,
+                splashBorderRadius: BorderRadius.circular(14),
+                indicatorSize: TabBarIndicatorSize.tab,
+                dividerColor: Colors.transparent,
+                indicator: BoxDecoration(
+                  color: colorScheme.primary,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                labelColor: colorScheme.onPrimary,
+                unselectedLabelColor: colorScheme.onSurfaceVariant,
+                labelStyle: const TextStyle(
+                    fontWeight: FontWeight.w700, fontSize: 13),
+                tabs: <Widget>[
+                  Tab(
+                    icon: const Icon(Icons.mic_rounded, size: 18),
+                    text:
+                        '${tr(widget.preferences, 'Takes', 'Prises')} (${_project.sessions.length})',
                   ),
+                  Tab(
+                    icon: const Icon(Icons.notes_rounded, size: 18),
+                    text:
+                        '${tr(widget.preferences, 'Notes', 'Notes')} (${_notesWordCount}w)',
+                  ),
+                  Tab(
+                    icon: const Icon(Icons.bookmarks_rounded, size: 18),
+                    text:
+                        '${tr(widget.preferences, 'Marks', 'Repères')} (${_project.bookmarks.length})',
+                  ),
+                  Tab(
+                    icon: const Icon(Icons.attach_file_rounded, size: 18),
+                    text:
+                        '${tr(widget.preferences, 'Files', 'Fichiers')} (${_attachments.length})',
+                  ),
+                ],
+              ),
+            );
+
+            if (isWide) {
+              return Padding(
+                padding: const EdgeInsets.all(20),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
-                    Text(_project.title,
-                        style: theme.textTheme.headlineSmall
-                            ?.copyWith(fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 6),
-                    Text(createdLabel,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                            color: theme.colorScheme.onSurfaceVariant)),
-                    const SizedBox(height: 12),
-                    Card(
-                      color: theme.colorScheme.primaryContainer
-                          .withValues(alpha: 0.55),
-                      child: ListTile(
-                        leading: Icon(Icons.mic_none_rounded,
-                            color: theme.colorScheme.primary),
-                        title: Text(tr(
-                          widget.preferences,
-                          'Add a recording to this project',
-                          'Ajouter un enregistrement à ce projet',
-                        )),
-                        subtitle: Text(tr(
-                          widget.preferences,
-                          'The microphone button records a new take into this project. Every recording stays separate: tap one below to play, rename, share or delete just that recording.',
-                          'Le bouton du microphone enregistre une nouvelle prise dans ce projet. Chaque enregistrement reste séparé : touchez-en un ci-dessous pour le lire, le renommer, le partager ou le supprimer.',
-                        )),
-                      ),
-                    ),
-                    if (_project.sessions.isNotEmpty) ...<Widget>[
-                      const SizedBox(height: 12),
-                      _buildSessionsSection(theme),
-                    ],
-                    if (_project.sessions.isNotEmpty) ...<Widget>[
-                      const SizedBox(height: 12),
-                      _buildBookmarksSection(theme),
-                      const SizedBox(height: 18),
-                    ],
-                    const SizedBox(height: 22),
-                    Container(
-                      padding: const EdgeInsets.all(22),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(26),
-                        color: theme.colorScheme.surfaceContainerLow,
-                        border: Border.all(
-                            color: theme.colorScheme.outlineVariant
-                                .withValues(alpha: 0.45)),
-                      ),
-                      child: Column(
+                    SizedBox(
+                      width: 380,
+                      child: ListView(
                         children: <Widget>[
-                          if (_project.sessions.length > 1)
-                            Padding(
-                              padding: const EdgeInsets.only(bottom: 12),
-                              child: Text(
-                                tr(
-                                    widget.preferences,
-                                    'Playing recording ${_activeIndex + 1} of ${_project.sessions.length}',
-                                    'Lecture de l’enregistrement ${_activeIndex + 1} sur ${_project.sessions.length}'),
-                                textAlign: TextAlign.center,
-                                style: theme.textTheme.bodySmall?.copyWith(
-                                    color: theme.colorScheme.onSurfaceVariant),
-                              ),
-                            ),
-                          if (_securityWarning != null)
-                            Container(
-                              width: double.infinity,
-                              margin: const EdgeInsets.only(bottom: 14),
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: theme.colorScheme.errorContainer,
-                                borderRadius: BorderRadius.circular(14),
-                              ),
-                              child: Text(
-                                _securityWarning!,
-                                style: theme.textTheme.bodySmall?.copyWith(
-                                    color: theme.colorScheme.onErrorContainer),
-                              ),
-                            ),
-                          Container(
-                            width: 80,
-                            height: 80,
-                            decoration: BoxDecoration(
-                                color: theme.colorScheme.primary
-                                    .withValues(alpha: 0.12),
-                                shape: BoxShape.circle),
-                            child: Icon(Icons.graphic_eq_rounded,
-                                size: 40, color: theme.colorScheme.primary),
-                          ),
-                          const SizedBox(height: 15),
-                          Text(
-                              _project.sessions.isEmpty
-                                  ? '—'
-                                  : _formatDuration(_activeDurationMs),
-                              style: theme.textTheme.titleLarge
-                                  ?.copyWith(fontWeight: FontWeight.w800)),
-                          if (_session != null && _session!.name.isNotEmpty)
-                            Padding(
-                              padding: const EdgeInsets.only(top: 4),
-                              child: Text(
-                                _session!.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                textAlign: TextAlign.center,
-                                style: theme.textTheme.bodySmall?.copyWith(
-                                    color: theme.colorScheme.onSurfaceVariant),
-                              ),
-                            ),
-                          const SizedBox(height: 20),
-                          if (_loading)
-                            const Padding(
-                                padding: EdgeInsets.all(18),
-                                child: CircularProgressIndicator())
-                          else if (_error != null)
-                            Text(_error!,
-                                textAlign: TextAlign.center,
-                                style: theme.textTheme.bodyMedium
-                                    ?.copyWith(color: theme.colorScheme.error))
-                          else ...<Widget>[
-                            StreamBuilder<Duration>(
-                              stream: _player.positionStream,
-                              builder: (context, positionSnapshot) {
-                                final position = positionSnapshot.data ??
-                                    Duration.zero;
-                                final duration = Duration(
-                                    milliseconds: _activeDurationMs);
-                                final maxMs = duration.inMilliseconds > 0
-                                    ? duration.inMilliseconds.toDouble()
-                                    : 1.0;
-                                return Column(
-                                  children: <Widget>[
-                                    Slider(
-                                      min: 0,
-                                      max: maxMs,
-                                      value: position.inMilliseconds
-                                          .toDouble()
-                                          .clamp(0, maxMs)
-                                          .toDouble(),
-                                      onChanged: (value) =>
-                                          _seekGlobal(value.round()),
-                                    ),
-                                    Row(
-                                      mainAxisAlignment:
-                                          MainAxisAlignment.spaceBetween,
-                                      children: <Widget>[
-                                        Text(
-                                            _formatDuration(
-                                                position.inMilliseconds),
-                                            style: theme.textTheme.labelSmall
-                                                ?.copyWith(
-                                                    color: theme.colorScheme
-                                                        .onSurfaceVariant)),
-                                        Text(
-                                            _formatDuration(
-                                                duration.inMilliseconds),
-                                            style: theme.textTheme.labelSmall
-                                                ?.copyWith(
-                                                    color: theme.colorScheme
-                                                        .onSurfaceVariant)),
-                                      ],
-                                    ),
-                                  ],
-                                );
-                              },
-                            ),
-                            const SizedBox(height: 6),
-                            StreamBuilder<PlayerState>(
-                              stream: _player.playerStateStream,
-                              builder: (context, snapshot) {
-                                final playing = snapshot.data?.playing ?? false;
-                                // Compact phones cannot fit five controls in
-                                // one row; wrap them instead of overflowing.
-                                return Wrap(
-                                  alignment: WrapAlignment.center,
-                                  crossAxisAlignment: WrapCrossAlignment.center,
-                                  spacing: 6,
-                                  runSpacing: 4,
-                                  children: <Widget>[
-                                    IconButton(
-                                      tooltip: tr(
-                                          widget.preferences,
-                                          'Restart from the beginning',
-                                          'Recommencer au début'),
-                                      onPressed: () => _seekGlobal(0),
-                                      icon: const Icon(Icons.replay_rounded),
-                                      iconSize: 27,
-                                    ),
-                                    IconButton.filledTonal(
-                                      tooltip: tr(
-                                          widget.preferences,
-                                          'Bookmark this exact moment',
-                                          'Repérer ce moment exact'),
-                                      onPressed: _loading || _error != null
-                                          ? null
-                                          : () => _addBookmark(),
-                                      icon: const Icon(
-                                          Icons.bookmark_add_rounded),
-                                      iconSize: 24,
-                                    ),
-                                    SizedBox(
-                                      width: 66,
-                                      height: 66,
-                                      child: FilledButton(
-                                        style: FilledButton.styleFrom(
-                                            shape: const CircleBorder(),
-                                            padding: EdgeInsets.zero),
-                                        onPressed: _loading || _error != null
-                                            ? null
-                                            : () async {
-                                                if (playing) {
-                                                  await _player.pause();
-                                                } else {
-                                                  unawaited(_player.play());
-                                                }
-                                              },
-                                        child: Icon(
-                                            playing
-                                                ? Icons.pause_rounded
-                                                : Icons.play_arrow_rounded,
-                                            size: 34),
-                                      ),
-                                    ),
-                                    IconButton(
-                                      tooltip: tr(
-                                          widget.preferences,
-                                          'Show bookmarks',
-                                          'Afficher les repères'),
-                                      onPressed: () => _showBookmarksSheet(),
-                                      icon: const Icon(
-                                          Icons.bookmarks_outlined),
-                                      iconSize: 25,
-                                    ),
-                                    PopupMenuButton<double>(
-                                      tooltip: tr(
-                                          widget.preferences,
-                                          'Playback speed',
-                                          'Vitesse de lecture'),
-                                      icon: const Icon(Icons.speed_rounded),
-                                      onSelected: (speed) =>
-                                          _player.setSpeed(speed),
-                                      itemBuilder: (_) =>
-                                          <PopupMenuEntry<double>>[
-                                        for (final speed in <double>[
-                                          0.5,
-                                          0.75,
-                                          1,
-                                          1.25,
-                                          1.5,
-                                          2
-                                        ])
-                                          PopupMenuItem<double>(
-                                              value: speed,
-                                              child: Text('$speed×')),
-                                      ],
-                                    ),
-                                  ],
-                                );
-                              },
-                            ),
-                          ],
+                          _buildWorkspaceHeader(theme),
+                          const SizedBox(height: 16),
+                          _buildHeroAudioConsole(theme),
                         ],
                       ),
                     ),
-                    if (_project.isDraft) ...<Widget>[
-                      const SizedBox(height: 14),
-                      Container(
-                        padding: const EdgeInsets.all(15),
-                        decoration: BoxDecoration(
-                          color: theme.colorScheme.tertiaryContainer,
-                          borderRadius: BorderRadius.circular(18),
+                    const SizedBox(width: 20),
+                    Expanded(
+                      child: Card(
+                        elevation: 0,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(20),
+                          side: BorderSide(
+                              color: colorScheme.outlineVariant
+                                  .withValues(alpha: 0.4)),
                         ),
+                        color: colorScheme.surface,
                         child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: <Widget>[
-                            Text(
-                              tr(
-                                  widget.preferences,
-                                  'Recovered recording draft',
-                                  'Brouillon d’enregistrement récupéré'),
-                              style: theme.textTheme.titleSmall
-                                  ?.copyWith(fontWeight: FontWeight.w800),
-                            ),
-                            const SizedBox(height: 5),
-                            Text(
-                              tr(
-                                  widget.preferences,
-                                  'RAVEN found a project that was not finalised before the app closed. Review playback first, then finalise the draft if the audio is usable.',
-                                  'RAVEN a retrouvé un projet qui n’a pas été finalisé avant la fermeture de l’application. Vérifiez la lecture, puis finalisez le brouillon si l’audio est utilisable.'),
-                              style: theme.textTheme.bodySmall,
-                            ),
-                            const SizedBox(height: 10),
-                            Align(
-                              alignment: Alignment.centerRight,
-                              child: FilledButton.tonalIcon(
-                                onPressed: _loading || _error != null
-                                    ? null
-                                    : _finalizeRecoveredDraft,
-                                icon: const Icon(
-                                    Icons.check_circle_outline_rounded),
-                                label: Text(tr(
-                                    widget.preferences,
-                                    'Finalise draft',
-                                    'Finaliser le brouillon')),
+                            const SizedBox(height: 8),
+                            tabBar,
+                            const Divider(height: 12),
+                            Expanded(
+                              child: TabBarView(
+                                controller: _tabController,
+                                children: <Widget>[
+                                  _buildSessionsTab(theme),
+                                  _buildNotesTab(theme),
+                                  _buildBookmarksTab(theme),
+                                  _buildAttachmentsTab(theme),
+                                ],
                               ),
                             ),
                           ],
                         ),
-                      ),
-                    ],
-                    const SizedBox(height: 22),
-                    // Title on its own line, actions below: keeps the header
-                    // readable on narrow phones instead of overflowing.
-                    Text(
-                        tr(widget.preferences, 'Project notes',
-                            'Notes du projet'),
-                        style: theme.textTheme.titleLarge
-                            ?.copyWith(fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 4),
-                    Wrap(
-                      alignment: WrapAlignment.end,
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      spacing: 4,
-                      children: <Widget>[
-                        PopupMenuButton<String>(
-                          tooltip: tr(widget.preferences, 'AI tools for notes',
-                              'Outils IA pour les notes'),
-                          icon: const Icon(Icons.auto_awesome_rounded),
-                          onSelected: (task) => _runAiTask(task),
-                          itemBuilder: (context) => <PopupMenuEntry<String>>[
-                            PopupMenuItem(
-                                value: 'summary',
-                                child: Text(tr(widget.preferences,
-                                    'Summarize notes', 'Résumer les notes'))),
-                            PopupMenuItem(
-                                value: 'organize',
-                                child: Text(tr(
-                                    widget.preferences,
-                                    'Organize and polish',
-                                    'Organiser et améliorer'))),
-                            PopupMenuItem(
-                                value: 'translate',
-                                child: Text(tr(widget.preferences,
-                                    'Translate notes', 'Traduire les notes'))),
-                          ],
-                        ),
-                        TextButton.icon(
-                          onPressed: _savingNotes ? null : _saveNotes,
-                          icon: _savingNotes
-                              ? const SizedBox(
-                                  width: 15,
-                                  height: 15,
-                                  child:
-                                      CircularProgressIndicator(strokeWidth: 2))
-                              : const Icon(Icons.save_outlined, size: 18),
-                          label: Text(tr(
-                              widget.preferences, 'Save notes', 'Enregistrer')),
-                        ),
-                        TextButton.icon(
-                          onPressed: _exportNotesTxt,
-                          icon: const Icon(Icons.description_outlined,
-                              size: 18),
-                          label: Text(tr(widget.preferences, 'Save .txt',
-                              'Enregistrer .txt')),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: _notesController,
-                      minLines: 4,
-                      maxLines: 10,
-                      textCapitalization: TextCapitalization.sentences,
-                      decoration: InputDecoration(
-                        hintText: tr(
-                            widget.preferences,
-                            'Add context, ideas, timestamps or follow-up notes…',
-                            'Ajoutez du contexte, des idées, des repères temporels ou des notes…'),
-                        alignLabelWithHint: true,
-                        filled: true,
-                        border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(20),
-                            borderSide: BorderSide.none),
-                      ),
-                    ),
-                    const SizedBox(height: 15),
-                    Container(
-                      padding: const EdgeInsets.all(15),
-                      decoration: BoxDecoration(
-                          color: theme.colorScheme.surfaceContainerLow,
-                          borderRadius: BorderRadius.circular(18)),
-                      child: Row(
-                        children: <Widget>[
-                          Icon(Icons.lock_outline_rounded,
-                              color: theme.colorScheme.primary),
-                          const SizedBox(width: 12),
-                          Expanded(
-                              child: Text(
-                                  tr(
-                                      widget.preferences,
-                                      'Stored in this app’s private folder. Protected audio is encrypted on this device; keep a backup because losing app data can make protected recordings unrecoverable.',
-                                      'Stocké dans le dossier privé de l’application. L’audio protégé est chiffré sur cet appareil ; conservez une sauvegarde, car la perte des données de l’application peut rendre les enregistrements irrécupérables.'),
-                                  style: theme.textTheme.bodySmall?.copyWith(
-                                      color:
-                                          theme.colorScheme.onSurfaceVariant))),
-                        ],
                       ),
                     ),
                   ],
                 ),
+              );
+            }
+
+            return NestedScrollView(
+              headerSliverBuilder: (context, innerBoxIsScrolled) => <Widget>[
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        _buildWorkspaceHeader(theme),
+                        const SizedBox(height: 14),
+                        _buildHeroAudioConsole(theme),
+                      ],
+                    ),
+                  ),
+                ),
+                SliverPersistentHeader(
+                  pinned: true,
+                  delegate: _SliverTabBarDelegate(
+                    tabBar: tabBar,
+                    color: theme.scaffoldBackgroundColor,
+                  ),
+                ),
+              ],
+              body: TabBarView(
+                controller: _tabController,
+                children: <Widget>[
+                  _buildSessionsTab(theme),
+                  _buildNotesTab(theme),
+                  _buildBookmarksTab(theme),
+                  _buildAttachmentsTab(theme),
+                ],
               ),
             );
           },
@@ -2510,335 +3661,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  /// Full-screen-sized sheet listing every bookmark with jump/edit/delete.
-  /// Reached from the player controls so bookmarks are one tap away.
-  Future<void> _showBookmarksSheet() async {
-    if (_project.sessions.isEmpty) return;
-    await showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      isScrollControlled: true,
-      builder: (sheetContext) => StatefulBuilder(
-        builder: (sheetContext, refresh) {
-          final bookmarks = List<RavenBookmark>.of(_project.bookmarks)
-            ..sort((a, b) => a.positionMs.compareTo(b.positionMs));
-          final colorScheme = Theme.of(sheetContext).colorScheme;
-          return SafeArea(
-            child: SizedBox(
-              height: MediaQuery.of(sheetContext).size.height * 0.7,
-              child: Column(
-                children: <Widget>[
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 0, 12, 8),
-                    child: Row(
-                      children: <Widget>[
-                        const Icon(Icons.bookmarks_rounded),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(
-                            tr(widget.preferences, 'Bookmarks', 'Repères'),
-                            style: Theme.of(sheetContext)
-                                .textTheme
-                                .titleLarge,
-                          ),
-                        ),
-                        FilledButton.tonalIcon(
-                          onPressed: () async {
-                            Navigator.pop(sheetContext);
-                            await _addBookmark();
-                          },
-                          icon: const Icon(Icons.add_rounded, size: 18),
-                          label: Text(tr(widget.preferences, 'Add here',
-                              'Ajouter ici')),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const Divider(height: 1),
-                  Expanded(
-                    child: bookmarks.isEmpty
-                        ? Center(
-                            child: Padding(
-                              padding: const EdgeInsets.all(24),
-                              child: Text(
-                                tr(
-                                    widget.preferences,
-                                    'No bookmarks yet.\nPlay the recording and tap Add here to mark a moment.',
-                                    'Aucun repère.\nLancez la lecture et touchez Ajouter ici pour marquer un moment.'),
-                                textAlign: TextAlign.center,
-                              ),
-                            ),
-                          )
-                        : ListView.separated(
-                            padding: const EdgeInsets.all(12),
-                            itemCount: bookmarks.length,
-                            separatorBuilder: (_, __) =>
-                                const SizedBox(height: 6),
-                            itemBuilder: (context, index) {
-                              final bookmark = bookmarks[index];
-                              return ListTile(
-                                shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(14)),
-                                tileColor: colorScheme.surfaceContainerHighest
-                                    .withValues(alpha: 0.45),
-                                leading: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 9, vertical: 5),
-                                  decoration: BoxDecoration(
-                                    color: colorScheme.primary,
-                                    borderRadius: BorderRadius.circular(9),
-                                  ),
-                                  child: Text(
-                                    _formatBookmarkTime(bookmark.positionMs),
-                                    style: TextStyle(
-                                      color: colorScheme.onPrimary,
-                                      fontWeight: FontWeight.w700,
-                                      fontSize: 12,
-                                    ),
-                                  ),
-                                ),
-                                title: Text(bookmark.label,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis),
-                                onTap: () {
-                                  Navigator.pop(sheetContext);
-                                  _jumpToBookmark(bookmark);
-                                },
-                                trailing: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: <Widget>[
-                                    IconButton(
-                                      tooltip: tr(widget.preferences,
-                                          'Rename', 'Renommer'),
-                                      onPressed: () async {
-                                        Navigator.pop(sheetContext);
-                                        await _addBookmark(
-                                            existing: bookmark);
-                                      },
-                                      icon: const Icon(Icons.edit_outlined),
-                                    ),
-                                    IconButton(
-                                      tooltip: tr(widget.preferences,
-                                          'Delete', 'Supprimer'),
-                                      onPressed: () async {
-                                        Navigator.pop(sheetContext);
-                                        await _deleteBookmark(bookmark);
-                                      },
-                                      icon: Icon(Icons.delete_outline_rounded,
-                                          color: colorScheme.error),
-                                    ),
-                                  ],
-                                ),
-                              );
-                            },
-                          ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
-    );
-  }
-
-  /// Bookmark panel: visible add button, sorted list, per-marker jump, rename
-  /// and delete. Each entry shows its own timestamp and recording part so a
-  /// multi-session project never hides where a bookmark really lives.
-  Widget _buildBookmarksSection(ThemeData theme) {
-    final bookmarks = List<RavenBookmark>.of(_project.bookmarks)
-      ..sort((a, b) => a.positionMs.compareTo(b.positionMs));
-    final totalMs = _activeDurationMs;
-    final colorScheme = theme.colorScheme;
-
-    String partLabel(RavenBookmark bookmark) {
-      final index = _project.sessions
-          .indexWhere((session) => session.id == bookmark.sessionId);
-      if (index < 0) return '';
-      final session = _project.sessions[index];
-      final name =
-          session.name.isEmpty ? 'Part ${index + 1}' : session.name;
-      return ' · $name';
-    }
-
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      child: ExpansionTile(
-        initiallyExpanded: bookmarks.isNotEmpty,
-        leading: Container(
-          width: 40,
-          height: 40,
-          decoration: BoxDecoration(
-            color: colorScheme.tertiaryContainer,
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Icon(Icons.bookmarks_rounded,
-              size: 22, color: colorScheme.onTertiaryContainer),
-        ),
-        title: Text(tr(
-            widget.preferences,
-            'Timeline bookmarks',
-            'Repères audio')),
-        subtitle: Text(
-          bookmarks.isEmpty
-              ? tr(
-                  widget.preferences,
-                  'Mark a moment so you can jump straight back to it.',
-                  'Marquez un moment pour y revenir directement.')
-              : tr(
-                  widget.preferences,
-                  '${bookmarks.length} saved · tap to jump',
-                  '${bookmarks.length} enregistré(s) · touchez pour accéder'),
-          style: theme.textTheme.bodySmall
-              ?.copyWith(color: colorScheme.onSurfaceVariant),
-        ),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            IconButton.filledTonal(
-              tooltip: tr(widget.preferences, 'Add bookmark here',
-                  'Ajouter un repère ici'),
-              onPressed: _loading || _error != null
-                  ? null
-                  : () => _addBookmark(),
-              icon: const Icon(Icons.add_rounded),
-              visualDensity: VisualDensity.compact,
-            ),
-            const Icon(Icons.expand_more_rounded),
-          ],
-        ),
-        childrenPadding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-        children: <Widget>[
-          if (bookmarks.isEmpty)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: <Widget>[
-                  Text(
-                    tr(
-                        widget.preferences,
-                        'No bookmarks yet. Play the recording, then tap “Add bookmark” to pin this moment.',
-                        'Aucun repère. Lancez la lecture, puis touchez « Ajouter un repère » pour épingler ce moment.'),
-                    style: theme.textTheme.bodySmall,
-                  ),
-                  const SizedBox(height: 10),
-                  FilledButton.tonalIcon(
-                    onPressed: _loading || _error != null
-                        ? null
-                        : () => _addBookmark(),
-                    icon: const Icon(Icons.bookmark_add_outlined, size: 18),
-                    label: Text(tr(widget.preferences, 'Add bookmark',
-                        'Ajouter un repère')),
-                  ),
-                ],
-              ),
-            )
-          else ...<Widget>[
-            for (final bookmark in bookmarks)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: Material(
-                  color: colorScheme.surfaceContainerHighest
-                      .withValues(alpha: 0.45),
-                  borderRadius: BorderRadius.circular(14),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(14),
-                    onTap: () => _jumpToBookmark(bookmark),
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
-                      child: Row(
-                        children: <Widget>[
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 8, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: colorScheme.primary,
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Text(
-                              _formatBookmarkTime(bookmark.positionMs),
-                              style: theme.textTheme.labelSmall?.copyWith(
-                                color: colorScheme.onPrimary,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: <Widget>[
-                                Text(
-                                  bookmark.label,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.bodyMedium?.copyWith(
-                                      fontWeight: FontWeight.w600),
-                                ),
-                                if (partLabel(bookmark).isNotEmpty)
-                                  Text(
-                                    partLabel(bookmark).replaceFirst(' · ', ''),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: theme.textTheme.labelSmall
-                                        ?.copyWith(
-                                            color: colorScheme
-                                                .onSurfaceVariant),
-                                  ),
-                              ],
-                            ),
-                          ),
-                          PopupMenuButton<String>(
-                            tooltip: tr(widget.preferences,
-                                'Bookmark actions', 'Actions du repère'),
-                            onSelected: (action) {
-                              switch (action) {
-                                case 'play':
-                                  _jumpToBookmark(bookmark);
-                                case 'rename':
-                                  _addBookmark(existing: bookmark);
-                                case 'delete':
-                                  _deleteBookmark(bookmark);
-                              }
-                            },
-                            itemBuilder: (context) =>
-                                <PopupMenuEntry<String>>[
-                              PopupMenuItem<String>(
-                                  value: 'play',
-                                  child: Text(tr(widget.preferences,
-                                      'Play from here', 'Lire à partir d’ici'))),
-                              PopupMenuItem<String>(
-                                  value: 'rename',
-                                  child: Text(tr(widget.preferences,
-                                      'Rename bookmark', 'Renommer le repère'))),
-                              PopupMenuItem<String>(
-                                  value: 'delete',
-                                  child: Text(tr(widget.preferences,
-                                      'Delete bookmark',
-                                      'Supprimer le repère'))),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            if (bookmarks.length > 1 && totalMs > 0)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(4, 6, 4, 4),
-                child: _BookmarkTimelineStrip(
-                  bookmarks: bookmarks,
-                  totalMs: totalMs,
-                  onTap: _seekGlobal,
-                ),
-              ),
-          ],
-        ],
-      ),
-    );
-  }
 
   PopupMenuItem<String> _projectMenuItem(
     String value,
@@ -2868,8 +3690,31 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 }
 
-/// Compact visual overview of where bookmarks sit on the project timeline.
-/// Tapping a marker seeks to it, so users can see spacing at a glance.
+class _SliverTabBarDelegate extends SliverPersistentHeaderDelegate {
+  _SliverTabBarDelegate({required this.tabBar, required this.color});
+
+  final Widget tabBar;
+  final Color color;
+
+  @override
+  double get minExtent => 56;
+  @override
+  double get maxExtent => 56;
+
+  @override
+  Widget build(BuildContext context, double shrinkOffset, bool overlapsContent) {
+    return Container(
+      color: color,
+      child: Center(child: tabBar),
+    );
+  }
+
+  @override
+  bool shouldRebuild(_SliverTabBarDelegate oldDelegate) {
+    return tabBar != oldDelegate.tabBar || color != oldDelegate.color;
+  }
+}
+
 class _BookmarkTimelineStrip extends StatelessWidget {
   const _BookmarkTimelineStrip({
     required this.bookmarks,

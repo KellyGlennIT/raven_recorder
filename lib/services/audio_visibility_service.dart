@@ -8,6 +8,16 @@ import 'package:path_provider/path_provider.dart';
 class AudioVisibilityService {
   static const MethodChannel _channel = MethodChannel('raven/audio_visibility');
 
+  /// True when [location] is an Android MediaStore-style `content://` URI
+  /// (returned by [publish] / [publishFolder] via the native channel), rather
+  /// than a real filesystem path.
+  ///
+  /// Callers that need to inspect, move, or delete a folder should route
+  /// content:// URIs through [removeFolder] / [remove] instead of `Directory`
+  /// or `File`. Real filesystem paths continue to use normal dart:io APIs.
+  static bool isContentUri(String location) =>
+      location.startsWith('content://');
+
   Future<String> publish({required File source, required String title, required String projectId}) async {
     if (!await source.exists()) throw FileSystemException('The source audio does not exist.', source.path);
     final leaf = source.uri.pathSegments.isEmpty ? source.path : source.uri.pathSegments.last;

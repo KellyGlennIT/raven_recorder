@@ -3,6 +3,8 @@
 RAVEN is a Flutter-first audio workspace for recording, organising, reviewing and annotating audio. It is designed for musicians, teachers, preachers, interviewers and everyday users who need a dependable recorder without needing to understand file management.
 
 > **Implementation status:** this repository is a working development baseline, not a certified release. `dart analyze lib` currently reports **0 errors** (a handful of style infos remain). Android debug APK builds have been exercised on a Windows development PC; Windows desktop builds still need Visual Studio with the **Desktop development with C++** workload. Treat any reported diagnostic as work to resolve before release.
+>
+> **Background playback:** fully wired via `just_audio_background` + `AudioServiceActivity`. Media notification with artwork, lock-screen controls and Bluetooth headset buttons work in debug and release builds. ProGuard rules explicitly keep `com.ryanheise.audioservice.*` so R8 minification in release builds does not strip the manifest-referenced service and receiver.
 
 ### Quick build commands
 
@@ -40,12 +42,14 @@ flutter build windows --release
 - Adjustable sample rate and bitrate plus optional platform voice processing requests.
 - Project library with search, rename, favourites, Trash/restore and permanent delete. Renaming changes the title stored against the stable project ID; it does not move or rename audio/session files, notes, bookmarks or the continuous master.
 - Audio playback, seeking across a single continuous project timeline, playback-speed control, editable project notes and timeline bookmarks. Project sessions remain individually playable, shareable, renameable and manageable from their own action menus. Continued recordings are merged into a single master file after Stop **on desktop**; on Android the sessions are played as one continuous timeline instead (see *Master audio and FFmpeg*). Library import accepts supported audio files (M4A, MP3, WAV and FLAC) as resumable standalone recordings, as well as portable RAVEN project bundles.
+- **Background playback & media notifications:** audio playback survives navigating between screens and minimizing or locking the device via `just_audio_background` and a global `PlaybackService` singleton. System media notifications and lock-screen controls (playback status, artwork, scrubbable progress bar, play/pause) keep active playback controllable anywhere. Bluetooth headset and wired headset media buttons are handled by `MediaButtonReceiver`. Background playback works in both debug and release APKs — ProGuard rules protect the `com.ryanheise.audioservice` classes that R8 would otherwise strip.
+- **Streamlined PIN Lock UX:** users can require or remove the RAVEN PIN lock on individual recordings directly from the Library card action menu or the standalone player without opening a project tab. Unlocking a PIN-protected recording starts playback immediately in the standalone player without forcing conversion into a multi-track project.
 - **Timeline bookmarks:** add a bookmark from the app bar, from the player controls, or from the bookmarks card. The dialog shows the exact timestamp and which recording part it belongs to, pauses playback while open, and resumes afterwards. Bookmarks are sorted by time, can be renamed or deleted, jump-and-play on tap, and are drawn as markers on a mini timeline strip. Each bookmark stores its `sessionId`, so a multi-session project always knows which part a bookmark belongs to; orphaned bookmarks are pruned when a part is deleted.
 - **Notes as real `.txt` files:** *Save .txt* writes a UTF-8 (with BOM) text file into the project folder at `projects/<id>/notes/<title> notes.txt`, so it opens correctly in Notepad, Word, Google Docs or any text editor and is included in project exports. A private copy is always written; the share sheet is offered from the confirmation snackbar.
 - **Attachments:** files and images can be attached to a project, previewed, shared, and removed individually or in bulk with select-all multi-select.
 - English/French UI strings and a first-run guided tour with explanations of recording, library, settings and privacy. The tour can be replayed from Settings.
 - Secure-storage vault and provider REST clients for OpenRouter, OpenAI API and Gemini API; users can configure models, test connections and manage keys. Notes AI actions require confirmation and never send audio in the current implementation.
-- Optional app-wide PIN gate stored using platform secure storage with a salted PBKDF2-HMAC-SHA256 verifier. Individual recordings can require the same RAVEN PIN before opening. This is an app-access lock, not file encryption. Per-recording public-copy control can create/remove a managed copy in Android Music/RAVEN (Android 10+) or Windows Downloads/RAVEN while preserving the private original.
+- Optional app-wide PIN gate stored using platform secure storage with a salted PBKDF2-HMAC-SHA256 verifier. Individual recordings can require the same RAVEN PIN before opening. This is an app-access lock, not file encryption. Per-recording public-folder control physically moves a project folder between app-private storage and `/storage/emulated/0/Music/RAVEN/<name>-<id>/` on Android (requires `MANAGE_EXTERNAL_STORAGE`, requested lazily on the first "Make public" action). On Windows/Linux the public root is `Downloads/RAVEN/`.
 - Recovery-aware JSON project index and category manifests. At startup, RAVEN also makes a best-effort cleanup of abandoned plaintext playback caches left after an interrupted process.
 - **Interrupted-recording recovery:** if a process is force-killed mid-recording, the session is kept as a draft. Draft sessions appear in the Library as "Interrupted draft — review audio"; opening one repairs the WAV header of a partial PCM16 recording (recomputing RIFF/data sizes) and lets the user save or discard it. Drafts are excluded from playback shortcuts, export and continue-recording flows until recovered.
 - Direct sharing of a recording via the platform share sheet. Encrypted recordings are decrypted to temporary files for sharing and those temporaries are removed afterwards; the master file is shared when valid, otherwise sessions are shared.
@@ -58,6 +62,7 @@ flutter build windows --release
 - `lib/models/raven_project.dart` — serializable project, audio-session and timeline-bookmark models.
 - `lib/screens/` — UI only: Home, Recorder, Library, Player and Settings.
 - `lib/services/project_repository.dart` — filesystem persistence, project index, backup/recovery and category manifests.
+- `lib/services/playback_service.dart` — shared, app-wide audio player singleton powering continuous background playback and WAV duration parsing.
 - `lib/services/audio_encryption_service.dart` — authenticated AES-GCM encryption with a per-recording password-derived key and PBKDF2; the password is never persisted.
 - `lib/services/audio_protection_service.dart` — project-level encrypt/decrypt orchestration, including removal of the master file on encryption and refusal to encrypt while a public copy exists.
 - `lib/services/audio_share_service.dart` — platform share-sheet export of a recording (master preferred, session fallback) with temporary decryption of protected sources.
@@ -88,7 +93,7 @@ The repository root is under the platform's application-support directory in a `
 ├── projects.json.bak         # last known-good index backup
 ├── projects.json.tmp         # in-progress index write / recovery candidate
 ├── projects/
-│   └── <stable-project-uuid>/
+│   └── <name>-<short-uuid>/  # canonical private project folder
 │       ├── sessions/         # source audio or encrypted audio sessions
 │       ├── notes/            # exported .txt notes (UTF-8 with BOM)
 │       ├── attachments/      # reserved for imported files/images
@@ -99,9 +104,9 @@ The repository root is under the platform's application-support directory in a `
         └── <project-uuid>.json  # lightweight pointer/manifest only
 ```
 
-**Why category manifests instead of moving the project folder?** A recording may be renamed or recategorised. Audio paths remain stable under `projects/<uuid>/sessions`; category folders are indexes only. This prevents moving a category from breaking session paths. Empty child directories are created when a project folder is first created; feature data should only be written when it exists.
+**Public project folders (Android):** when a project is made public, its entire folder is **physically moved** (not copied) to `/storage/emulated/0/Music/RAVEN/<name>-<short-uuid>/`. This requires `MANAGE_EXTERNAL_STORAGE` on Android 11+ (prompted lazily on first "Make public"). On Android 10 and below, `WRITE_EXTERNAL_STORAGE` + `requestLegacyExternalStorage` achieve the same without a runtime prompt. Making a project private moves the folder back to app-private storage. Resuming, adding notes, managing attachments, and deleting all work directly on the folder at its current location — no copies are involved.
 
-On Android, this app-support directory is private to the app sandbox and is not meant to be browsed directly in a generic file manager. On Windows it is under the application-support location for the current user. Use the Player export action to create a portable project bundle, and the Library archive button to import a `.zip` bundle. Uninstalling may remove private app data; keep separate backups of important projects.
+**Windows / Linux public root:** `<Downloads>/RAVEN/<name>-<short-uuid>/`.
 
 ## App lock and private recordings
 
@@ -210,6 +215,31 @@ The Android app scaffold and plugin configuration are in `android/`. Recording n
 - **Version warnings:** Flutter warns that Gradle 8.14.3, AGP 8.11.1 and Kotlin 2.2.20 will soon be unsupported. Build with `--android-skip-build-dependency-validation` until you upgrade them.
 - **SDK XML warning:** *"This version only understands SDK XML versions up to 3 but an SDK XML file of version 4 was encountered"* means Android Studio and the command-line tools are from different releases. It is harmless; update the command-line tools to match Android Studio to silence it.
 
+### Permissions
+
+| Permission | Purpose |
+|---|---|
+| `RECORD_AUDIO` | Microphone capture |
+| `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_MICROPHONE` | Recording foreground service |
+| `FOREGROUND_SERVICE_MEDIA_PLAYBACK` | Background audio playback service (Android 14+) |
+| `POST_NOTIFICATIONS` | Recording and playback notifications |
+| `WAKE_LOCK` | Keep audio alive when screen turns off |
+| `MANAGE_EXTERNAL_STORAGE` | Move project folders into `Music/RAVEN/` (Android 11+, prompted lazily) |
+| `WRITE_EXTERNAL_STORAGE` `maxSdkVersion="28"` | Same capability on Android 10 and below |
+| `READ_EXTERNAL_STORAGE` | Read shared storage on Android ≤ 12 |
+
+### Background playback (Android)
+
+Background playback is powered by `just_audio_background` + `AudioServiceActivity`:
+
+- `MainActivity` extends `AudioServiceActivity` (from `com.ryanheise.audioservice`). This registers the `AudioService` foreground service automatically and must not be changed to a plain `FlutterActivity`.
+- `AudioService` and `MediaButtonReceiver` are declared in `AndroidManifest.xml` and kept by ProGuard rule `-keep class com.ryanheise.audioservice.**`. Without this rule R8 minification strips them from release builds, silently breaking background audio and media button handling.
+- `PlaybackService` holds a single `AudioPlayer` for the app's lifetime. The player is never disposed per-screen, so playback continues when navigating away from `PlayerScreen`.
+- `JustAudioBackground.init()` is called at the top of `main()`, before any `AudioPlayer` is created.
+- Media notification shows the project title, session name, album art (project attachment or RAVEN logo) and a scrubbable seek bar. Lock-screen controls and Bluetooth headset buttons dispatch to the same player.
+
+To verify after a release build: start playback, press Home, confirm the media notification appears and play/pause works from the notification shade and lock screen. `adb logcat | grep -i "audioservice\|just_audio\|raven"` shows any service failures.
+
 ### Saving notes as `.txt` on Android
 
 Notes are written to the project folder (`projects/<id>/notes/`) and are therefore private to the app. To open them outside RAVEN, use the **Share** action in the confirmation snackbar, or export the project bundle. The `publishDocument` method channel in `MainActivity.kt` can copy a text file into the public `Documents/RAVEN` folder on Android 10+ if you want a user-visible copy; it is not called by default so notes stay inside the project.
@@ -230,6 +260,9 @@ While a recording is active, a microphone-type foreground service shows a visibl
 8. Check editable `.txt` notes export (file appears in `projects/<id>/notes/`, opens in Notepad with correct accents), bookmark add/rename/delete/jump, French UI, first-run tour and tour replay.
 9. Test long recordings, low storage, denied permissions, missing files, interrupted writes and app process termination; confirm the interrupted draft appears in the Library, its WAV header is repaired on open, and it can be saved or discarded.
 10. Test project bundle export/import with long audio, attachments, special characters, missing source files and interrupted import; verify the imported project receives a new ID and stays private.
+11. **Background playback (release build):** install a release APK, start playing a recording, press Home — confirm media notification appears with artwork and seek bar. Play/pause from the notification and lock screen. Press Back from the Player screen and confirm audio continues. `adb logcat | grep -i audioservice` must be silent (no crashes).
+12. **Public folder (Android 11+):** make a project public — confirm the "Allow RAVEN to access all files" settings screen appears on first use. Grant, return to app, verify `Music/RAVEN/<name>-<id>/sessions/` exists in the Files app. Make private — folder disappears from Music. Deny permission — snackbar shows the actionable message, nothing moved.
+13. **Public folder blocked cases:** try to make an encrypted project public (should fail with encryption message); try to make a PIN-locked project public (should fail with PIN message).
 
 ## Scope still to finish
 

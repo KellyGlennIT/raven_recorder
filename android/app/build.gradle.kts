@@ -64,15 +64,12 @@ android {
     }
 }
 
-// FFmpeg (ffmpeg_kit_flutter_new_audio) is used only to build continuous master
-// audio, which is a desktop feature. Excluding it from the Android variant keeps
-// roughly 20–30 MB of native libraries (arm64/armv7/x86_64) out of the APK.
-// The Dart side already skips merging on Android (see AudioMergeService).
-configurations.configureEach {
-    if (name.startsWith("implementation") || name.startsWith("api")) {
-        exclude(group = "com.antonkarpenko", module = "ffmpeg-kit-audio")
-    }
-}
+// FFmpeg (ffmpeg_kit_flutter_new_audio) is bundled on Android because RAVEN
+// needs to convert between WAV / M4A / MP3 / FLAC during resume: WAV is the
+// intermediate format used for the lossless byte-merge, and the merged result
+// must be re-encoded back to the project's format. Android has no built-in
+// MP3 encoder, so libmp3lame (shipped inside FFmpeg) is the only way to
+// produce MP3. This adds roughly 20–30 MB of native libraries to the APK.
 
 kotlin {
     compilerOptions {

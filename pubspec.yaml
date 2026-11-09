@@ -14,9 +14,11 @@ dependencies:
     sdk: flutter
   record: ^6.2.1
   just_audio: ^0.9.46
-  # Desktop-only: builds one continuous master file for multi-session projects.
-  # Its native Android AARs are excluded in android/app/build.gradle.kts so the
-  # APK does not carry ~20–30 MB of unused FFmpeg libraries.
+  # Background playback + media notification (play/pause/seek in the
+  # notification shade and lock screen). Wraps just_audio transparently.
+  just_audio_background: ^0.0.1-beta.17
+  # FFmpeg is bundled on Android now (see android/app/build.gradle.kts) so
+  # WAV / M4A / MP3 / FLAC conversions work during resume-merge.
   ffmpeg_kit_flutter_new_audio: ^2.5.7
   path: ^1.9.1
   path_provider: ^2.1.5

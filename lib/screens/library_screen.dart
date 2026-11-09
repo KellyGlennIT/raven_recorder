@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 
 import '../models/raven_project.dart';
@@ -30,30 +31,37 @@ class LibraryScreen extends StatefulWidget {
     required this.onShareProject,
     required this.onToggleVisibility,
     required this.onToggleProtection,
+    this.onShareProjects,
+    this.onTogglePin,
     super.key,
   });
 
   final List<RavenProject> projects;
   final List<String> categories;
   final AppPreferences preferences;
-  final ValueChanged<RavenProject> onOpenProject;
-  final ValueChanged<RavenProject> onFavorite;
-  final ValueChanged<RavenProject> onRename;
-  final ValueChanged<RavenProject> onTrash;
-  final ValueChanged<RavenProject> onRestore;
-  final ValueChanged<RavenProject> onDelete;
+
+  final Future<void> Function(RavenProject) onOpenProject;
+  final Future<void> Function(RavenProject) onFavorite;
+  final Future<void> Function(RavenProject) onRename;
+  final Future<void> Function(RavenProject) onTrash;
+  final Future<void> Function(RavenProject) onRestore;
+  final Future<void> Function(RavenProject) onDelete;
+  final Future<void> Function(RavenProject) onResumeProject;
+  final Future<void> Function(RavenProject) onAssignCategory;
+  final Future<void> Function(RavenProject) onCreateProject;
+  final Future<void> Function(RavenProject) onShareProject;
+
   final VoidCallback onImportProject;
   final VoidCallback onImportAudio;
-  final ValueChanged<RavenProject> onResumeProject;
   final Future<void> Function(String name) onCreateCategory;
   final Future<void> Function(String currentName, String newName)
       onRenameCategory;
   final Future<void> Function(String name) onDeleteCategory;
-  final ValueChanged<RavenProject> onAssignCategory;
-  final ValueChanged<RavenProject> onCreateProject;
-  final ValueChanged<RavenProject> onShareProject;
   final Future<void> Function(RavenProject project) onToggleVisibility;
   final Future<void> Function(RavenProject project) onToggleProtection;
+
+  final Future<void> Function(List<RavenProject> projects)? onShareProjects;
+  final Future<void> Function(RavenProject project)? onTogglePin;
 
   @override
   State<LibraryScreen> createState() => _LibraryScreenState();
@@ -61,14 +69,594 @@ class LibraryScreen extends StatefulWidget {
 
 class _LibraryScreenState extends State<LibraryScreen> {
   final TextEditingController _searchController = TextEditingController();
+  final Set<String> _selectedIds = <String>{};
   LibraryFilter _filter = LibraryFilter.all;
   String? _selectedCategory;
+  bool _bulkRunning = false;
 
   @override
   void dispose() {
     _searchController.dispose();
     super.dispose();
   }
+
+  @override
+  void didUpdateWidget(covariant LibraryScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final currentIds = widget.projects.map((p) => p.id).toSet();
+    _selectedIds.removeWhere((id) => !currentIds.contains(id));
+  }
+
+  bool get _isSelectionMode => _selectedIds.isNotEmpty;
+
+  List<RavenProject> get _selectedProjects =>
+      widget.projects.where((p) => _selectedIds.contains(p.id)).toList();
+
+  List<RavenProject> get _selectedActive =>
+      _selectedProjects.where((p) => !p.isTrashed).toList();
+
+  List<RavenProject> get _selectedTrashed =>
+      _selectedProjects.where((p) => p.isTrashed).toList();
+
+  bool get _allActiveFavorite =>
+      _selectedActive.isNotEmpty &&
+      _selectedActive.every((p) => p.isFavorite);
+
+  bool get _canMakePublic => _selectedActive.any(
+      (p) => !p.isAudioProtected && !p.requiresAppPin && !p.isPublic);
+
+  bool get _canMakePrivate => _selectedActive.any((p) => p.isPublic);
+
+  void _enterSelection(String projectId) {
+    HapticFeedback.mediumImpact();
+    setState(() => _selectedIds.add(projectId));
+  }
+
+  void _toggleSelection(String projectId) {
+    setState(() {
+      if (_selectedIds.contains(projectId)) {
+        _selectedIds.remove(projectId);
+      } else {
+        _selectedIds.add(projectId);
+      }
+    });
+  }
+
+  void _clearSelection() {
+    if (_selectedIds.isEmpty) return;
+    setState(_selectedIds.clear);
+  }
+
+  void _selectAll(List<RavenProject> visible) {
+    setState(() {
+      final visibleIds = visible.map((p) => p.id).toSet();
+      final allAlreadySelected = _selectedIds.length == visibleIds.length &&
+          _selectedIds.containsAll(visibleIds);
+      if (allAlreadySelected) {
+        _selectedIds.clear();
+      } else {
+        _selectedIds
+          ..clear()
+          ..addAll(visibleIds);
+      }
+    });
+  }
+
+  void _setFilter(LibraryFilter filter) {
+    _clearSelection();
+    setState(() {
+      _filter = filter;
+      _selectedCategory = null;
+    });
+  }
+
+  void _setCategory(String? category) {
+    _clearSelection();
+    setState(() {
+      _selectedCategory = category;
+      if (category != null) _filter = LibraryFilter.all;
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Bulk operations
+  // ---------------------------------------------------------------------------
+
+  Future<void> _runBulk({
+    required List<RavenProject> projects,
+    required Future<void> Function(RavenProject) action,
+    required String Function(int successCount) successMessage,
+  }) async {
+    if (projects.isEmpty || _bulkRunning) return;
+    setState(() => _bulkRunning = true);
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final failures = <String>[];
+    for (final p in projects) {
+      try {
+        await action(p);
+      } catch (e) {
+        failures.add('${p.title}: $e');
+      }
+    }
+    if (!mounted) return;
+    setState(() => _bulkRunning = false);
+    _clearSelection();
+    final success = projects.length - failures.length;
+    final base = successMessage(success);
+    final message = failures.isEmpty
+        ? base
+        : '$base · ${failures.length} ${tr(widget.preferences, 'failed', 'échoué(s)')}';
+    messenger?.showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _bulkFavorite() async {
+    final active = _selectedActive;
+    if (active.isEmpty) return;
+    final allFav = _allActiveFavorite;
+    final targets =
+        allFav ? active : active.where((p) => !p.isFavorite).toList();
+    await _runBulk(
+      projects: targets,
+      action: widget.onFavorite,
+      successMessage: (n) => allFav
+          ? tr(widget.preferences, 'Removed $n from favourites',
+              '$n retiré(s) des favoris')
+          : tr(widget.preferences, 'Added $n to favourites',
+              '$n ajouté(s) aux favoris'),
+    );
+  }
+
+  Future<void> _bulkCategory() async {
+    final active = _selectedActive;
+    if (active.isEmpty) return;
+    final category = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: Text(tr(widget.preferences, 'Move to category',
+            'Déplacer vers une catégorie')),
+        children: widget.categories
+            .map(
+              (name) => SimpleDialogOption(
+                onPressed: () => Navigator.pop(dialogContext, name),
+                child: Row(
+                  children: <Widget>[
+                    const Icon(Icons.folder_outlined),
+                    const SizedBox(width: 12),
+                    Text(name),
+                  ],
+                ),
+              ),
+            )
+            .toList(),
+      ),
+    );
+    if (category == null || !mounted) return;
+    final targets = active.where((p) => p.category != category).toList();
+    await _runBulk(
+      projects: targets,
+      action: (p) => widget.onAssignCategory(p.copyWith(category: category)),
+      successMessage: (n) => tr(widget.preferences,
+          'Moved $n to "$category"', '$n déplacé(s) vers « $category »'),
+    );
+  }
+
+  Future<void> _bulkTrash() async {
+    final active = _selectedActive;
+    if (active.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(tr(
+          widget.preferences,
+          active.length == 1
+              ? 'Move 1 recording to trash?'
+              : 'Move ${active.length} recordings to trash?',
+          active.length == 1
+              ? 'Déplacer 1 enregistrement dans la corbeille ?'
+              : 'Déplacer ${active.length} enregistrements dans la corbeille ?',
+        )),
+        content: Text(tr(widget.preferences,
+            'You can restore them later from Trash.',
+            'Vous pourrez les restaurer depuis la corbeille.')),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(tr(widget.preferences, 'Move to trash',
+                'Mettre à la corbeille')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await _runBulk(
+      projects: active,
+      action: widget.onTrash,
+      successMessage: (n) => tr(widget.preferences,
+          'Moved $n to trash', '$n déplacé(s) dans la corbeille'),
+    );
+  }
+
+  Future<void> _bulkRestore() async {
+    final trashed = _selectedTrashed;
+    if (trashed.isEmpty) return;
+    await _runBulk(
+      projects: trashed,
+      action: widget.onRestore,
+      successMessage: (n) =>
+          tr(widget.preferences, 'Restored $n', '$n restauré(s)'),
+    );
+  }
+
+  Future<void> _bulkDelete() async {
+    final all = _selectedProjects;
+    if (all.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(tr(
+          widget.preferences,
+          all.length == 1
+              ? 'Delete 1 recording permanently?'
+              : 'Delete ${all.length} recordings permanently?',
+          all.length == 1
+              ? 'Supprimer 1 enregistrement définitivement ?'
+              : 'Supprimer ${all.length} enregistrements définitivement ?',
+        )),
+        content: Text(tr(
+            widget.preferences,
+            'This removes them and their audio from this device. This action cannot be undone.',
+            'Cela supprime ces projets et leur audio de cet appareil. Action irréversible.')),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+              foregroundColor: Theme.of(context).colorScheme.onError,
+            ),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(tr(widget.preferences, 'Delete permanently',
+                'Supprimer définitivement')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await _runBulk(
+      projects: all,
+      action: widget.onDelete,
+      successMessage: (n) =>
+          tr(widget.preferences, 'Deleted $n', '$n supprimé(s)'),
+    );
+  }
+
+  Future<void> _bulkVisibility({required bool makePublic}) async {
+    final active = _selectedActive;
+    if (active.isEmpty) return;
+    final targets = makePublic
+        ? active
+            .where((p) =>
+                !p.isPublic && !p.isAudioProtected && !p.requiresAppPin)
+            .toList()
+        : active.where((p) => p.isPublic).toList();
+    if (targets.isEmpty) return;
+    final skipped = active.length - targets.length;
+    await _runBulk(
+      projects: targets,
+      action: widget.onToggleVisibility,
+      successMessage: (n) {
+        final base = makePublic
+            ? tr(widget.preferences, 'Made $n public',
+                '$n rendu(s) public(s)')
+            : tr(widget.preferences, 'Made $n private',
+                '$n rendu(s) privé(s)');
+        return skipped > 0
+            ? '$base · $skipped ${tr(widget.preferences, 'skipped', 'ignoré(s)')}'
+            : base;
+      },
+    );
+  }
+
+  Future<void> _bulkShare() async {
+    final active = _selectedActive;
+    if (active.isEmpty) return;
+    final handler = widget.onShareProjects;
+    if (handler == null) return;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    try {
+      await handler(active);
+      if (!mounted) return;
+      _clearSelection();
+    } catch (e) {
+      if (!mounted) return;
+      messenger?.showSnackBar(SnackBar(
+        content: Text(
+            '${tr(widget.preferences, 'Could not share', 'Impossible de partager')}: $e'),
+      ));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Header builders
+  // ---------------------------------------------------------------------------
+
+  Widget _buildNormalHeader({
+    required ThemeData theme,
+    required List<RavenProject> visible,
+    required String query,
+    required double horizontalPadding,
+    required bool isCompact,
+  }) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+          horizontalPadding, isCompact ? 16 : 28, horizontalPadding, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              if (isCompact)
+                Builder(
+                  builder: (context) => IconButton(
+                    tooltip: tr(widget.preferences, 'Open library menu',
+                        'Ouvrir le menu de la bibliothèque'),
+                    onPressed: () => Scaffold.of(context).openDrawer(),
+                    icon: const Icon(Icons.menu_rounded),
+                  ),
+                ),
+              Expanded(
+                child: Text(
+                  _pageTitle,
+                  style: theme.textTheme.headlineMedium
+                      ?.copyWith(fontWeight: FontWeight.w800),
+                ),
+              ),
+              IconButton.filledTonal(
+                tooltip: tr(widget.preferences, 'Manage categories',
+                    'Gérer les catégories'),
+                onPressed: () => _manageCategories(context),
+                icon: const Icon(Icons.folder_copy_outlined),
+              ),
+              const SizedBox(width: 4),
+              PopupMenuButton<String>(
+                tooltip: tr(widget.preferences, 'Import audio or project',
+                    'Importer un audio ou un projet'),
+                onSelected: (value) {
+                  if (value == 'audio') {
+                    widget.onImportAudio();
+                  } else {
+                    widget.onImportProject();
+                  }
+                },
+                itemBuilder: (context) => <PopupMenuEntry<String>>[
+                  PopupMenuItem<String>(
+                    value: 'audio',
+                    child: Text(tr(widget.preferences, 'Import audio file',
+                        'Importer un fichier audio')),
+                  ),
+                  PopupMenuItem<String>(
+                    value: 'project',
+                    child: Text(tr(widget.preferences,
+                        'Import RAVEN project bundle',
+                        'Importer un projet RAVEN')),
+                  ),
+                ],
+                icon: const Icon(Icons.file_upload_outlined),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            query.isEmpty
+                ? '${visible.length} ${tr(widget.preferences, visible.length == 1 ? 'recording' : 'recordings', visible.length == 1 ? 'enregistrement' : 'enregistrements')}'
+                : '${visible.length} ${tr(widget.preferences, 'of', 'sur')} ${widget.projects.where((p) => _filter != LibraryFilter.trash ? !p.isTrashed : p.isTrashed).length}',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 17),
+          TextField(
+            controller: _searchController,
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(
+              hintText: tr(widget.preferences, 'Search title, category or tag',
+                  'Rechercher titre, catégorie ou étiquette'),
+              prefixIcon: const Icon(Icons.search_rounded),
+              suffixIcon: _searchController.text.isEmpty
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.clear_rounded),
+                      onPressed: () {
+                        _searchController.clear();
+                        setState(() {});
+                      },
+                    ),
+              filled: true,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(18),
+                borderSide: BorderSide.none,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSelectionHeader({
+    required ThemeData theme,
+    required List<RavenProject> visible,
+    required double horizontalPadding,
+    required bool isCompact,
+  }) {
+    final count = _selectedIds.length;
+    final allVisibleSelected = visible.isNotEmpty &&
+        _selectedIds.length == visible.length &&
+        _selectedIds.containsAll(visible.map((p) => p.id));
+
+    return Material(
+      color: theme.colorScheme.primaryContainer.withValues(alpha: 0.55),
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+            horizontalPadding, isCompact ? 8 : 14, horizontalPadding, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                IconButton(
+                  tooltip: tr(widget.preferences, 'Exit selection',
+                      'Quitter la sélection'),
+                  onPressed: _clearSelection,
+                  icon: const Icon(Icons.close_rounded),
+                ),
+                const SizedBox(width: 4),
+                Expanded(
+                  child: Text(
+                    '$count ${tr(widget.preferences, 'selected', 'sélectionné(s)')}',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w800,
+                      color: theme.colorScheme.onPrimaryContainer,
+                    ),
+                  ),
+                ),
+                if (visible.isNotEmpty)
+                  TextButton.icon(
+                    onPressed:
+                        _bulkRunning ? null : () => _selectAll(visible),
+                    icon: Icon(
+                      allVisibleSelected
+                          ? Icons.deselect_rounded
+                          : Icons.select_all_rounded,
+                      size: 18,
+                    ),
+                    label: Text(allVisibleSelected
+                        ? tr(widget.preferences, 'Clear', 'Effacer')
+                        : tr(widget.preferences, 'All', 'Tout')),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: <Widget>[
+                  if (_selectedActive.isNotEmpty)
+                    _selectionChip(
+                      icon: _allActiveFavorite
+                          ? Icons.star_rounded
+                          : Icons.star_border_rounded,
+                      label: _allActiveFavorite
+                          ? tr(widget.preferences, 'Unfavourite', 'Retirer')
+                          : tr(widget.preferences, 'Favourite', 'Favori'),
+                      onPressed: _bulkFavorite,
+                    ),
+                  if (_selectedActive.isNotEmpty)
+                    _selectionChip(
+                      icon: Icons.folder_outlined,
+                      label:
+                          tr(widget.preferences, 'Category', 'Catégorie'),
+                      onPressed: _bulkCategory,
+                    ),
+                  if (_selectedActive.isNotEmpty)
+                    _selectionChip(
+                      icon: Icons.delete_outline_rounded,
+                      label: tr(widget.preferences, 'Trash', 'Corbeille'),
+                      onPressed: _bulkTrash,
+                    ),
+                  if (_selectedTrashed.isNotEmpty)
+                    _selectionChip(
+                      icon: Icons.restore_rounded,
+                      label: tr(widget.preferences, 'Restore', 'Restaurer'),
+                      onPressed: _bulkRestore,
+                    ),
+                  if (_canMakePublic)
+                    _selectionChip(
+                      icon: Icons.public_rounded,
+                      label: tr(widget.preferences, 'Make public',
+                          'Rendre public'),
+                      onPressed: () => _bulkVisibility(makePublic: true),
+                    ),
+                  if (_canMakePrivate)
+                    _selectionChip(
+                      icon: Icons.lock_outline_rounded,
+                      label: tr(widget.preferences, 'Make private',
+                          'Rendre privé'),
+                      onPressed: () => _bulkVisibility(makePublic: false),
+                    ),
+                  if (widget.onShareProjects != null &&
+                      _selectedActive.isNotEmpty)
+                    _selectionChip(
+                      icon: Icons.share_outlined,
+                      label: tr(widget.preferences, 'Share', 'Partager'),
+                      onPressed: _bulkShare,
+                    ),
+                  if (_selectedProjects.isNotEmpty)
+                    _selectionChip(
+                      icon: Icons.delete_forever_rounded,
+                      label: tr(widget.preferences, 'Delete', 'Supprimer'),
+                      onPressed: _bulkDelete,
+                      tint: theme.colorScheme.error,
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _selectionChip({
+    required IconData icon,
+    required String label,
+    required VoidCallback onPressed,
+    Color? tint,
+  }) {
+    final theme = Theme.of(context);
+    final c = tint ?? theme.colorScheme.onSurface;
+    return Padding(
+      padding: const EdgeInsets.only(right: 8),
+      child: Material(
+        color: theme.colorScheme.surface,
+        shape: StadiumBorder(
+          side: BorderSide(color: c.withValues(alpha: 0.35)),
+        ),
+        child: InkWell(
+          customBorder: const StadiumBorder(),
+          onTap: _bulkRunning ? null : onPressed,
+          child: Padding(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Icon(icon, size: 16, color: c),
+                const SizedBox(width: 6),
+                Text(
+                  label,
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: c,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Build
+  // ---------------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
@@ -94,134 +682,57 @@ class _LibraryScreenState extends State<LibraryScreen> {
         builder: (context, constraints) {
           final isCompact = constraints.maxWidth < 740;
           final horizontalPadding = isCompact ? 16.0 : 28.0;
-          final filterChips = SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: <Widget>[
-                _FilterChip(
-                  label: tr(widget.preferences, 'All', 'Tous'),
-                  selected: _filter == LibraryFilter.all,
-                  onTap: () => setState(() => _filter = LibraryFilter.all),
-                ),
-                const SizedBox(width: 8),
-                _FilterChip(
-                  label: tr(widget.preferences, 'Favourites', 'Favoris'),
-                  selected: _filter == LibraryFilter.favorites,
-                  onTap: () =>
-                      setState(() => _filter = LibraryFilter.favorites),
-                ),
-                const SizedBox(width: 8),
-                _FilterChip(
-                  label: tr(widget.preferences, 'Trash', 'Corbeille'),
-                  selected: _filter == LibraryFilter.trash,
-                  onTap: () => setState(() => _filter = LibraryFilter.trash),
-                ),
-              ],
-            ),
-          );
-          final header = Padding(
-            padding: EdgeInsets.fromLTRB(
-                horizontalPadding, isCompact ? 16 : 28, horizontalPadding, 10),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Row(
-                  children: <Widget>[
-                    if (isCompact)
-                      Builder(
-                        builder: (context) => IconButton(
-                          tooltip: tr(widget.preferences, 'Open library menu',
-                              'Ouvrir le menu de la bibliothèque'),
-                          onPressed: () => Scaffold.of(context).openDrawer(),
-                          icon: const Icon(Icons.menu_rounded),
-                        ),
+
+          final header = _isSelectionMode
+              ? _buildSelectionHeader(
+                  theme: theme,
+                  visible: visible,
+                  horizontalPadding: horizontalPadding,
+                  isCompact: isCompact,
+                )
+              : _buildNormalHeader(
+                  theme: theme,
+                  visible: visible,
+                  query: query,
+                  horizontalPadding: horizontalPadding,
+                  isCompact: isCompact,
+                );
+
+          final filterChips = _isSelectionMode
+              ? null
+              : SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: <Widget>[
+                      _FilterChip(
+                        label: tr(widget.preferences, 'All', 'Tous'),
+                        selected: _filter == LibraryFilter.all,
+                        onTap: () => _setFilter(LibraryFilter.all),
                       ),
-                    Expanded(
-                      child: Text(
-                        _pageTitle,
-                        style: theme.textTheme.headlineMedium
-                            ?.copyWith(fontWeight: FontWeight.w800),
+                      const SizedBox(width: 8),
+                      _FilterChip(
+                        label: tr(
+                            widget.preferences, 'Favourites', 'Favoris'),
+                        selected: _filter == LibraryFilter.favorites,
+                        onTap: () => _setFilter(LibraryFilter.favorites),
                       ),
-                    ),
-                    IconButton.filledTonal(
-                      tooltip: tr(widget.preferences, 'Manage categories',
-                          'Gérer les catégories'),
-                      onPressed: () => _manageCategories(context),
-                      icon: const Icon(Icons.folder_copy_outlined),
-                    ),
-                    const SizedBox(width: 4),
-                    PopupMenuButton<String>(
-                      tooltip: tr(widget.preferences, 'Import audio or project',
-                          'Importer un audio ou un projet'),
-                      onSelected: (value) {
-                        if (value == 'audio') {
-                          widget.onImportAudio();
-                        } else {
-                          widget.onImportProject();
-                        }
-                      },
-                      itemBuilder: (context) => <PopupMenuEntry<String>>[
-                        PopupMenuItem<String>(
-                          value: 'audio',
-                          child: Text(tr(
-                              widget.preferences,
-                              'Import audio file',
-                              'Importer un fichier audio')),
-                        ),
-                        PopupMenuItem<String>(
-                          value: 'project',
-                          child: Text(tr(
-                              widget.preferences,
-                              'Import RAVEN project bundle',
-                              'Importer un projet RAVEN')),
-                        ),
-                      ],
-                      icon: const Icon(Icons.file_upload_outlined),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  tr(
-                      widget.preferences,
-                      'Browse projects, standalone recordings and recovered drafts.',
-                      'Parcourez les projets, les enregistrements autonomes et les brouillons récupérés.'),
-                  style: theme.textTheme.bodyMedium
-                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-                ),
-                const SizedBox(height: 17),
-                TextField(
-                  controller: _searchController,
-                  onChanged: (_) => setState(() {}),
-                  decoration: InputDecoration(
-                    hintText: tr(
-                        widget.preferences,
-                        'Search title, category or tag',
-                        'Rechercher titre, catégorie ou étiquette'),
-                    prefixIcon: const Icon(Icons.search_rounded),
-                    suffixIcon: _searchController.text.isEmpty
-                        ? null
-                        : IconButton(
-                            icon: const Icon(Icons.clear_rounded),
-                            onPressed: () {
-                              _searchController.clear();
-                              setState(() {});
-                            },
-                          ),
-                    filled: true,
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(18),
-                      borderSide: BorderSide.none,
-                    ),
+                      const SizedBox(width: 8),
+                      _FilterChip(
+                        label: tr(widget.preferences, 'Trash', 'Corbeille'),
+                        selected: _filter == LibraryFilter.trash,
+                        onTap: () => _setFilter(LibraryFilter.trash),
+                      ),
+                    ],
                   ),
-                ),
-              ],
-            ),
-          );
+                );
+
           final results = Expanded(
             child: visible.isEmpty
                 ? _EmptyLibrary(
-                    preferences: widget.preferences, filter: _filter)
+                    preferences: widget.preferences,
+                    filter: _filter,
+                    hasSearch: query.isNotEmpty,
+                  )
                 : ListView.separated(
                     padding: EdgeInsets.fromLTRB(
                         horizontalPadding, 8, horizontalPadding, 24),
@@ -229,9 +740,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     separatorBuilder: (_, __) => const SizedBox(height: 10),
                     itemBuilder: (context, index) {
                       final project = visible[index];
+                      final isSelected = _selectedIds.contains(project.id);
                       return ProjectTile(
                         project: project,
                         preferences: widget.preferences,
+                        selectionMode: _isSelectionMode,
+                        isSelected: isSelected,
+                        onLongPress: _isSelectionMode
+                            ? null
+                            : () => _enterSelection(project.id),
+                        onToggleSelection: _isSelectionMode
+                            ? () => _toggleSelection(project.id)
+                            : null,
                         onTap: () => widget.onOpenProject(project),
                         onFavorite: () => widget.onFavorite(project),
                         onRename: () => _rename(context, project),
@@ -251,6 +771,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         onToggleProtection: project.isTrashed
                             ? null
                             : () => widget.onToggleProtection(project),
+                        onTogglePin:
+                            project.isTrashed || widget.onTogglePin == null
+                                ? null
+                                : () => widget.onTogglePin!(project),
                         onDetails: () => _showDetails(context, project),
                         onAssignCategory: project.isTrashed
                             ? null
@@ -264,6 +788,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     },
                   ),
           );
+
           return Scaffold(
             drawer: isCompact
                 ? Drawer(
@@ -275,14 +800,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         filter: _filter,
                         selectedCategory: _selectedCategory,
                         closeOnSelect: true,
-                        onFilter: (filter) => setState(() {
-                          _filter = filter;
-                          _selectedCategory = null;
-                        }),
-                        onCategory: (category) => setState(() {
-                          _filter = LibraryFilter.all;
-                          _selectedCategory = category;
-                        }),
+                        onFilter: _setFilter,
+                        onCategory: _setCategory,
                         onManageCategories: () => _manageCategories(context),
                       ),
                     ),
@@ -305,14 +824,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                               filter: _filter,
                               selectedCategory: _selectedCategory,
                               closeOnSelect: false,
-                              onFilter: (filter) => setState(() {
-                                _filter = filter;
-                                _selectedCategory = null;
-                              }),
-                              onCategory: (category) => setState(() {
-                                _filter = LibraryFilter.all;
-                                _selectedCategory = category;
-                              }),
+                              onFilter: _setFilter,
+                              onCategory: _setCategory,
                               onManageCategories: () =>
                                   _manageCategories(context),
                             ),
@@ -322,11 +835,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
                             child: Column(
                               children: <Widget>[
                                 header,
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 28),
-                                  child: filterChips,
-                                ),
+                                if (filterChips != null)
+                                  Padding(
+                                    padding: const EdgeInsets.fromLTRB(
+                                        28, 4, 28, 4),
+                                    child: filterChips,
+                                  ),
                                 results,
                               ],
                             ),
@@ -351,6 +865,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return _selectedCategory ??
         tr(widget.preferences, 'All recordings', 'Tous les enregistrements');
   }
+
+  // ---------------------------------------------------------------------------
+  // Single-project operations (unchanged)
+  // ---------------------------------------------------------------------------
 
   Future<void> _showDetails(BuildContext context, RavenProject project) async {
     final messenger = ScaffoldMessenger.of(context);
@@ -400,7 +918,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     '${project.sessions.length}'),
                 _detailRow(widget.preferences, 'Audio format',
                     formats.isEmpty ? '—' : formats),
-                if (project.sessions.isNotEmpty)
+                if (project.sessions.isNotEmpty &&
+                    project.sessions.last.sampleRate > 0)
                   _detailRow(
                     widget.preferences,
                     'Sample rate',
@@ -410,11 +929,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 _detailRow(
                     widget.preferences,
                     'Privacy',
-                    project.isPublic
-                        ? tr(widget.preferences, 'Public project folder',
-                            'Dossier de projet public')
-                        : tr(widget.preferences, 'Private in RAVEN',
-                            'Privé dans RAVEN')),
+                    project.isAudioProtected
+                        ? tr(
+                            widget.preferences,
+                            'Encrypted — always private',
+                            'Chiffré — toujours privé')
+                        : project.isPublic
+                            ? tr(
+                                widget.preferences,
+                                'Public — visible in your device Files app',
+                                'Public — visible dans les fichiers de l’appareil')
+                            : tr(
+                                widget.preferences,
+                                'Private — stored inside RAVEN only',
+                                'Privé — stocké uniquement dans RAVEN')),
                 if (project.isAudioProtected)
                   _detailRow(widget.preferences, 'Encryption', 'Encrypted'),
                 if (project.requiresAppPin)
@@ -448,7 +976,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('Could not update recording visibility: $error'),
+        content: Text(
+          '${tr(widget.preferences, 'Could not update recording visibility', 'Impossible de modifier la visibilité')}: $error',
+        ),
       ));
     }
   }
@@ -515,8 +1045,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
   String _formatDuration(int milliseconds) {
     final duration = Duration(milliseconds: milliseconds);
     final hours = duration.inHours;
-    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+    final minutes =
+        duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds =
+        duration.inSeconds.remainder(60).toString().padLeft(2, '0');
     return hours > 0
         ? '${hours.toString().padLeft(2, '0')}:$minutes:$seconds'
         : '$minutes:$seconds';
@@ -583,13 +1115,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
       final replacement = await showDialog<String>(
         context: context,
         builder: (dialogContext) => AlertDialog(
-          title: Text(tr(
-              widget.preferences, 'Rename category', 'Renommer la catégorie')),
+          title: Text(tr(widget.preferences, 'Rename category',
+              'Renommer la catégorie')),
           content: TextField(
             controller: nameController,
             autofocus: true,
             maxLength: 60,
-            onSubmitted: (value) => Navigator.pop(dialogContext, value.trim()),
+            onSubmitted: (value) =>
+                Navigator.pop(dialogContext, value.trim()),
             decoration: InputDecoration(
               labelText: tr(widget.preferences, 'Category name', 'Nom'),
             ),
@@ -803,6 +1336,10 @@ class ProjectTile extends StatelessWidget {
     required this.project,
     required this.preferences,
     required this.onTap,
+    this.selectionMode = false,
+    this.isSelected = false,
+    this.onLongPress,
+    this.onToggleSelection,
     this.onFavorite,
     this.onRename,
     this.onTrash,
@@ -815,12 +1352,17 @@ class ProjectTile extends StatelessWidget {
     this.onShare,
     this.onToggleVisibility,
     this.onToggleProtection,
+    this.onTogglePin,
     super.key,
   });
 
   final RavenProject project;
   final AppPreferences preferences;
   final VoidCallback onTap;
+  final bool selectionMode;
+  final bool isSelected;
+  final VoidCallback? onLongPress;
+  final VoidCallback? onToggleSelection;
   final VoidCallback? onFavorite;
   final VoidCallback? onRename;
   final VoidCallback? onTrash;
@@ -833,6 +1375,7 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback? onShare;
   final VoidCallback? onToggleVisibility;
   final VoidCallback? onToggleProtection;
+  final VoidCallback? onTogglePin;
 
   @override
   Widget build(BuildContext context) {
@@ -859,213 +1402,402 @@ class ProjectTile extends StatelessWidget {
         : project.isDraft
             ? '$date  ·  ${tr(preferences, 'Interrupted draft — review audio', 'Brouillon interrompu — vérifier l’audio')}'
             : '$date  ·  $duration';
-    return Material(
-      color: theme.colorScheme.surfaceContainerLow,
-      borderRadius: BorderRadius.circular(20),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(20),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(14, 14, 7, 14),
-          child: Row(
-            children: <Widget>[
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                    color: theme.colorScheme.primary.withValues(alpha: 0.13),
-                    borderRadius: BorderRadius.circular(15)),
-                child: Icon(
-                    project.isTrashed
-                        ? Icons.delete_outline_rounded
-                        : project.isStandalone
-                            ? Icons.mic_none_rounded
-                            : Icons.audio_file_outlined,
-                    color: theme.colorScheme.primary),
-              ),
-              const SizedBox(width: 13),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final showResumeButton = !selectionMode &&
+            onResume != null &&
+            !project.isDraft &&
+            !project.isTrashed &&
+            !project.isAudioProtected &&
+            constraints.maxWidth >= 340;
+
+        final bg = selectionMode && isSelected
+            ? theme.colorScheme.primaryContainer.withValues(alpha: 0.55)
+            : theme.colorScheme.surfaceContainerLow;
+        final borderColor = selectionMode && isSelected
+            ? theme.colorScheme.primary
+            : Colors.transparent;
+
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 140),
+          curve: Curves.easeOut,
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: borderColor,
+              width: selectionMode && isSelected ? 1.5 : 0,
+            ),
+          ),
+          child: Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(20),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(20),
+              onTap: selectionMode ? onToggleSelection : onTap,
+              onLongPress: selectionMode ? null : onLongPress,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(14, 14, 7, 14),
+                child: Row(
                   children: <Widget>[
-                    Text(title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.titleSmall
-                            ?.copyWith(fontWeight: FontWeight.w700)),
-                    const SizedBox(height: 5),
-                    Text(
-                      subtitle,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: project.isDraft
-                            ? theme.colorScheme.tertiary
-                            : theme.colorScheme.onSurfaceVariant,
+                    selectionMode
+                        ? _selectionLeading(theme)
+                        : _leadingIcon(theme),
+                    const SizedBox(width: 13),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Text(title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.titleSmall
+                                  ?.copyWith(fontWeight: FontWeight.w700)),
+                          const SizedBox(height: 5),
+                          Text(
+                            subtitle,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: project.isDraft
+                                  ? theme.colorScheme.tertiary
+                                  : theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          if (project.category != 'Uncategorized') ...<Widget>[
+                            const SizedBox(height: 6),
+                            Text(project.category,
+                                style: theme.textTheme.labelSmall?.copyWith(
+                                    color: theme.colorScheme.primary)),
+                          ],
+                        ],
                       ),
                     ),
-                    if (project.category != 'Uncategorized') ...<Widget>[
-                      const SizedBox(height: 6),
-                      Text(project.category,
-                          style: theme.textTheme.labelSmall
-                              ?.copyWith(color: theme.colorScheme.primary)),
-                    ],
-                  ],
-                ),
-              ),
-              if (!project.isTrashed && onFavorite != null)
-                IconButton(
-                  tooltip: project.isFavorite
-                      ? tr(preferences, 'Remove favourite',
-                          'Retirer des favoris')
-                      : tr(preferences, 'Add favourite', 'Ajouter aux favoris'),
-                  onPressed: onFavorite,
-                  icon: Icon(
-                      project.isFavorite
-                          ? Icons.star_rounded
-                          : Icons.star_border_rounded,
-                      color: project.isFavorite
-                          ? theme.colorScheme.tertiary
-                          : null),
-                ),
-              if (onResume != null ||
-                  onDetails != null ||
-                  onAssignCategory != null ||
-                  onCreateProject != null ||
-                  onShare != null ||
-                  onToggleVisibility != null ||
-                  onToggleProtection != null ||
-                  onRename != null ||
-                  onTrash != null ||
-                  onRestore != null ||
-                  onDelete != null)
-                PopupMenuButton<String>(
-                  tooltip:
-                      tr(preferences, 'Project actions', 'Actions du projet'),
-                  onSelected: (action) {
-                    switch (action) {
-                      case 'rename':
-                        onRename?.call();
-                        break;
-                      case 'resume':
-                        onResume?.call();
-                        break;
-                      case 'details':
-                        onDetails?.call();
-                        break;
-                      case 'category':
-                        onAssignCategory?.call();
-                        break;
-                      case 'create_project':
-                        onCreateProject?.call();
-                        break;
-                      case 'share':
-                        onShare?.call();
-                        break;
-                      case 'visibility':
-                        onToggleVisibility?.call();
-                        break;
-                      case 'protection':
-                        onToggleProtection?.call();
-                        break;
-                      case 'trash':
-                        onTrash?.call();
-                        break;
-                      case 'restore':
-                        onRestore?.call();
-                        break;
-                      case 'delete':
-                        onDelete?.call();
-                        break;
-                    }
-                  },
-                  itemBuilder: (context) => <PopupMenuEntry<String>>[
-                    if (onDetails != null)
-                      PopupMenuItem(
-                        value: 'details',
-                        child: Text(tr(preferences, 'Details', 'Détails')),
-                      ),
-                    if (!project.isTrashed && onAssignCategory != null)
-                      PopupMenuItem(
-                        value: 'category',
-                        child: Text(tr(preferences, 'Move to category',
-                            'Déplacer vers une catégorie')),
-                      ),
-                    if (onCreateProject != null)
-                      PopupMenuItem(
-                        value: 'create_project',
-                        child: Text(tr(
-                            preferences, 'Create project', 'Créer un projet')),
-                      ),
-                    if (onShare != null)
-                      PopupMenuItem(
-                        value: 'share',
-                        child: Text(
-                            tr(preferences, 'Share audio', 'Partager l’audio')),
-                      ),
-                    if (onToggleVisibility != null)
-                      PopupMenuItem(
-                        value: 'visibility',
-                        child: Text(tr(
-                          preferences,
-                          project.isPublic
-                              ? 'Make project private'
-                              : 'Make project public',
-                          project.isPublic
-                              ? 'Rendre le projet privé'
-                              : 'Rendre le projet public',
-                        )),
-                      ),
-                    if (onToggleProtection != null)
-                      PopupMenuItem(
-                        value: 'protection',
-                        child: Text(tr(
-                          preferences,
-                          project.isAudioProtected
-                              ? 'Unlock audio'
-                              : 'Lock audio with a password',
-                          project.isAudioProtected
-                              ? 'Déverrouiller l’audio'
-                              : 'Verrouiller l’audio avec un mot de passe',
-                        )),
-                      ),
-                    if (onResume != null)
-                      PopupMenuItem(
-                        value: 'resume',
-                        child: Text(
-                          project.isStandalone
+                    if (!selectionMode) ...<Widget>[
+                      if (showResumeButton)
+                        IconButton(
+                          tooltip: project.isStandalone
                               ? tr(preferences, 'Resume recording',
                                   'Reprendre l’enregistrement')
                               : tr(preferences, 'Add a recording',
                                   'Ajouter un enregistrement'),
+                          onPressed: onResume,
+                          icon: const Icon(Icons.mic_rounded),
+                          visualDensity: VisualDensity.compact,
                         ),
-                      ),
-                    if (!project.isTrashed && onRename != null)
-                      PopupMenuItem(
-                          value: 'rename',
-                          child: Text(tr(preferences, 'Rename', 'Renommer'))),
-                    if (!project.isTrashed && onTrash != null)
-                      PopupMenuItem(
-                          value: 'trash',
-                          child: Text(tr(preferences, 'Move to trash',
-                              'Mettre à la corbeille'))),
-                    if (project.isTrashed && onRestore != null)
-                      PopupMenuItem(
-                          value: 'restore',
-                          child: Text(tr(preferences, 'Restore', 'Restaurer'))),
-                    if (onDelete != null)
-                      PopupMenuItem(
-                          value: 'delete',
-                          child: Text(tr(preferences, 'Delete permanently',
-                              'Supprimer définitivement'))),
+                      if (!project.isTrashed && onFavorite != null)
+                        IconButton(
+                          tooltip: project.isFavorite
+                              ? tr(preferences, 'Remove favourite',
+                                  'Retirer des favoris')
+                              : tr(preferences, 'Add favourite',
+                                  'Ajouter aux favoris'),
+                          onPressed: onFavorite,
+                          icon: Icon(
+                              project.isFavorite
+                                  ? Icons.star_rounded
+                                  : Icons.star_border_rounded,
+                              color: project.isFavorite
+                                  ? theme.colorScheme.tertiary
+                                  : null),
+                        ),
+                      _popupMenu(context),
+                    ],
                   ],
-                )
-              else
-                const SizedBox(width: 8),
-            ],
+                ),
+              ),
+            ),
           ),
+        );
+      },
+    );
+  }
+
+  Widget _leadingIcon(ThemeData theme) {
+    final iconData = project.isTrashed
+        ? Icons.delete_outline_rounded
+        : project.isStandalone
+            ? Icons.mic_none_rounded
+            : Icons.audio_file_outlined;
+
+    return SizedBox(
+      width: 48,
+      height: 48,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: <Widget>[
+          Container(
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(
+                color: theme.colorScheme.primary.withValues(alpha: 0.13),
+                borderRadius: BorderRadius.circular(15)),
+            child: Icon(iconData, color: theme.colorScheme.primary),
+          ),
+          if (!project.isTrashed) _stateBadge(theme),
+        ],
+      ),
+    );
+  }
+
+  Widget _selectionLeading(ThemeData theme) {
+    final iconData = project.isTrashed
+        ? Icons.delete_outline_rounded
+        : project.isStandalone
+            ? Icons.mic_none_rounded
+            : Icons.audio_file_outlined;
+
+    return SizedBox(
+      width: 48,
+      height: 48,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: <Widget>[
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 140),
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(
+              color: isSelected
+                  ? theme.colorScheme.primary
+                  : theme.colorScheme.primary.withValues(alpha: 0.13),
+              borderRadius: BorderRadius.circular(15),
+            ),
+            child: Icon(
+              iconData,
+              color: isSelected
+                  ? theme.colorScheme.onPrimary
+                  : theme.colorScheme.primary,
+            ),
+          ),
+          if (isSelected)
+            Positioned(
+              right: -4,
+              top: -4,
+              child: Container(
+                padding: const EdgeInsets.all(3),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primary,
+                  shape: BoxShape.circle,
+                  border:
+                      Border.all(color: theme.colorScheme.surface, width: 2),
+                ),
+                child: Icon(Icons.check_rounded,
+                    size: 10, color: theme.colorScheme.onPrimary),
+              ),
+            ),
+          if (!project.isTrashed && !isSelected) _stateBadge(theme),
+        ],
+      ),
+    );
+  }
+
+  Widget _stateBadge(ThemeData theme) {
+    if (project.isAudioProtected) {
+      return _badge(
+        theme,
+        icon: Icons.lock_rounded,
+        background: theme.colorScheme.tertiary,
+        foreground: theme.colorScheme.onTertiary,
+        tooltip: tr(preferences, 'Encrypted — password required',
+            'Chiffré — mot de passe requis'),
+      );
+    }
+    if (project.requiresAppPin) {
+      return _badge(
+        theme,
+        icon: Icons.pin_rounded,
+        background: theme.colorScheme.secondary,
+        foreground: theme.colorScheme.onSecondary,
+        tooltip:
+            tr(preferences, 'Requires RAVEN PIN', 'Nécessite le PIN RAVEN'),
+      );
+    }
+    if (project.isPublic) {
+      return _badge(
+        theme,
+        icon: Icons.public_rounded,
+        background: theme.colorScheme.primary,
+        foreground: theme.colorScheme.onPrimary,
+        tooltip: tr(preferences, 'Public — visible in your Files app',
+            'Public — visible dans vos fichiers'),
+      );
+    }
+    return const SizedBox.shrink();
+  }
+
+  Widget _badge(
+    ThemeData theme, {
+    required IconData icon,
+    required Color background,
+    required Color foreground,
+    required String tooltip,
+  }) {
+    return Positioned(
+      right: 0,
+      bottom: 0,
+      child: Tooltip(
+        message: tooltip,
+        child: Container(
+          padding: const EdgeInsets.all(3),
+          decoration: BoxDecoration(
+            color: background,
+            shape: BoxShape.circle,
+            border: Border.all(color: theme.colorScheme.surface, width: 1.5),
+          ),
+          child: Icon(icon, size: 10, color: foreground),
         ),
       ),
+    );
+  }
+
+  Widget _popupMenu(BuildContext context) {
+    final hasAnyAction = onResume != null ||
+        onDetails != null ||
+        onAssignCategory != null ||
+        onCreateProject != null ||
+        onShare != null ||
+        onToggleVisibility != null ||
+        onToggleProtection != null ||
+        onRename != null ||
+        onTrash != null ||
+        onRestore != null ||
+        onDelete != null;
+
+    if (!hasAnyAction) return const SizedBox(width: 8);
+
+    return PopupMenuButton<String>(
+      tooltip: tr(preferences, 'Project actions', 'Actions du projet'),
+      onSelected: (action) {
+        switch (action) {
+          case 'rename':
+            onRename?.call();
+            break;
+          case 'resume':
+            onResume?.call();
+            break;
+          case 'details':
+            onDetails?.call();
+            break;
+          case 'category':
+            onAssignCategory?.call();
+            break;
+          case 'create_project':
+            onCreateProject?.call();
+            break;
+          case 'share':
+            onShare?.call();
+            break;
+          case 'visibility':
+            onToggleVisibility?.call();
+            break;
+          case 'protection':
+            onToggleProtection?.call();
+            break;
+          case 'pin':
+            onTogglePin?.call();
+            break;
+          case 'trash':
+            onTrash?.call();
+            break;
+          case 'restore':
+            onRestore?.call();
+            break;
+          case 'delete':
+            onDelete?.call();
+            break;
+        }
+      },
+      itemBuilder: (context) => <PopupMenuEntry<String>>[
+        if (onDetails != null)
+          PopupMenuItem(
+            value: 'details',
+            child: Text(tr(preferences, 'Details', 'Détails')),
+          ),
+        if (!project.isTrashed && onAssignCategory != null)
+          PopupMenuItem(
+            value: 'category',
+            child: Text(tr(preferences, 'Move to category',
+                'Déplacer vers une catégorie')),
+          ),
+        if (onCreateProject != null)
+          PopupMenuItem(
+            value: 'create_project',
+            child: Text(tr(preferences, 'Create project', 'Créer un projet')),
+          ),
+        if (onShare != null)
+          PopupMenuItem(
+            value: 'share',
+            child: Text(tr(preferences, 'Share audio', 'Partager l’audio')),
+          ),
+        if (onToggleVisibility != null)
+          PopupMenuItem(
+            value: 'visibility',
+            child: Text(tr(
+              preferences,
+              project.isPublic
+                  ? 'Make project private'
+                  : 'Make project public',
+              project.isPublic
+                  ? 'Rendre le projet privé'
+                  : 'Rendre le projet public',
+            )),
+          ),
+        if (onToggleProtection != null)
+          PopupMenuItem(
+            value: 'protection',
+            child: Text(tr(
+              preferences,
+              project.isAudioProtected
+                  ? 'Unlock audio'
+                  : 'Lock audio with a password',
+              project.isAudioProtected
+                  ? 'Déverrouiller l’audio'
+                  : 'Verrouiller l’audio avec un mot de passe',
+            )),
+          ),
+        if (onTogglePin != null)
+          PopupMenuItem(
+            value: 'pin',
+            child: Text(tr(
+              preferences,
+              project.requiresAppPin ? 'Remove PIN lock' : 'Lock with PIN',
+              project.requiresAppPin
+                  ? 'Retirer le verrouillage PIN'
+                  : 'Verrouiller par PIN',
+            )),
+          ),
+        if (onResume != null)
+          PopupMenuItem(
+            value: 'resume',
+            child: Text(
+              project.isStandalone
+                  ? tr(preferences, 'Resume recording',
+                      'Reprendre l’enregistrement')
+                  : tr(preferences, 'Add a recording',
+                      'Ajouter un enregistrement'),
+            ),
+          ),
+        if (!project.isTrashed && onRename != null)
+          PopupMenuItem(
+              value: 'rename',
+              child: Text(tr(preferences, 'Rename', 'Renommer'))),
+        if (!project.isTrashed && onTrash != null)
+          PopupMenuItem(
+              value: 'trash',
+              child: Text(tr(preferences, 'Move to trash',
+                  'Mettre à la corbeille'))),
+        if (project.isTrashed && onRestore != null)
+          PopupMenuItem(
+              value: 'restore',
+              child: Text(tr(preferences, 'Restore', 'Restaurer'))),
+        if (onDelete != null)
+          PopupMenuItem(
+              value: 'delete',
+              child: Text(tr(preferences, 'Delete permanently',
+                  'Supprimer définitivement'))),
+      ],
     );
   }
 
@@ -1110,7 +1842,7 @@ class _LibrarySidebar extends StatelessWidget {
   final String? selectedCategory;
   final bool closeOnSelect;
   final ValueChanged<LibraryFilter> onFilter;
-  final ValueChanged<String> onCategory;
+  final ValueChanged<String?> onCategory;
   final VoidCallback onManageCategories;
 
   int _count(bool Function(RavenProject) predicate) =>
@@ -1278,8 +2010,8 @@ class _LibrarySidebar extends StatelessWidget {
                 ),
                 if (count > 0)
                   Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 8, vertical: 2),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                     decoration: BoxDecoration(
                       color: selected
                           ? colorScheme.primary.withValues(alpha: 0.15)
@@ -1307,13 +2039,50 @@ class _LibrarySidebar extends StatelessWidget {
 }
 
 class _EmptyLibrary extends StatelessWidget {
-  const _EmptyLibrary({required this.preferences, required this.filter});
+  const _EmptyLibrary({
+    required this.preferences,
+    required this.filter,
+    this.hasSearch = false,
+  });
   final AppPreferences preferences;
   final LibraryFilter filter;
+  final bool hasSearch;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+
+    if (hasSearch) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Icon(Icons.search_off_rounded,
+                  size: 48, color: theme.colorScheme.onSurfaceVariant),
+              const SizedBox(height: 14),
+              Text(
+                tr(preferences, 'No matches', 'Aucun résultat'),
+                style: theme.textTheme.titleLarge,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 7),
+              Text(
+                tr(
+                    preferences,
+                    'Try a different title, category or tag.',
+                    'Essayez un autre titre, catégorie ou étiquette.'),
+                style: theme.textTheme.bodyMedium
+                    ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     final (icon, title, subtitle) = switch (filter) {
       LibraryFilter.all => (
           Icons.audio_file_outlined,
@@ -1349,6 +2118,20 @@ class _EmptyLibrary extends StatelessWidget {
                 style: theme.textTheme.bodyMedium
                     ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
                 textAlign: TextAlign.center),
+            if (filter == LibraryFilter.all) ...<Widget>[
+              const SizedBox(height: 14),
+              Text(
+                tr(
+                    preferences,
+                    'Tip: long-press any recording to select several and act on them at once.',
+                    'Astuce : maintenez un enregistrement appuyé pour en sélectionner plusieurs et les gérer ensemble.'),
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontStyle: FontStyle.italic,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ],
           ],
         ),
       ),

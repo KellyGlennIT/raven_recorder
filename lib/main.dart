@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
 import 'package:cryptography/cryptography.dart';
 
 import 'models/raven_project.dart';
@@ -28,12 +30,27 @@ import 'widgets/audio_password_dialog.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialise the background audio service before anything else that
+  // touches just_audio. From this point on, playback continues when the app
+  // is backgrounded and a media notification appears with play/pause/seek.
+  await JustAudioBackground.init(
+    androidNotificationChannelId: 'com.raven.raven.audio',
+    androidNotificationChannelName: 'RAVEN audio playback',
+    androidNotificationChannelDescription:
+        'Playback controls for your RAVEN recordings',
+    androidNotificationIcon: 'mipmap/ic_launcher',
+    // Hide fast-forward / rewind buttons — recordings aren't skippable
+    // tracks. The seek bar is still available in the notification.
+    fastForwardInterval: Duration.zero,
+    rewindInterval: Duration.zero,
+  );
+
   await initializeDateFormatting('fr');
-  // Remove plaintext playback caches left by an interrupted previous process.
-  // This runs before the UI/player starts, never during active playback.
   try {
     await AudioEncryptionService.cleanupAbandonedPlaybackFiles();
   } catch (_) {/* startup must remain available */}
+
   final repository = await ProjectRepository.create();
   final preferences = await AppPreferences.load();
   runApp(RavenApp(repository: repository, preferences: preferences));
@@ -302,9 +319,9 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         titleEn: 'Everything stays together',
         titleFr: 'Tout reste ensemble',
         bodyEn:
-            'Find recordings in Library. Rename, search, favourite, add notes and use Trash to recover a project you removed by mistake.',
+            'Find recordings in Library. Rename, search, favourite, add notes and use Trash to recover a project you removed by mistake. Long-press any recording to select several at once.',
         bodyFr:
-            'Retrouvez vos enregistrements dans Bibliothèque. Renommez, recherchez, ajoutez des favoris et utilisez la corbeille pour récupérer un projet.',
+            'Retrouvez vos enregistrements dans Bibliothèque. Renommez, recherchez, ajoutez des favoris et utilisez la corbeille pour récupérer un projet. Maintenez un enregistrement appuyé pour en sélectionner plusieurs.',
         hintEn: 'Open Library to explore your projects.',
         hintFr: 'Ouvrez Bibliothèque pour explorer vos projets.'
       ),
@@ -383,66 +400,68 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
   }
 
   Future<void> _refreshProjects() async {
-    // The repository already updates its in-memory model before each write.
-    // Refresh the views without reloading and risking loss of in-memory state.
     if (mounted) setState(() {});
     widget.onProjectsChanged();
   }
 
-  /// Makes a project public or private. A public project is copied as a whole
-  /// folder (audio, notes, attachments) into the device's RAVEN folder so it can
-  /// be browsed with any file manager; the private original stays in RAVEN.
+  /// Lazily requests Android's "All files access" permission the first time
+  /// the user makes a project public. On non-Android platforms and on
+  /// Android 10 and below this is a no-op that returns true.
+  ///
+  /// The prompt is shown via Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+  /// not the standard runtime permission dialog — MANAGE_EXTERNAL_STORAGE is
+  /// a special permission that can only be granted through system settings.
+  Future<bool> _ensureAllFilesAccess() async {
+    if (!Platform.isAndroid) return true;
+    const channel = MethodChannel('raven/storage_permission');
+    try {
+      final has = await channel.invokeMethod<bool>('hasAllFilesAccess') ?? false;
+      if (has) return true;
+      final granted =
+          await channel.invokeMethod<bool>('requestAllFilesAccess') ?? false;
+      return granted;
+    } on PlatformException {
+      return false;
+    }
+  }
+
   Future<String?> _setProjectVisibility(
     RavenProject project, {
     required bool visible,
     bool refresh = true,
   }) async {
-    final visibility = AudioVisibilityService();
-    final folderLocation = project.publicFolderLocation;
-    final audioLocation = project.publicCopyLocation;
-    if (!visible) {
-      if (folderLocation != null) {
-        await visibility.removeFolder(folderLocation);
-      }
-      if (audioLocation != null) {
-        await visibility.remove(audioLocation);
-      }
-      if (folderLocation != null || audioLocation != null) {
-        await widget.repository.update(project.copyWith(
-          clearPublicCopyLocation: true,
-          clearPublicFolderLocation: true,
-        ));
-      }
-      if (refresh) await _refreshProjects();
-      return null;
-    }
-
-    if (folderLocation != null) return folderLocation;
-    if (project.isAudioProtected || project.requiresAppPin) {
+    if (visible && (project.isAudioProtected || project.requiresAppPin)) {
       throw StateError(
           'Protected or PIN-locked recordings cannot be made public.');
     }
-    if (project.sessions.isEmpty) {
-      throw StateError('This recording does not contain any audio.');
+    if (visible == project.hasPublicFolder &&
+        project.publicCopyLocation == null) {
+      if (refresh) await _refreshProjects();
+      return project.publicFolderLocation;
     }
-
-    // Make sure the on-device project folder exists before publishing it.
-    final folder = await widget.repository.ensureProjectFolder(project);
-    final publicLocation = await visibility.publishFolder(
-      source: folder,
-      folderName: widget.repository.projectFolderName(project),
+    if (visible) {
+      final allowed = await _ensureAllFilesAccess();
+      if (!allowed) {
+        throw StateError(tr(
+          widget.preferences,
+          'RAVEN needs "All files access" to move project folders into your Music/RAVEN folder. Open Settings and allow it, then try again.',
+          'RAVEN a besoin de « Accès à tous les fichiers » pour déplacer les dossiers de projet vers votre dossier Music/RAVEN. Ouvrez les paramètres, autorisez l\'accès, puis réessayez.',
+        ));
+      }
+    }
+    var updated = await widget.repository.toggleVisibility(
+      project,
+      makePublic: visible,
     );
-    try {
-      await widget.repository.update(
-          project.copyWith(publicFolderLocation: publicLocation));
-    } catch (_) {
+    if (project.publicCopyLocation != null) {
       try {
-        await visibility.removeFolder(publicLocation);
+        await AudioVisibilityService().remove(project.publicCopyLocation!);
+        updated = updated.copyWith(clearPublicCopyLocation: true);
       } catch (_) {}
-      rethrow;
     }
+    await widget.repository.update(updated);
     if (refresh) await _refreshProjects();
-    return publicLocation;
+    return updated.publicFolderLocation;
   }
 
   Future<void> _applyPublicVisibilityToAll({required bool visible}) async {
@@ -497,7 +516,11 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         } catch (error) {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text('Could not publish new recording: $error'),
+              content: Text(tr(
+                widget.preferences,
+                'Recording saved privately — could not publish: $error',
+                'Enregistrement sauvegardé en privé — publication impossible : $error',
+              )),
             ));
           }
         }
@@ -509,10 +532,8 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     RavenProject recording, {
     bool replaceCurrentRoute = false,
   }) async {
-    final project = recording.copyWith(isStandalone: false);
+    var project = recording.copyWith(isStandalone: false);
     await widget.repository.update(project);
-    // A project owns a real folder on the device with audio, notes,
-    // attachments, exports and metadata sub-folders.
     try {
       await widget.repository.ensureProjectFolder(project);
     } catch (error) {
@@ -526,6 +547,30 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         ));
       }
     }
+
+    if (widget.preferences.defaultPublicAudioVisible &&
+        !project.hasPublicFolder &&
+        !project.isAudioProtected &&
+        !project.requiresAppPin) {
+      try {
+        project = await widget.repository.toggleVisibility(
+          project,
+          makePublic: true,
+        );
+        await widget.repository.update(project);
+      } catch (error) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(tr(
+              widget.preferences,
+              'Project kept private — could not publish: $error',
+              'Projet conservé en privé — publication impossible : $error',
+            )),
+          ));
+        }
+      }
+    }
+
     await _refreshProjects();
     if (!mounted) return;
     final route = MaterialPageRoute<void>(
@@ -592,7 +637,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
 
   Future<void> _importAudioRecording() async {
     final messenger = ScaffoldMessenger.maybeOf(context);
-    String? stagedDirectory;
+    String? stagedFolderPath;
     try {
       final selection = await FilePicker.platform.pickFiles(
         type: FileType.custom,
@@ -625,17 +670,30 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
 
       final projectId = widget.repository.newId();
       final sessionId = widget.repository.newId();
-      final projectDirectory =
-          await widget.repository.createProjectDirectory(projectId);
-      stagedDirectory = projectDirectory.path;
-      await widget.repository.ensureProjectFolder(RavenProject(
+      final createdAt = DateTime.now();
+
+      var project = RavenProject(
         id: projectId,
         title: title,
-        createdAt: DateTime.now(),
-        updatedAt: DateTime.now(),
+        createdAt: createdAt,
+        updatedAt: createdAt,
         sessions: const <RavenAudioSession>[],
-      ));
-      final sessionDirectory = Directory('${projectDirectory.path}/sessions');
+        isStandalone: true,
+      );
+
+      if (widget.preferences.defaultPublicAudioVisible) {
+        try {
+          project = await widget.repository.toggleVisibility(
+            project,
+            makePublic: true,
+          );
+        } catch (_) {}
+      }
+
+      final folder = await widget.repository.ensureProjectFolder(project);
+      stagedFolderPath = folder.path;
+
+      final sessionDirectory = Directory('${folder.path}/sessions');
       await sessionDirectory.create(recursive: true);
       final safeFileTitle = title.replaceAll(RegExp(r'\s+'), '_');
       final destination = File(
@@ -657,12 +715,8 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
       } finally {
         await audioPlayer.dispose();
       }
-      final createdAt = DateTime.now();
-      await widget.repository.add(RavenProject(
-        id: projectId,
-        title: title,
-        createdAt: createdAt,
-        updatedAt: createdAt,
+
+      project = project.copyWith(
         sessions: <RavenAudioSession>[
           RavenAudioSession(
             id: sessionId,
@@ -673,23 +727,27 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
             name: '$title · Session 1',
           ),
         ],
-        isStandalone: true,
-      ));
-      stagedDirectory = null;
+      );
+      await widget.repository.add(project);
+      stagedFolderPath = null;
       await _refreshProjects();
       if (mounted) {
         messenger?.showSnackBar(SnackBar(
           content: Text(tr(
             widget.preferences,
-            'Imported "$title" as a private recording.',
-            '« $title » a été importé comme enregistrement privé.',
+            'Imported "$title" as a recording.',
+            '« $title » a été importé comme enregistrement.',
           )),
         ));
       }
     } catch (error) {
-      if (stagedDirectory != null) {
-        final directory = Directory(stagedDirectory);
-        if (await directory.exists()) await directory.delete(recursive: true);
+      if (stagedFolderPath != null) {
+        final directory = Directory(stagedFolderPath);
+        try {
+          if (await directory.exists()) {
+            await directory.delete(recursive: true);
+          }
+        } catch (_) {}
       }
       if (mounted) {
         messenger?.showSnackBar(SnackBar(
@@ -756,6 +814,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
             ? StandaloneRecordingScreen(
                 project: project,
                 preferences: widget.preferences,
+                autoPlay: true,
                 onResume: () => _resumeStandaloneFromPlayer(project),
                 onOpenDetails: () => _openProjectDetails(project),
                 onCreateProject: () => _createProjectFromRecording(
@@ -764,6 +823,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
                 ),
                 onShare: () => _shareRecording(project),
                 onRename: (title) => _renameStandalone(project, title),
+                onTogglePin: () => _toggleProjectPin(project),
                 onToggleEncryption: () => _toggleRecordingProtection(
                   project,
                   closeCurrentScreen: true,
@@ -806,6 +866,59 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     }
   }
 
+  /// Batch-share handler for the multi-select action in the Library screen.
+  /// Collects every audio file from the selected projects and opens one
+  /// system share sheet for the whole batch.
+  ///
+  /// Encrypted recordings are skipped because they need per-project password
+  /// entry, which cannot be batched. A note is shown if any were skipped.
+  Future<void> _shareProjects(List<RavenProject> projects) async {
+    if (projects.isEmpty) return;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final files = <File>[];
+    var skippedEncrypted = 0;
+    for (final project in projects) {
+      if (project.isAudioProtected) {
+        skippedEncrypted++;
+        continue;
+      }
+      for (final session in project.sessions) {
+        final file = File(session.audioPath);
+        if (await file.exists()) files.add(file);
+      }
+    }
+    if (!mounted) return;
+    if (files.isEmpty) {
+      final message = skippedEncrypted > 0
+          ? tr(
+              widget.preferences,
+              'Encrypted recordings cannot be batch-shared. Open one to share it individually.',
+              'Les enregistrements chiffrés ne peuvent pas être partagés en lot. Ouvrez-en un pour le partager individuellement.')
+          : tr(widget.preferences,
+              'No audio files to share.', 'Aucun fichier audio à partager.');
+      messenger?.showSnackBar(SnackBar(content: Text(message)));
+      return;
+    }
+    try {
+      await AudioShareService().shareFiles(files);
+      if (skippedEncrypted > 0 && mounted) {
+        messenger?.showSnackBar(SnackBar(
+          content: Text(tr(
+            widget.preferences,
+            'Shared ${files.length} file(s). $skippedEncrypted encrypted recording(s) skipped.',
+            '${files.length} fichier(s) partagé(s). $skippedEncrypted enregistrement(s) chiffré(s) ignoré(s).',
+          )),
+        ));
+      }
+    } catch (error) {
+      if (!mounted) return;
+      messenger?.showSnackBar(SnackBar(
+        content: Text(
+            '${tr(widget.preferences, 'Could not share', 'Impossible de partager')}: $error'),
+      ));
+    }
+  }
+
   Future<bool> _renameStandalone(RavenProject project, String title) async {
     try {
       await widget.repository
@@ -824,7 +937,14 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
   }
 
   Future<String?> _toggleRecordingVisibility(RavenProject project) async {
-    final enabling = project.publicCopyLocation == null;
+    final enabling = !project.isPublic;
+
+    // No-op silently when the project is already in the target state.
+    if (enabling == project.hasPublicFolder &&
+        project.publicCopyLocation == null) {
+      return project.publicFolderLocation;
+    }
+
     if (enabling && (project.isAudioProtected || project.requiresAppPin)) {
       throw StateError(
           'Decrypt the recording and remove its individual PIN lock before making it public.');
@@ -840,11 +960,11 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         content: Text(tr(
           widget.preferences,
           enabling
-              ? 'RAVEN creates a separate copy in the device music folder. Your private original stays in RAVEN.'
-              : 'RAVEN removes the public copy it created. Your private original stays in RAVEN.',
+              ? 'RAVEN will move this recording’s folder into the device’s public RAVEN folder so you can browse it with a file manager. The recording stays playable inside RAVEN.'
+              : 'RAVEN will move this recording’s folder back into its app-private storage. It will no longer be visible in your file manager, but stays playable inside RAVEN.',
           enabling
-              ? 'RAVEN crée une copie distincte dans le dossier musical de l’appareil. L’original privé reste dans RAVEN.'
-              : 'RAVEN supprime la copie publique créée par l’application. L’original privé reste dans RAVEN.',
+              ? 'RAVEN déplacera le dossier de cet enregistrement dans le dossier RAVEN public de l’appareil afin que vous puissiez le parcourir avec un gestionnaire de fichiers. L’enregistrement reste lisible dans RAVEN.'
+              : 'RAVEN replacera le dossier de cet enregistrement dans le stockage privé de l’application. Il ne sera plus visible dans votre gestionnaire de fichiers, mais reste lisible dans RAVEN.',
         )),
         actions: <Widget>[
           TextButton(
@@ -858,7 +978,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         ],
       ),
     );
-    if (confirmed != true) return project.publicCopyLocation;
+    if (confirmed != true) return project.publicFolderLocation;
     return _setProjectVisibility(project, visible: enabling);
   }
 
@@ -909,6 +1029,102 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _toggleProjectPin(RavenProject project) async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final enabling = !project.requiresAppPin;
+    if (enabling && (project.hasPublicFolder || project.hasPublicCopy)) {
+      messenger?.showSnackBar(SnackBar(
+          content: Text(tr(
+        widget.preferences,
+        'Make this recording private first. Public copies can be opened outside RAVEN.',
+        'Rendez d’abord cet enregistrement privé. Les copies publiques peuvent être ouvertes hors de RAVEN.',
+      ))));
+      return;
+    }
+    if (enabling && !widget.preferences.appLockEnabled) {
+      final pin = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) {
+          final controller = TextEditingController();
+          return AlertDialog(
+            icon: const Icon(Icons.lock_rounded, size: 32),
+            title: Text(tr(widget.preferences, 'Set RAVEN PIN first',
+                'Définir un code PIN RAVEN')),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(tr(
+                  widget.preferences,
+                  'To protect individual recordings, create your 4–12 digit app PIN.',
+                  'Pour protéger des enregistrements individuels, créez votre code PIN (4 à 12 chiffres).',
+                )),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: controller,
+                  autofocus: true,
+                  obscureText: true,
+                  keyboardType: TextInputType.number,
+                  maxLength: 12,
+                  decoration: InputDecoration(
+                    labelText:
+                        tr(widget.preferences, 'New PIN', 'Nouveau code PIN'),
+                    prefixIcon: const Icon(Icons.password_rounded),
+                  ),
+                ),
+              ],
+            ),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+              ),
+              FilledButton(
+                onPressed: () =>
+                    Navigator.pop(dialogContext, controller.text.trim()),
+                child: Text(tr(widget.preferences, 'Save PIN', 'Enregistrer')),
+              ),
+            ],
+          );
+        },
+      );
+      if (pin == null || pin.length < 4 || !mounted) {
+        if (pin != null && pin.length < 4) {
+          messenger?.showSnackBar(SnackBar(
+            content: Text(tr(
+                widget.preferences,
+                'PIN must be at least 4 digits.',
+                'Le code PIN doit comporter au moins 4 chiffres.')),
+          ));
+        }
+        return;
+      }
+      await AppLockService().setPin(pin);
+      widget.preferences.appLockEnabled = true;
+      await widget.preferences.save();
+    }
+    try {
+      final updated = project.copyWith(requiresAppPin: enabling);
+      await widget.repository.update(updated);
+      await _refreshProjects();
+      if (!mounted) return;
+      messenger?.showSnackBar(SnackBar(
+        content: Text(tr(
+            widget.preferences,
+            enabling
+                ? 'This recording now requires your RAVEN PIN.'
+                : 'PIN requirement removed for this recording.',
+            enabling
+                ? 'Cet enregistrement nécessite maintenant votre code PIN RAVEN.'
+                : 'Le code PIN n’est plus requis pour cet enregistrement.')),
+      ));
+    } catch (error) {
+      if (!mounted) return;
+      messenger?.showSnackBar(
+          SnackBar(content: Text('Could not update recording lock: $error')));
+    }
+  }
+
   Future<void> _openProjectDetails(RavenProject project) async {
     await Navigator.of(context).push<void>(
       MaterialPageRoute<void>(
@@ -927,6 +1143,28 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     RavenProject project, {
     bool alreadyUnlocked = false,
   }) async {
+    if (project.sessions.isEmpty) {
+      await _addRecordingToProject(project);
+      return;
+    }
+    if (project.sessions.length > 1 ||
+        project.isDraft ||
+        project.isAudioProtected) {
+      await _openProject(project);
+      return;
+    }
+    await _resumeSessionInProject(
+      project,
+      project.sessions.first.id,
+      alreadyUnlocked: alreadyUnlocked,
+    );
+  }
+
+  Future<void> _resumeSessionInProject(
+    RavenProject project,
+    String sessionId, {
+    bool alreadyUnlocked = false,
+  }) async {
     if (_recordingRouteActive || project.isAudioProtected) return;
     if (project.requiresAppPin && !alreadyUnlocked) {
       await _openProject(project);
@@ -940,7 +1178,29 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
             repository: widget.repository,
             preferences: widget.preferences,
             onSaved: _refreshProjects,
-            continueProject: project,
+            existingProject: project,
+            resumeSessionId: sessionId,
+            createProject: false,
+          ),
+        ),
+      );
+    } finally {
+      _recordingRouteActive = false;
+      await _refreshProjects();
+    }
+  }
+
+  Future<void> _addRecordingToProject(RavenProject project) async {
+    if (_recordingRouteActive || project.isAudioProtected) return;
+    _recordingRouteActive = true;
+    try {
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (_) => RecorderScreen(
+            repository: widget.repository,
+            preferences: widget.preferences,
+            onSaved: _refreshProjects,
+            existingProject: project,
             createProject: false,
           ),
         ),
@@ -1049,11 +1309,15 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         onAssignCategory: _assignCategory,
         onCreateProject: (project) => _createProjectFromRecording(project),
         onShareProject: _shareRecording,
+        onShareProjects: _shareProjects,
         onToggleVisibility: (project) async {
           await _toggleRecordingVisibility(project);
         },
         onToggleProtection: (project) async {
           await _toggleRecordingProtection(project);
+        },
+        onTogglePin: (project) async {
+          await _toggleProjectPin(project);
         },
       ),
       SettingsScreen(

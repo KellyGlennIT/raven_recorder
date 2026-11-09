@@ -9,20 +9,26 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
-import io.flutter.embedding.android.FlutterActivity
+import android.provider.Settings
+import com.ryanheise.audioservice.AudioServiceActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileInputStream
 
-class MainActivity : FlutterActivity() {
+class MainActivity : AudioServiceActivity() {
     private val visibilityChannelName = "raven/audio_visibility"
     private val permissionChannelName = "raven/recording_permissions"
     private val recordingControlChannelName = "raven/recording_controls"
+    private val storagePermissionChannelName = "raven/storage_permission"
     private var pendingRecordingAction: String? = null
     private var recordingControlChannel: MethodChannel? = null
     private var notificationPermissionResult: MethodChannel.Result? = null
     private val notificationPermissionRequestCode = 7341
+    // All-files-access uses startActivityForResult / onActivityResult,
+    // which is a separate mechanism from onRequestPermissionsResult.
+    private var allFilesAccessResult: MethodChannel.Result? = null
+    private val allFilesAccessRequestCode = 7342
 
     override fun onCreate(savedInstanceState: Bundle?) {
         pendingRecordingAction = recordingAction(intent?.action)
@@ -292,6 +298,73 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        // raven/storage_permission — manages MANAGE_EXTERNAL_STORAGE for Music/RAVEN/
+        // access. Uses startActivityForResult / onActivityResult (not
+        // onRequestPermissionsResult, which handles only POST_NOTIFICATIONS).
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, storagePermissionChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "hasAllFilesAccess" -> result.success(hasAllFilesAccess())
+                    "requestAllFilesAccess" -> {
+                        if (hasAllFilesAccess()) {
+                            result.success(true)
+                            return@setMethodCallHandler
+                        }
+                        if (allFilesAccessResult != null) {
+                            result.error(
+                                "PERMISSION_PENDING",
+                                "An all-files-access request is already in progress.",
+                                null,
+                            )
+                            return@setMethodCallHandler
+                        }
+                        allFilesAccessResult = result
+                        // ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION opens the
+                        // per-app settings page. Some OEMs omit it; fall back to the
+                        // global MANAGE_ALL_FILES_ACCESS_PERMISSION screen.
+                        val launched = tryLaunchAllFilesIntent(
+                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:$packageName"),
+                        ) || tryLaunchAllFilesIntent(
+                            Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION,
+                            null,
+                        )
+                        if (!launched) {
+                            allFilesAccessResult = null
+                            result.success(false)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    private fun hasAllFilesAccess(): Boolean {
+        // On Android 10 and below, WRITE_EXTERNAL_STORAGE + requestLegacyExternalStorage
+        // grants the filesystem access we need. No special check required; return true
+        // so the Dart side does not show a settings prompt to pre-R users.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return true
+        return Environment.isExternalStorageManager()
+    }
+
+    private fun tryLaunchAllFilesIntent(action: String, data: Uri?): Boolean {
+        return try {
+            val intent = if (data != null) Intent(action, data) else Intent(action)
+            startActivityForResult(intent, allFilesAccessRequestCode)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == allFilesAccessRequestCode) {
+            val granted = hasAllFilesAccess()
+            allFilesAccessResult?.success(granted)
+            allFilesAccessResult = null
+        }
     }
 
     private fun mimeTypeFor(fileName: String): String = when (fileName.substringAfterLast('.', "").lowercase()) {

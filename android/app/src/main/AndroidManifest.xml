@@ -1,17 +1,32 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <!-- MANAGE_EXTERNAL_STORAGE grants true filesystem access to Music/RAVEN/ on
+         Android 11+. Required so project folders can be physically moved into
+         /storage/emulated/0/Music/RAVEN/<name>-<id>/ without going through
+         MediaStore copies. The permission is requested lazily — only the first
+         time the user explicitly makes a project public. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage"/>
+    <!-- READ_EXTERNAL_STORAGE covers Android 10 and below alongside
+         requestLegacyExternalStorage on the application element. -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
 
     <application
         android:label="RAVEN"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:usesCleartextTraffic="false">
+        android:usesCleartextTraffic="false"
+        android:requestLegacyExternalStorage="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -30,6 +45,25 @@
             android:name=".RecordingForegroundService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
-        <meta-data android:name="flutterEmbedding" android:value="2" />
+        <service
+    android:name="com.ryanheise.audioservice.AudioService"
+    android:foregroundServiceType="mediaPlayback"
+    android:exported="true"
+    tools:ignore="Instantiatable">
+    <intent-filter>
+        <action android:name="android.media.browse.MediaBrowserService" />
+    </intent-filter>
+</service>
+
+<receiver
+    android:name="com.ryanheise.audioservice.MediaButtonReceiver"
+    android:exported="true"
+    tools:ignore="Instantiatable">
+    <intent-filter>
+        <action android:name="android.intent.action.MEDIA_BUTTON" />
+    </intent-filter>
+</receiver>
+        <meta-data 
+        android:name="flutterEmbedding" android:value="2" />
     </application>
 </manifest>

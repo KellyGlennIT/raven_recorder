@@ -10,3 +10,10 @@
 
 # Keep the recording foreground service referenced from the manifest.
 -keep class com.raven.raven.** { *; }
+
+# just_audio_background — AudioService and MediaButtonReceiver are referenced
+# by name in AndroidManifest.xml but not imported in Kotlin source, so R8
+# would strip or rename them without this rule, breaking background playback
+# and lock-screen/headset media controls in release builds.
+-keep class com.ryanheise.audioservice.** { *; }
+-keep class com.ryanheise.audiosession.** { *; }

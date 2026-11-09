@@ -42,6 +42,82 @@ class ProjectRepository {
 
   String newId() => _uuid.v4();
 
+  // ---------------------------------------------------------------------------
+  // Folder locations
+  // ---------------------------------------------------------------------------
+
+  /// Resolves the platform-appropriate public root that holds every user-visible
+  /// RAVEN project folder. Returns null when no such location is available.
+  ///
+  /// This does **not** create the folder — callers create it when publishing.
+  ///
+  /// Android: `/storage/emulated/0/Music/RAVEN/` — the real, media-scanner-
+  ///   indexed Music folder on shared storage. Requires MANAGE_EXTERNAL_STORAGE
+  ///   to be granted at runtime (see `_ensureAllFilesAccess` in main.dart).
+  ///   Falls back to the app-scoped external directory if the primary Music
+  ///   path is unexpectedly absent (rare OEM configuration).
+  /// Windows / Linux: `<Downloads>/RAVEN/`.
+  /// iOS / macOS: `<Documents>/RAVEN/`.
+  Future<Directory?> _publicProjectsRoot() async {
+    try {
+      Directory? base;
+      if (Platform.isAndroid) {
+        // Real filesystem path on shared storage. Requires MANAGE_EXTERNAL_STORAGE
+        // to be granted at runtime (see main.dart `_ensureAllFilesAccess`).
+        // Falls back to the app-scoped external directory if the primary Music
+        // folder is unexpectedly missing (rare OEM configuration) or if the
+        // permission was somehow not granted. The caller's error handling will
+        // surface a permission-denied failure on the fallback path if it too
+        // cannot be written.
+        final musicDir = Directory('/storage/emulated/0/Music');
+        if (await musicDir.exists()) {
+          return Directory('${musicDir.path}/RAVEN');
+        }
+        base = await getExternalStorageDirectory();
+        if (base == null) return null;
+        return Directory('${base.path}/RAVEN');
+      } else if (Platform.isIOS || Platform.isMacOS) {
+        base = await getApplicationDocumentsDirectory();
+      } else if (Platform.isWindows || Platform.isLinux) {
+        base = await getDownloadsDirectory();
+        base ??= await getApplicationDocumentsDirectory();
+      } else {
+        base = await getApplicationDocumentsDirectory();
+      }
+      return Directory('${base.path}/RAVEN');
+    } on Exception {
+      return null;
+    }
+  }
+
+  /// Public root as a plain path, or null when unavailable.
+  Future<String?> publicProjectsRootPath() async {
+    final dir = await _publicProjectsRoot();
+    return dir?.path;
+  }
+
+  /// Private root as a plain path — always non-null once [create] has run.
+  String privateProjectsRootPath() => projectsDirectory.path;
+
+  /// Resolves the folder that currently stores [project]'s files.
+  ///
+  /// When [RavenProject.hasPublicFolder] is true the folder is assumed to live
+  /// at [RavenProject.publicFolderLocation]. Otherwise the folder is the
+  /// private `<projects>/<name>-<id>/` workspace.
+  Future<Directory> _resolveProjectFolder(RavenProject project) async {
+    final public = project.publicFolderLocation;
+    if (project.hasPublicFolder && public != null && public.isNotEmpty) {
+      return Directory(public);
+    }
+    return Directory(
+        '${projectsDirectory.path}/${projectFolderName(project)}');
+  }
+
+  /// Legacy: creates `<projects>/<id>/` with no user-facing name. Kept for
+  /// callers that still use the older identifier-only convention.
+  ///
+  /// New code should use [ensureProjectFolder] — it respects public/private
+  /// visibility and produces a human-readable folder name.
   Future<Directory> createProjectDirectory(String projectId) async {
     final directory = Directory('${projectsDirectory.path}/$projectId');
     await directory.create(recursive: true);
@@ -57,22 +133,14 @@ class ProjectRepository {
     return directory;
   }
 
-  /// Creates the on-device folder tree for a project. Every project owns a
-  /// stable folder named after its title (with the ID appended so two projects
-  /// with the same title never collide), containing the audio, notes,
-  /// attachments, exports and metadata sub-folders.
+  /// Ensures the project's on-device folder exists at the location dictated by
+  /// its current visibility. When [RavenProject.hasPublicFolder] is true the
+  /// folder is created under the public RAVEN root; otherwise under the private
+  /// RAVEN root. Every project owns a stable folder named after its title with
+  /// the ID appended so two projects with the same title never collide.
   Future<Directory> ensureProjectFolder(RavenProject project) async {
-    final folder = Directory('${projectsDirectory.path}/${projectFolderName(project)}');
-    await folder.create(recursive: true);
-    for (final child in <String>[
-      'sessions',
-      'notes',
-      'attachments',
-      'exports',
-      'metadata'
-    ]) {
-      await Directory('${folder.path}/$child').create(recursive: true);
-    }
+    final folder = await _resolveProjectFolder(project);
+    await _createEmptyProjectTree(folder);
     return folder;
   }
 
@@ -84,6 +152,141 @@ class ProjectRepository {
         : project.id;
     return '${base.isEmpty ? 'Project' : base}-$shortId';
   }
+
+  Future<void> _createEmptyProjectTree(Directory folder) async {
+    await folder.create(recursive: true);
+    for (final child in <String>[
+      'sessions',
+      'notes',
+      'attachments',
+      'exports',
+      'metadata'
+    ]) {
+      await Directory('${folder.path}/$child').create(recursive: true);
+    }
+  }
+
+  /// Moves every file inside [from] into [to] and then removes [from]. The move
+  /// is copy-then-delete so it works across filesystems (private app storage →
+  /// external storage on Android). If the delete of the source fails, the
+  /// destination copy is kept and no exception is thrown so the user is never
+  /// left without their files.
+  Future<void> _moveDirectory(Directory from, Directory to) async {
+    if (from.path == to.path) return;
+    await to.create(recursive: true);
+    await for (final entity
+        in from.list(recursive: true, followLinks: false)) {
+      final relative = entity.path
+          .substring(from.path.length)
+          .replaceFirst(RegExp(r'^[\\/]+'), '');
+      if (relative.isEmpty) continue;
+      if (entity is File) {
+        final dest = File('${to.path}/$relative');
+        await dest.parent.create(recursive: true);
+        await entity.copy(dest.path);
+      } else if (entity is Directory) {
+        await Directory('${to.path}/$relative').create(recursive: true);
+      }
+    }
+    try {
+      await from.delete(recursive: true);
+    } on FileSystemException {
+      // Best-effort cleanup: the copy succeeded, so the user still has their
+      // data. A stale source tree is harmless and can be removed manually.
+    }
+  }
+
+  /// Toggles a project's public / private folder visibility.
+  ///
+  /// Physically moves the project folder between the private root and the
+  /// public root, rewrites every [RavenAudioSession.audioPath] and
+  /// [RavenProject.masterAudioPath] that lives inside the folder, and returns
+  /// the **updated project**. This method does **not** mutate the repository's
+  /// index — the caller must pass the returned project to [update] (or [add]
+  /// if the project is brand new and not yet in the index).
+  ///
+  /// Encrypted projects cannot be made public: the audio would be ciphertext
+  /// that no other app could open. A [StateError] is thrown so callers can
+  /// show the user an explanation instead of silently producing an unreadable
+  /// public folder.
+  Future<RavenProject> toggleVisibility(
+    RavenProject project, {
+    required bool makePublic,
+  }) async {
+    if (project.isAudioProtected && makePublic) {
+      throw StateError(
+          'Encrypted projects cannot be made public. Remove the password '
+          'first, or copy the recording with Share instead.');
+    }
+    if (project.requiresAppPin && makePublic) {
+      throw StateError(
+          'PIN-locked recordings cannot be made public. Remove the individual '
+          'PIN requirement first.');
+    }
+
+    final currentlyPublic = project.hasPublicFolder;
+    if (currentlyPublic == makePublic) return project;
+
+    final oldFolder = await _resolveProjectFolder(project);
+    final oldPath = oldFolder.path;
+
+    final Directory newRoot;
+    if (makePublic) {
+      final public = await _publicProjectsRoot();
+      if (public == null) {
+        throw StateError(
+            'Public storage is not available on this device. Check that '
+            'external storage is mounted and try again.');
+      }
+      newRoot = public;
+    } else {
+      newRoot = projectsDirectory;
+    }
+    await newRoot.create(recursive: true);
+
+    final newFolder =
+        Directory('${newRoot.path}/${projectFolderName(project)}');
+
+    if (await oldFolder.exists()) {
+      if (oldFolder.path != newFolder.path) {
+        await _moveDirectory(oldFolder, newFolder);
+      }
+    } else {
+      await _createEmptyProjectTree(newFolder);
+    }
+
+    // Rewrite session audio paths inside the moved folder.
+    final updatedSessions = <RavenAudioSession>[];
+    for (final session in project.sessions) {
+      if (session.audioPath.startsWith(oldPath)) {
+        updatedSessions.add(session.copyWith(
+          audioPath:
+              session.audioPath.replaceFirst(oldPath, newFolder.path),
+        ));
+      } else {
+        updatedSessions.add(session);
+      }
+    }
+
+    // Rewrite the master audio path, if any.
+    String? updatedMaster = project.masterAudioPath;
+    if (updatedMaster != null && updatedMaster.startsWith(oldPath)) {
+      updatedMaster =
+          updatedMaster.replaceFirst(oldPath, newFolder.path);
+    }
+
+    return project.copyWith(
+      sessions: updatedSessions,
+      masterAudioPath: updatedMaster,
+      clearMasterAudioPath: updatedMaster == null,
+      publicFolderLocation: makePublic ? newFolder.path : null,
+      clearPublicFolderLocation: !makePublic,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Index load / save
+  // ---------------------------------------------------------------------------
 
   Future<void> load() async {
     _projects.clear();
@@ -126,9 +329,9 @@ class ProjectRepository {
     await _ensureProjectFolders();
   }
 
-  /// Older projects were stored under their raw ID. Give every project the
-  /// same on-device folder tree (audio, notes, attachments, exports, metadata)
-  /// so the folder structure is consistent for new and existing projects.
+  /// Give every project the same on-device folder tree (audio, notes,
+  /// attachments, exports, metadata) at the location dictated by its current
+  /// public/private state.
   Future<void> _ensureProjectFolders() async {
     for (final project in _projects) {
       try {
@@ -446,6 +649,10 @@ class ProjectRepository {
         '${_rootDirectory.path}/categories/${_safeFolderName(project.category)}');
     await categoryDirectory.create(recursive: true);
     final manifest = File('${categoryDirectory.path}/${project.id}.json');
+    // The canonical folder depends on visibility: public projects live in the
+    // user-visible RAVEN root, private projects in the app-private workspace.
+    final folderLocation = project.publicFolderLocation ??
+        '${projectsDirectory.path}/${projectFolderName(project)}';
     await manifest.writeAsString(
         jsonEncode(<String, Object?>{
           'projectId': project.id,
@@ -453,9 +660,9 @@ class ProjectRepository {
           'category': project.category,
           'updatedAt': project.updatedAt.toIso8601String(),
           'projectDirectory': '${projectsDirectory.path}/${project.id}',
-          'projectFolder':
-              '${projectsDirectory.path}/${projectFolderName(project)}',
-          'isPublic': project.publicCopyLocation != null,
+          'projectFolder': folderLocation,
+          'isPublic': project.isPublic,
+          'isPublicFolder': project.hasPublicFolder,
         }),
         flush: true);
     // Remove stale category pointers when a project moves; project files stay in
@@ -510,10 +717,16 @@ class ProjectRepository {
   }
 
   Future<void> deleteForever(RavenProject project) async {
-    // Remove any RAVEN-managed public copy before permanently deleting its project.
+    // Remove any RAVEN-managed single-file public copy before permanently
+    // deleting its project.
     if (project.publicCopyLocation != null) {
-      await AudioVisibilityService().remove(project.publicCopyLocation!);
+      try {
+        await AudioVisibilityService().remove(project.publicCopyLocation!);
+      } on Exception {
+        // Best-effort: a stale copy must never block deleting the project.
+      }
     }
+
     final existingIndex = _projects.indexWhere((item) => item.id == project.id);
     if (existingIndex < 0) return;
     final removed = _projects.removeAt(existingIndex);
@@ -528,9 +741,26 @@ class ProjectRepository {
       rethrow;
     }
 
-    final directory = Directory('${projectsDirectory.path}/${project.id}');
-    if (await directory.exists()) {
-      await directory.delete(recursive: true);
+    // Clean up every folder shape this project might have used across versions:
+    //   <projects>/<id>/                    — legacy identifier-only folder
+    //   <projects>/<name>-<id>/             — canonical private folder
+    //   <public-root>/RAVEN/<name>-<id>/    — canonical public folder
+    final candidates = <Directory>{
+      Directory('${projectsDirectory.path}/${project.id}'),
+      Directory(
+          '${projectsDirectory.path}/${projectFolderName(project)}'),
+      if (project.publicFolderLocation != null)
+        Directory(project.publicFolderLocation!),
+    };
+    for (final directory in candidates) {
+      try {
+        if (await directory.exists()) {
+          await directory.delete(recursive: true);
+        }
+      } on FileSystemException {
+        // Best-effort cleanup: a locked folder must not resurrect the project
+        // record we already removed from the index.
+      }
     }
   }
 }

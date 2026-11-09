@@ -157,19 +157,59 @@ class RavenProject {
   /// Optional, automatically generated continuous master file. Session files remain as recovery sources.
   final String? masterAudioPath;
 
-  /// URI or path for RAVEN-managed user-visible copy, separate from the private original.
+  /// URI or path for a single-file RAVEN-managed user-visible copy
+  /// (Show/Hide public-copy control), separate from the private original.
+  /// This is a *per-file* copy, not the whole project folder.
   final String? publicCopyLocation;
 
   /// URI or path of the public copy of the whole project folder (audio, notes,
   /// attachments). Null while the project folder is private.
+  ///
+  /// The public/private **folder toggle** in the UI operates exclusively on
+  /// this field. Toggling public moves the project's folder into a
+  /// user-visible public root; toggling private moves it back into
+  /// app-private storage.
   final String? publicFolderLocation;
 
-  /// True when the project folder is visible in the device's public RAVEN folder.
+  /// True when *any* public representation of this project exists.
+  /// Backwards-compatible umbrella used by existing UI/badges.
   bool get isPublic =>
       publicFolderLocation != null || publicCopyLocation != null;
 
+  /// True when the whole project folder is user-visible (Files app).
+  /// This is what the public/private toggle flips.
+  bool get hasPublicFolder => publicFolderLocation != null;
+
+  /// True when a single-file managed public copy exists (Show/Hide).
+  bool get hasPublicCopy => publicCopyLocation != null;
+
   String? get latestAudioPath =>
       masterAudioPath ?? (sessions.isEmpty ? null : sessions.last.audioPath);
+
+  /// The most recent audio session, or null when the project has no sessions.
+  /// Used by resume, merge and player logic to know the format/sample rate
+  /// of the existing recording before appending.
+  RavenAudioSession? get lastSession =>
+      sessions.isEmpty ? null : sessions.last;
+
+  /// True when more than one internal session is present.
+  /// The resume-merge flow should reduce this to 1 (WAV append) or treat the
+  /// master file as the single user-facing recording (compressed formats).
+  bool get hasMultipleSessions => sessions.length > 1;
+
+  /// True when this project can accept another recording via resume.
+  /// Single source of truth — the Library tile, the popup menu and the
+  /// repository should all agree by reading this getter.
+  bool get canResume => !isDraft && !isTrashed && !isAudioProtected;
+
+  /// Format of the most recent recording, or the default 'm4a' for new
+  /// projects with no sessions yet. Used by the repository to decide between
+  /// lossless PCM16 append (WAV) and FFmpeg re-encode (M4A/MP3/FLAC).
+  String get currentFormat => sessions.isEmpty ? 'm4a' : sessions.last.format;
+
+  /// Sample rate of the most recent recording, or the default 44100 Hz.
+  int get currentSampleRate =>
+      sessions.isEmpty ? 44100 : sessions.last.sampleRate;
 
   int get durationMs =>
       sessions.fold<int>(0, (sum, session) => sum + session.durationMs);
