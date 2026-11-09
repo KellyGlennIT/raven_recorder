@@ -278,6 +278,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
       } catch (_) {
         // The recorder must still be preserved if Android cannot dismiss its notification.
       }
+      _started = false;
+      _paused = false;
       _showMessage(tr(
           widget.preferences,
           preservedPartial
@@ -468,6 +470,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
           // An orphaned old master is harmless; cleanup is best-effort.
         }
       }
+      _started = false;
+      _paused = false;
       widget.onSaved();
       if (mounted) Navigator.of(context).pop();
     } catch (error) {
@@ -554,6 +558,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
         }
       }
       _clock.stop();
+      _started = false;
+      _paused = false;
       if (close && mounted) Navigator.of(context).pop();
     } catch (error) {
       _showMessage(
@@ -714,14 +720,31 @@ class _RecorderScreenState extends State<RecorderScreen> {
                             children:
                                 List<Widget>.generate(_levels.length, (index) {
                               final level = _paused ? 0.10 : _levels[index];
+                              final waveColor = Color.lerp(
+                                accent,
+                                theme.colorScheme.tertiary,
+                                level.clamp(0, 1).toDouble(),
+                              )!;
                               return AnimatedContainer(
-                                duration: const Duration(milliseconds: 100),
-                                width: 3.2,
-                                height: 8 + (level * (isCompact ? 46 : 64)),
+                                duration: const Duration(milliseconds: 140),
+                                curve: Curves.easeOutCubic,
+                                width: isCompact ? 3.2 : 4,
+                                height: 7 + (level * (isCompact ? 46 : 64)),
                                 decoration: BoxDecoration(
-                                  color: accent.withValues(
-                                      alpha: 0.35 + (level * 0.65)),
-                                  borderRadius: BorderRadius.circular(4),
+                                  color: waveColor.withValues(
+                                      alpha:
+                                          _paused ? 0.35 : 0.55 + level * 0.45),
+                                  borderRadius: BorderRadius.circular(8),
+                                  boxShadow: level > 0.55 && !_paused
+                                      ? <BoxShadow>[
+                                          BoxShadow(
+                                            color: waveColor.withValues(
+                                                alpha: 0.35),
+                                            blurRadius: 8,
+                                            spreadRadius: 1,
+                                          ),
+                                        ]
+                                      : null,
                                 ),
                               );
                             }),

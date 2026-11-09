@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -22,6 +24,9 @@ class LibraryScreen extends StatefulWidget {
     required this.onCreateCategory,
     required this.onRenameCategory,
     required this.onDeleteCategory,
+    required this.onAssignCategory,
+    required this.onCreateProject,
+    required this.onShareProject,
     super.key,
   });
 
@@ -40,6 +45,9 @@ class LibraryScreen extends StatefulWidget {
   final Future<void> Function(String currentName, String newName)
       onRenameCategory;
   final Future<void> Function(String name) onDeleteCategory;
+  final ValueChanged<RavenProject> onAssignCategory;
+  final ValueChanged<RavenProject> onCreateProject;
+  final ValueChanged<RavenProject> onShareProject;
 
   @override
   State<LibraryScreen> createState() => _LibraryScreenState();
@@ -113,9 +121,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
               children: <Widget>[
                 Row(
                   children: <Widget>[
+                    if (isCompact)
+                      Builder(
+                        builder: (context) => IconButton(
+                          tooltip: tr(widget.preferences, 'Open library menu',
+                              'Ouvrir le menu de la bibliothèque'),
+                          onPressed: () => Scaffold.of(context).openDrawer(),
+                          icon: const Icon(Icons.menu_rounded),
+                        ),
+                      ),
                     Expanded(
                       child: Text(
-                        tr(widget.preferences, 'Library', 'Bibliothèque'),
+                        _pageTitle,
                         style: theme.textTheme.headlineMedium
                             ?.copyWith(fontWeight: FontWeight.w800),
                       ),
@@ -172,34 +189,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     ),
                   ),
                 ),
-                if (isCompact) ...<Widget>[
-                  const SizedBox(height: 13),
-                  filterChips,
-                  const SizedBox(height: 9),
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(
-                      children: <Widget>[
-                        _FilterChip(
-                          label: tr(widget.preferences, 'All categories',
-                              'Toutes les catégories'),
-                          selected: _selectedCategory == null,
-                          onTap: () => setState(() => _selectedCategory = null),
-                        ),
-                        for (final category in widget.categories) ...<Widget>[
-                          const SizedBox(width: 8),
-                          _FilterChip(
-                            label: category,
-                            selected: _selectedCategory == category,
-                            onTap: () => setState(
-                              () => _selectedCategory = category,
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                ],
               ],
             ),
           );
@@ -223,61 +212,271 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         onTrash: () => _confirmTrash(context, project),
                         onRestore: () => widget.onRestore(project),
                         onDelete: () => _confirmDelete(context, project),
-                        onResume: project.isStandalone &&
+                        onResume:
+                            !project.isTrashed && !project.isAudioProtected
+                                ? () => widget.onResumeProject(project)
+                                : null,
+                        onShare: project.isTrashed
+                            ? null
+                            : () => widget.onShareProject(project),
+                        onDetails: () => _showDetails(context, project),
+                        onAssignCategory: project.isTrashed
+                            ? null
+                            : () => _chooseCategory(context, project),
+                        onCreateProject: project.isStandalone &&
                                 !project.isTrashed &&
                                 !project.isAudioProtected
-                            ? () => widget.onResumeProject(project)
+                            ? () => widget.onCreateProject(project)
                             : null,
                       );
                     },
                   ),
           );
-          return Align(
-            alignment: Alignment.topCenter,
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 940),
-              child: isCompact
-                  ? Column(children: <Widget>[header, results])
-                  : Row(
-                      children: <Widget>[
-                        SizedBox(
-                          width: 205,
-                          child: _LibrarySidebar(
-                            preferences: widget.preferences,
-                            categories: widget.categories,
-                            filter: _filter,
-                            selectedCategory: _selectedCategory,
-                            onFilter: (filter) => setState(() {
-                              _filter = filter;
-                              _selectedCategory = null;
-                            }),
-                            onCategory: (category) => setState(() {
-                              _filter = LibraryFilter.all;
-                              _selectedCategory = category;
-                            }),
-                          ),
-                        ),
-                        const VerticalDivider(width: 1),
-                        Expanded(
-                          child: Column(
-                            children: <Widget>[
-                              header,
-                              Padding(
-                                padding:
-                                    const EdgeInsets.symmetric(horizontal: 28),
-                                child: filterChips,
-                              ),
-                              results,
-                            ],
-                          ),
-                        ),
-                      ],
+          return Scaffold(
+            drawer: isCompact
+                ? Drawer(
+                    child: SafeArea(
+                      child: _LibrarySidebar(
+                        preferences: widget.preferences,
+                        categories: widget.categories,
+                        filter: _filter,
+                        selectedCategory: _selectedCategory,
+                        closeOnSelect: true,
+                        onFilter: (filter) => setState(() {
+                          _filter = filter;
+                          _selectedCategory = null;
+                        }),
+                        onCategory: (category) => setState(() {
+                          _filter = LibraryFilter.all;
+                          _selectedCategory = category;
+                        }),
+                      ),
                     ),
+                  )
+                : null,
+            body: Align(
+              alignment: Alignment.topCenter,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 940),
+                child: isCompact
+                    ? Column(children: <Widget>[header, results])
+                    : Row(
+                        children: <Widget>[
+                          SizedBox(
+                            width: 205,
+                            child: _LibrarySidebar(
+                              preferences: widget.preferences,
+                              categories: widget.categories,
+                              filter: _filter,
+                              selectedCategory: _selectedCategory,
+                              closeOnSelect: false,
+                              onFilter: (filter) => setState(() {
+                                _filter = filter;
+                                _selectedCategory = null;
+                              }),
+                              onCategory: (category) => setState(() {
+                                _filter = LibraryFilter.all;
+                                _selectedCategory = category;
+                              }),
+                            ),
+                          ),
+                          const VerticalDivider(width: 1),
+                          Expanded(
+                            child: Column(
+                              children: <Widget>[
+                                header,
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 28),
+                                  child: filterChips,
+                                ),
+                                results,
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+              ),
             ),
           );
         },
       ),
     );
+  }
+
+  String get _pageTitle {
+    if (_filter == LibraryFilter.trash) {
+      return tr(widget.preferences, 'Trash', 'Corbeille');
+    }
+    if (_filter == LibraryFilter.favorites) {
+      return tr(widget.preferences, 'Favourites', 'Favoris');
+    }
+    return _selectedCategory ??
+        tr(widget.preferences, 'All recordings', 'Tous les enregistrements');
+  }
+
+  Future<void> _showDetails(BuildContext context, RavenProject project) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final paths = <String>{
+        ...project.sessions.map((session) => session.audioPath),
+        if (project.masterAudioPath != null) project.masterAudioPath!,
+      };
+      var totalBytes = 0;
+      for (final path in paths) {
+        final file = File(path);
+        if (await file.exists()) totalBytes += await file.length();
+      }
+      if (!context.mounted) return;
+      final formats = project.sessions
+          .map((session) => session.format.toUpperCase())
+          .toSet()
+          .join(', ');
+      final locale = widget.preferences.isFrench ? 'fr' : 'en';
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text(tr(widget.preferences, 'Recording details',
+              'Détails de l’enregistrement')),
+          content: SizedBox(
+            width: 420,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                _detailRow(
+                    widget.preferences,
+                    'Created',
+                    DateFormat('dd MMM yyyy · HH:mm', locale)
+                        .format(project.createdAt)),
+                _detailRow(
+                    widget.preferences,
+                    'Last updated',
+                    DateFormat('dd MMM yyyy · HH:mm', locale)
+                        .format(project.updatedAt)),
+                _detailRow(widget.preferences, 'Duration',
+                    _formatDuration(project.durationMs)),
+                _detailRow(widget.preferences, 'Storage used',
+                    _formatBytes(totalBytes)),
+                _detailRow(widget.preferences, 'Recording sessions',
+                    '${project.sessions.length}'),
+                _detailRow(widget.preferences, 'Audio format',
+                    formats.isEmpty ? '—' : formats),
+                if (project.sessions.isNotEmpty)
+                  _detailRow(
+                    widget.preferences,
+                    'Sample rate',
+                    '${(project.sessions.last.sampleRate / 1000).toStringAsFixed(1)} kHz',
+                  ),
+                _detailRow(widget.preferences, 'Category', project.category),
+                _detailRow(
+                    widget.preferences,
+                    'Privacy',
+                    project.publicCopyLocation == null
+                        ? tr(widget.preferences, 'Private in RAVEN',
+                            'Privé dans RAVEN')
+                        : tr(widget.preferences, 'Has a device-folder copy',
+                            'Possède une copie dans les dossiers')),
+                if (project.isAudioProtected)
+                  _detailRow(widget.preferences, 'Encryption', 'Encrypted'),
+                if (project.requiresAppPin)
+                  _detailRow(
+                      widget.preferences, 'Access lock', 'RAVEN PIN required'),
+                if (project.isDraft)
+                  _detailRow(widget.preferences, 'Status', 'Recovered draft'),
+              ],
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: Text(tr(widget.preferences, 'Done', 'Terminé')),
+            ),
+          ],
+        ),
+      );
+    } catch (error) {
+      if (context.mounted) {
+        messenger.showSnackBar(SnackBar(
+            content: Text(
+                '${tr(widget.preferences, 'Could not load recording details', 'Impossible de charger les détails')}: $error')));
+      }
+    }
+  }
+
+  Future<void> _chooseCategory(
+      BuildContext context, RavenProject project) async {
+    final category = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: Text(tr(widget.preferences, 'Move to category',
+            'Déplacer vers une catégorie')),
+        children: widget.categories
+            .map((name) => SimpleDialogOption(
+                  onPressed: () => Navigator.pop(dialogContext, name),
+                  child: Row(
+                    children: <Widget>[
+                      Icon(name == project.category
+                          ? Icons.check_circle_rounded
+                          : Icons.folder_outlined),
+                      const SizedBox(width: 12),
+                      Text(name),
+                    ],
+                  ),
+                ))
+            .toList(),
+      ),
+    );
+    if (category != null && category != project.category) {
+      widget.onAssignCategory(project.copyWith(category: category));
+    }
+  }
+
+  Widget _detailRow(AppPreferences preferences, String label, String value) =>
+      Padding(
+        padding: const EdgeInsets.symmetric(vertical: 5),
+        child: Row(
+          children: <Widget>[
+            SizedBox(
+              width: 130,
+              child: Text(tr(preferences, label, _frenchDetailLabel(label)),
+                  style: const TextStyle(fontWeight: FontWeight.w600)),
+            ),
+            Expanded(child: Text(value)),
+          ],
+        ),
+      );
+
+  String _frenchDetailLabel(String label) => switch (label) {
+        'Created' => 'Créé',
+        'Last updated' => 'Modifié',
+        'Duration' => 'Durée',
+        'Storage used' => 'Espace utilisé',
+        'Recording sessions' => 'Sessions',
+        'Audio format' => 'Format audio',
+        'Category' => 'Catégorie',
+        'Privacy' => 'Confidentialité',
+        'Encryption' => 'Chiffrement',
+        'Sample rate' => 'Fréquence',
+        'Access lock' => 'Verrou d’accès',
+        'Status' => 'État',
+        _ => label,
+      };
+
+  String _formatDuration(int milliseconds) {
+    final duration = Duration(milliseconds: milliseconds);
+    final hours = duration.inHours;
+    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return hours > 0
+        ? '${hours.toString().padLeft(2, '0')}:$minutes:$seconds'
+        : '$minutes:$seconds';
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
   Future<void> _rename(BuildContext context, RavenProject project) async {
@@ -561,6 +760,10 @@ class ProjectTile extends StatelessWidget {
     this.onRestore,
     this.onDelete,
     this.onResume,
+    this.onDetails,
+    this.onAssignCategory,
+    this.onCreateProject,
+    this.onShare,
     super.key,
   });
 
@@ -573,6 +776,10 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback? onRestore;
   final VoidCallback? onDelete;
   final VoidCallback? onResume;
+  final VoidCallback? onDetails;
+  final VoidCallback? onAssignCategory;
+  final VoidCallback? onCreateProject;
+  final VoidCallback? onShare;
 
   @override
   Widget build(BuildContext context) {
@@ -583,7 +790,22 @@ class ProjectTile extends StatelessWidget {
     final date =
         DateFormat('dd MMM yyyy · HH:mm', preferences.isFrench ? 'fr' : 'en')
             .format(project.createdAt);
+    final trashedDate =
+        DateFormat('dd MMM yyyy · HH:mm', preferences.isFrench ? 'fr' : 'en')
+            .format(project.trashedAt ?? project.updatedAt);
     final duration = _formatDuration(project.durationMs);
+    final subtitle = project.isTrashed
+        ? preferences.trashRetentionDays == 0
+            ? tr(preferences, 'In Trash since $trashedDate · Never expires',
+                'Dans la corbeille depuis le $trashedDate · N’expire jamais')
+            : tr(
+                preferences,
+                'In Trash since $trashedDate · Expires ${DateFormat('dd MMM yyyy', preferences.isFrench ? 'fr' : 'en').format((project.trashedAt ?? project.updatedAt).add(Duration(days: preferences.trashRetentionDays)))}',
+                'Dans la corbeille depuis le $trashedDate · Expire le ${DateFormat('dd MMM yyyy', preferences.isFrench ? 'fr' : 'en').format((project.trashedAt ?? project.updatedAt).add(Duration(days: preferences.trashRetentionDays)))}',
+              )
+        : project.isDraft
+            ? '$date  ·  ${tr(preferences, 'Interrupted draft — review audio', 'Brouillon interrompu — vérifier l’audio')}'
+            : '$date  ·  $duration';
     return Material(
       color: theme.colorScheme.surfaceContainerLow,
       borderRadius: BorderRadius.circular(20),
@@ -620,9 +842,7 @@ class ProjectTile extends StatelessWidget {
                             ?.copyWith(fontWeight: FontWeight.w700)),
                     const SizedBox(height: 5),
                     Text(
-                      project.isDraft
-                          ? '$date  ·  ${tr(preferences, 'Interrupted draft — review audio', 'Brouillon interrompu — vérifier l’audio')}'
-                          : '$date  ·  $duration',
+                      subtitle,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.bodySmall?.copyWith(
@@ -656,6 +876,10 @@ class ProjectTile extends StatelessWidget {
                           : null),
                 ),
               if (onResume != null ||
+                  onDetails != null ||
+                  onAssignCategory != null ||
+                  onCreateProject != null ||
+                  onShare != null ||
                   onRename != null ||
                   onTrash != null ||
                   onRestore != null ||
@@ -671,6 +895,18 @@ class ProjectTile extends StatelessWidget {
                       case 'resume':
                         onResume?.call();
                         break;
+                      case 'details':
+                        onDetails?.call();
+                        break;
+                      case 'category':
+                        onAssignCategory?.call();
+                        break;
+                      case 'create_project':
+                        onCreateProject?.call();
+                        break;
+                      case 'share':
+                        onShare?.call();
+                        break;
                       case 'trash':
                         onTrash?.call();
                         break;
@@ -683,11 +919,39 @@ class ProjectTile extends StatelessWidget {
                     }
                   },
                   itemBuilder: (context) => <PopupMenuEntry<String>>[
+                    if (onDetails != null)
+                      PopupMenuItem(
+                        value: 'details',
+                        child: Text(tr(preferences, 'Details', 'Détails')),
+                      ),
+                    if (!project.isTrashed && onAssignCategory != null)
+                      PopupMenuItem(
+                        value: 'category',
+                        child: Text(tr(preferences, 'Move to category',
+                            'Déplacer vers une catégorie')),
+                      ),
+                    if (onCreateProject != null)
+                      PopupMenuItem(
+                        value: 'create_project',
+                        child: Text(tr(
+                            preferences, 'Create project', 'Créer un projet')),
+                      ),
+                    if (onShare != null)
+                      PopupMenuItem(
+                        value: 'share',
+                        child: Text(
+                            tr(preferences, 'Share audio', 'Partager l’audio')),
+                      ),
                     if (onResume != null)
                       PopupMenuItem(
                         value: 'resume',
-                        child: Text(tr(preferences, 'Resume recording',
-                            'Reprendre l’enregistrement')),
+                        child: Text(
+                          project.isStandalone
+                              ? tr(preferences, 'Resume recording',
+                                  'Reprendre l’enregistrement')
+                              : tr(preferences, 'Add another session',
+                                  'Ajouter une session'),
+                        ),
                       ),
                     if (!project.isTrashed && onRename != null)
                       PopupMenuItem(
@@ -745,6 +1009,7 @@ class _LibrarySidebar extends StatelessWidget {
     required this.categories,
     required this.filter,
     required this.selectedCategory,
+    required this.closeOnSelect,
     required this.onFilter,
     required this.onCategory,
   });
@@ -753,6 +1018,7 @@ class _LibrarySidebar extends StatelessWidget {
   final List<String> categories;
   final LibraryFilter filter;
   final String? selectedCategory;
+  final bool closeOnSelect;
   final ValueChanged<LibraryFilter> onFilter;
   final ValueChanged<String> onCategory;
 
@@ -830,7 +1096,10 @@ class _LibrarySidebar extends StatelessWidget {
       title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
       contentPadding: const EdgeInsets.symmetric(horizontal: 12),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-      onTap: onTap,
+      onTap: () {
+        onTap();
+        if (closeOnSelect) Scaffold.of(context).closeDrawer();
+      },
     );
   }
 }

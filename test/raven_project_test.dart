@@ -1,8 +1,14 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:raven/models/raven_project.dart';
 import 'package:raven/services/scheduled_recording_service.dart';
+import 'package:raven/services/app_preferences.dart';
+import 'package:raven/services/project_repository.dart';
 
 void main() {
+  test('recording format options include MP3 export', () {
+    expect(AppPreferences.supportedRecordingFormats, contains('mp3'));
+  });
+
   group('ScheduledRecording persistence model', () {
     test('serializes and restores the requested local date and title', () {
       final schedule = ScheduledRecording(
@@ -155,6 +161,20 @@ void main() {
       expect(restored.masterAudioPath, isNull);
     });
 
+    test('uses the last update as a safe trash date for legacy records', () {
+      final updatedAt = DateTime.utc(2026, 11, 2, 10);
+      final restored = RavenProject.fromJson(<String, Object?>{
+        'id': 'legacy-trash',
+        'title': 'Legacy item',
+        'createdAt': DateTime.utc(2026, 11, 1).toIso8601String(),
+        'updatedAt': updatedAt.toIso8601String(),
+        'sessions': <Object?>[],
+        'isTrashed': true,
+      });
+
+      expect(restored.trashedAt, updatedAt);
+    });
+
     test('loads older sessions with safe interrupted-recording defaults', () {
       final session = RavenAudioSession.fromJson(<String, Object?>{
         'id': 'legacy-session',
@@ -184,6 +204,64 @@ void main() {
 
       expect(restored.isStandalone, isTrue);
       expect(recording.copyWith(title: 'Renamed').isStandalone, isTrue);
+    });
+
+    test('persists the trash timestamp and clears it when restored', () {
+      final now = DateTime.utc(2026, 11, 8, 12);
+      final project = RavenProject(
+        id: 'trashed-project',
+        title: 'Archived interview',
+        createdAt: now,
+        updatedAt: now,
+        sessions: const <RavenAudioSession>[],
+        isTrashed: true,
+        trashedAt: now,
+      );
+      final restored = RavenProject.fromJson(
+        Map<String, Object?>.from(project.toJson()),
+      );
+
+      expect(restored.trashedAt, now);
+      expect(
+          restored.copyWith(isTrashed: false, clearTrashedAt: true).trashedAt,
+          isNull);
+    });
+
+    test('trash expiry honors the configured retention boundary', () {
+      final trashedAt = DateTime.utc(2026, 11, 1, 12);
+      final project = RavenProject(
+        id: 'expiry-check',
+        title: 'Old recording',
+        createdAt: trashedAt,
+        updatedAt: trashedAt,
+        sessions: const <RavenAudioSession>[],
+        isTrashed: true,
+        trashedAt: trashedAt,
+      );
+      expect(
+        ProjectRepository.isTrashExpired(
+          project,
+          retentionDays: 7,
+          now: trashedAt.add(const Duration(days: 6, hours: 23)),
+        ),
+        isFalse,
+      );
+      expect(
+        ProjectRepository.isTrashExpired(
+          project,
+          retentionDays: 7,
+          now: trashedAt.add(const Duration(days: 7)),
+        ),
+        isTrue,
+      );
+      expect(
+        ProjectRepository.isTrashExpired(
+          project,
+          retentionDays: 0,
+          now: trashedAt.add(const Duration(days: 365)),
+        ),
+        isFalse,
+      );
     });
 
     test(

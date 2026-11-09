@@ -100,30 +100,6 @@ class MainActivity : FlutterActivity() {
                             return@setMethodCallHandler
                         }
 
-                        private fun recordingAction(action: String?): String? = when (action) {
-                            RecordingForegroundService.ACTION_PAUSE -> "pause"
-                            RecordingForegroundService.ACTION_RESUME -> "pause"
-                            RecordingForegroundService.ACTION_STOP_RECORDING -> "stop"
-                            else -> null
-                        }
-
-                        private fun dispatchPendingRecordingAction() {
-                            val action = pendingRecordingAction ?: return
-                            val channel = recordingControlChannel ?: return
-                            channel.invokeMethod(action, null, object : MethodChannel.Result {
-                                override fun success(result: Any?) {
-                                    if (pendingRecordingAction == action) pendingRecordingAction = null
-                                }
-
-                                override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
-                                    // Retain the action until the recorder's Dart handler is ready.
-                                }
-
-                                override fun notImplemented() {
-                                    // Retain the action until the recorder's Dart handler is ready.
-                                }
-                            })
-                        }
                         var uri: Uri? = null
                         try {
                             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -197,10 +173,8 @@ class MainActivity : FlutterActivity() {
                         try {
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                                 startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
-                            } else {
-                                result.success(null)
                             }
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) result.success(null)
+                            result.success(null)
                         } catch (error: Exception) {
                             result.error("ALARM_SETTINGS_FAILED", error.message ?: "Could not open alarm settings.", null)
                         }
@@ -247,6 +221,31 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    private fun recordingAction(action: String?): String? = when (action) {
+        RecordingForegroundService.ACTION_PAUSE -> "pause"
+        RecordingForegroundService.ACTION_RESUME -> "pause"
+        RecordingForegroundService.ACTION_STOP_RECORDING -> "stop"
+        else -> null
+    }
+
+    private fun dispatchPendingRecordingAction() {
+        val action = pendingRecordingAction ?: return
+        val channel = recordingControlChannel ?: return
+        channel.invokeMethod(action, null, object : MethodChannel.Result {
+            override fun success(result: Any?) {
+                if (pendingRecordingAction == action) pendingRecordingAction = null
+            }
+
+            override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+                // Retain the action until the recorder's Dart handler is ready.
+            }
+
+            override fun notImplemented() {
+                // Retain the action until the recorder's Dart handler is ready.
+            }
+        })
     }
 
     private fun requestNotificationPermission(result: MethodChannel.Result) {

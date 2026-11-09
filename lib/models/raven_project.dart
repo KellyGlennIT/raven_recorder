@@ -107,6 +107,7 @@ class RavenProject {
     this.category = 'Uncategorized',
     this.isFavorite = false,
     this.isTrashed = false,
+    this.trashedAt,
     this.isDraft = false,
     this.notes = '',
     this.tags = const <String>[],
@@ -127,6 +128,7 @@ class RavenProject {
   final String category;
   final bool isFavorite;
   final bool isTrashed;
+  final DateTime? trashedAt;
   final bool isDraft;
   final String notes;
   final List<String> tags;
@@ -161,6 +163,8 @@ class RavenProject {
     String? category,
     bool? isFavorite,
     bool? isTrashed,
+    DateTime? trashedAt,
+    bool clearTrashedAt = false,
     bool? isDraft,
     String? notes,
     List<String>? tags,
@@ -183,6 +187,9 @@ class RavenProject {
       category: category ?? this.category,
       isFavorite: isFavorite ?? this.isFavorite,
       isTrashed: isTrashed ?? this.isTrashed,
+      trashedAt: clearTrashedAt || isTrashed == false
+          ? null
+          : (trashedAt ?? this.trashedAt),
       isDraft: isDraft ?? this.isDraft,
       notes: notes ?? this.notes,
       tags: tags ?? this.tags,
@@ -209,6 +216,7 @@ class RavenProject {
         'category': category,
         'isFavorite': isFavorite,
         'isTrashed': isTrashed,
+        'trashedAt': trashedAt?.toIso8601String(),
         'isDraft': isDraft,
         'notes': notes,
         'tags': tags,
@@ -222,12 +230,15 @@ class RavenProject {
 
   factory RavenProject.fromJson(Map<String, Object?> json) {
     final rawSessions = json['sessions'];
+    final createdAt = DateTime.parse(json['createdAt'] as String);
+    final updatedAt =
+        DateTime.tryParse(json['updatedAt'] as String? ?? '') ?? createdAt;
+    final isTrashed = json['isTrashed'] as bool? ?? false;
     return RavenProject(
       id: json['id'] as String,
       title: json['title'] as String? ?? 'Untitled recording',
-      createdAt: DateTime.parse(json['createdAt'] as String),
-      updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
-          DateTime.parse(json['createdAt'] as String),
+      createdAt: createdAt,
+      updatedAt: updatedAt,
       sessions: rawSessions is List
           ? rawSessions
               .whereType<Map>()
@@ -239,7 +250,9 @@ class RavenProject {
       isStandalone: json['isStandalone'] as bool? ?? false,
       category: json['category'] as String? ?? 'Uncategorized',
       isFavorite: json['isFavorite'] as bool? ?? false,
-      isTrashed: json['isTrashed'] as bool? ?? false,
+      isTrashed: isTrashed,
+      trashedAt: DateTime.tryParse(json['trashedAt'] as String? ?? '') ??
+          (isTrashed ? updatedAt : null),
       isDraft: json['isDraft'] as bool? ?? false,
       notes: json['notes'] as String? ?? '',
       tags: (json['tags'] as List?)?.whereType<String>().toList() ?? <String>[],

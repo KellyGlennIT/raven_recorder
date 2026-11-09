@@ -13,6 +13,7 @@ class SettingsScreen extends StatelessWidget {
     required this.onShowTour,
     required this.onOpenScheduledRecordings,
     required this.onApplyPublicVisibility,
+    required this.onTrashRetentionChanged,
     super.key,
   });
 
@@ -21,6 +22,7 @@ class SettingsScreen extends StatelessWidget {
   final VoidCallback onShowTour;
   final VoidCallback onOpenScheduledRecordings;
   final Future<void> Function({required bool visible}) onApplyPublicVisibility;
+  final VoidCallback onTrashRetentionChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -147,6 +149,42 @@ class SettingsScreen extends StatelessWidget {
                           'Choisissez une date et une heure pour un enregistrement.')),
                       trailing: const Icon(Icons.chevron_right_rounded),
                       onTap: onOpenScheduledRecordings,
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                  _SectionHeading(
+                      title: tr(preferences, 'Library & trash',
+                          'Bibliothèque et corbeille')),
+                  Card(
+                    child: ListTile(
+                      leading: const Icon(Icons.delete_sweep_outlined),
+                      title: Text(tr(preferences, 'Trash retention',
+                          'Durée de conservation')),
+                      subtitle: Text(tr(
+                        preferences,
+                        'Items are permanently deleted after this many days in Trash. Choose Never to keep them until you delete them yourself.',
+                        'Les éléments sont définitivement supprimés après ce nombre de jours dans la corbeille. Choisissez Jamais pour les conserver jusqu’à leur suppression manuelle.',
+                      )),
+                      trailing: DropdownButton<int>(
+                        value: preferences.trashRetentionDays,
+                        underline: const SizedBox.shrink(),
+                        items: AppPreferences.supportedTrashRetentionDays
+                            .map((days) => DropdownMenuItem<int>(
+                                  value: days,
+                                  child: Text(days == 0
+                                      ? tr(preferences, 'Never', 'Jamais')
+                                      : tr(preferences, '$days days',
+                                          '$days jours')),
+                                ))
+                            .toList(),
+                        onChanged: (days) async {
+                          if (days == null) return;
+                          preferences.trashRetentionDays = days;
+                          await preferences.save();
+                          onSettingsChanged();
+                          onTrashRetentionChanged();
+                        },
+                      ),
                     ),
                   ),
                   const SizedBox(height: 24),
@@ -321,24 +359,6 @@ class SettingsScreen extends StatelessWidget {
                           },
                         ),
                         const Divider(height: 1),
-                        SwitchListTile.adaptive(
-                          secondary: const Icon(Icons.fact_check_rounded),
-                          title: Text(tr(
-                              preferences,
-                              'Create project for new recordings',
-                              'Créer un projet pour les nouveaux enregistrements')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'Turn this off to record quick single-take clips without auto-project creation.',
-                              'Désactivez ceci pour enregistrer des prises rapides sans création automatique de projet.')),
-                          value: preferences.newRecordingsCreateProject,
-                          onChanged: (value) async {
-                            preferences.newRecordingsCreateProject = value;
-                            await preferences.save();
-                            onSettingsChanged();
-                          },
-                        ),
-                        const Divider(height: 1),
                         ListTile(
                           leading: const Icon(Icons.sync_rounded),
                           title: Text(tr(
@@ -397,8 +417,8 @@ class SettingsScreen extends StatelessWidget {
                           'Verrouiller RAVEN avec un code PIN')),
                       subtitle: Text(tr(
                           preferences,
-                          'Require a 4–12 digit PIN when RAVEN opens or returns from the background. This locks the app interface; it does not encrypt audio files.',
-                          'Demander un code PIN de 4 à 12 chiffres à l’ouverture ou au retour de RAVEN. Cela verrouille l’interface, sans chiffrer les fichiers audio.')),
+                          'Require a 4–12 digit PIN when RAVEN starts after being closed. The app stays unlocked when you switch away and return; this does not encrypt audio files.',
+                          'Demander un code PIN de 4 à 12 chiffres au redémarrage de RAVEN après sa fermeture. L’application reste déverrouillée lorsque vous la mettez en arrière-plan ; cela ne chiffre pas les fichiers audio.')),
                       value: preferences.appLockEnabled,
                       onChanged: (enabled) async {
                         final changed = await _configureAppLock(

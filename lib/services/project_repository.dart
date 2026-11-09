@@ -262,10 +262,17 @@ class ProjectRepository {
       for (var index = 0; index < sessions.length; index++) {
         final session = sessions[index];
         if (!session.recoverablePcm16) continue;
-        final durationMs = await recovery.repairPcm16File(
-          File(session.audioPath),
-          sampleRate: session.sampleRate,
-        );
+        int? durationMs;
+        try {
+          durationMs = await recovery.repairPcm16File(
+            File(session.audioPath),
+            sampleRate: session.sampleRate,
+          );
+        } on FileSystemException {
+          // Keep the draft and source file intact for a later recovery attempt.
+          continue;
+        }
+
         if (durationMs == null) continue;
         sessions[index] = session.copyWith(durationMs: durationMs);
         projectChanged = true;
@@ -410,8 +417,9 @@ class ProjectRepository {
     final categoriesRoot = Directory('${_rootDirectory.path}/categories');
     if (await categoriesRoot.exists()) {
       await for (final entity in categoriesRoot.list(followLinks: false)) {
-        if (entity is! Directory || entity.path == categoryDirectory.path)
+        if (entity is! Directory || entity.path == categoryDirectory.path) {
           continue;
+        }
         final stale = File('${entity.path}/${project.id}.json');
         if (await stale.exists()) await stale.delete();
       }
@@ -419,11 +427,40 @@ class ProjectRepository {
   }
 
   Future<void> moveToTrash(RavenProject project) async {
-    await update(project.copyWith(isTrashed: true));
+    await update(project.copyWith(isTrashed: true, trashedAt: DateTime.now()));
   }
 
   Future<void> restore(RavenProject project) async {
-    await update(project.copyWith(isTrashed: false));
+    await update(project.copyWith(isTrashed: false, clearTrashedAt: true));
+  }
+
+  Future<void> purgeExpiredTrash({
+    required int retentionDays,
+    DateTime? now,
+  }) async {
+    if (retentionDays <= 0) return;
+    final currentTime = now ?? DateTime.now();
+    final expired = _projects.where((project) {
+      return isTrashExpired(
+        project,
+        retentionDays: retentionDays,
+        now: currentTime,
+      );
+    }).toList();
+    for (final project in expired) {
+      await deleteForever(project);
+    }
+  }
+
+  static bool isTrashExpired(
+    RavenProject project, {
+    required int retentionDays,
+    required DateTime now,
+  }) {
+    if (retentionDays <= 0 || !project.isTrashed) return false;
+    final trashedAt = project.trashedAt;
+    if (trashedAt == null) return false;
+    return !trashedAt.add(Duration(days: retentionDays)).isAfter(now);
   }
 
   Future<void> deleteForever(RavenProject project) async {

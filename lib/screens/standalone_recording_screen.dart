@@ -13,6 +13,10 @@ class StandaloneRecordingScreen extends StatefulWidget {
     required this.preferences,
     required this.onResume,
     required this.onOpenDetails,
+    required this.onCreateProject,
+    required this.onShare,
+    required this.onRename,
+    required this.onToggleEncryption,
     super.key,
   });
 
@@ -20,6 +24,10 @@ class StandaloneRecordingScreen extends StatefulWidget {
   final AppPreferences preferences;
   final VoidCallback onResume;
   final VoidCallback onOpenDetails;
+  final VoidCallback onCreateProject;
+  final Future<void> Function() onShare;
+  final Future<bool> Function(String title) onRename;
+  final Future<void> Function() onToggleEncryption;
 
   @override
   State<StandaloneRecordingScreen> createState() =>
@@ -28,12 +36,14 @@ class StandaloneRecordingScreen extends StatefulWidget {
 
 class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
   final AudioPlayer _player = AudioPlayer();
+  late String _title;
   String? _error;
   bool _loading = true;
 
   @override
   void initState() {
     super.initState();
+    _title = widget.project.title;
     _loadAudio();
   }
 
@@ -96,6 +106,47 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
       appBar: AppBar(
         title: Text(tr(widget.preferences, 'Recording', 'Enregistrement')),
         actions: <Widget>[
+          PopupMenuButton<String>(
+            tooltip: tr(widget.preferences, 'More actions', 'Plus d’actions'),
+            onSelected: (action) async {
+              if (action == 'create_project') widget.onCreateProject();
+              if (action == 'share') await widget.onShare();
+              if (action == 'rename') await _renameRecording();
+              if (action == 'encryption') {
+                await _player.pause();
+                await widget.onToggleEncryption();
+              }
+            },
+            itemBuilder: (context) => <PopupMenuEntry<String>>[
+              PopupMenuItem<String>(
+                value: 'share',
+                child: Text(
+                    tr(widget.preferences, 'Share audio', 'Partager l’audio')),
+              ),
+              PopupMenuItem<String>(
+                value: 'rename',
+                child: Text(
+                    tr(widget.preferences, 'Rename recording', 'Renommer')),
+              ),
+              PopupMenuItem<String>(
+                value: 'encryption',
+                child: Text(tr(
+                  widget.preferences,
+                  widget.project.isAudioProtected
+                      ? 'Decrypt audio'
+                      : 'Encrypt audio',
+                  widget.project.isAudioProtected
+                      ? 'Déchiffrer l’audio'
+                      : 'Chiffrer l’audio',
+                )),
+              ),
+              PopupMenuItem<String>(
+                value: 'create_project',
+                child: Text(tr(
+                    widget.preferences, 'Create project', 'Créer un projet')),
+              ),
+            ],
+          ),
           IconButton(
             tooltip: tr(widget.preferences, 'More details and files',
                 'Plus de détails et de fichiers'),
@@ -125,7 +176,7 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
                 ),
                 const SizedBox(height: 24),
                 Text(
-                  widget.project.title,
+                  _title,
                   textAlign: TextAlign.center,
                   style: theme.textTheme.headlineSmall
                       ?.copyWith(fontWeight: FontWeight.w800),
@@ -221,5 +272,40 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
         ),
       ),
     );
+  }
+
+  Future<void> _renameRecording() async {
+    final controller = TextEditingController(text: _title);
+    final title = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(tr(widget.preferences, 'Rename recording', 'Renommer')),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 80,
+          decoration: InputDecoration(
+              labelText: tr(widget.preferences, 'Recording title', 'Titre')),
+          onSubmitted: (value) => Navigator.pop(dialogContext, value.trim()),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, controller.text.trim()),
+            child: Text(tr(widget.preferences, 'Save', 'Enregistrer')),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (title == null || title.trim().isEmpty || title.trim() == _title) {
+      return;
+    }
+    final renamed = await widget.onRename(title.trim());
+    if (renamed && mounted) setState(() => _title = title.trim());
   }
 }

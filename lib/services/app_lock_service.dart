@@ -15,12 +15,14 @@ class AppLockService {
   static const _verifierKey = 'raven.appLock.verifier.v1';
   static const _iterations = 120000;
 
+  static bool isValidPin(String pin) => RegExp(r'^\d{4,12}$').hasMatch(pin);
+
   Future<bool> get hasPin async =>
       await _storage.read(key: _saltKey) != null &&
       await _storage.read(key: _verifierKey) != null;
 
   Future<void> setPin(String pin) async {
-    if (!RegExp(r'^\d{4,12}$').hasMatch(pin)) {
+    if (!isValidPin(pin)) {
       throw ArgumentError('Use a PIN containing 4 to 12 digits.');
     }
     final salt = List<int>.generate(16, (_) => Random.secure().nextInt(256));

@@ -92,15 +92,17 @@ class HomeScreen extends StatelessWidget {
                   ),
                   SizedBox(height: isCompact ? 24 : 34),
                   Text(
-                    tr(preferences, 'Capture the moment.',
-                        'Capturez l’instant.'),
+                    tr(preferences, 'Every sound has a place.',
+                        'Chaque son a sa place.'),
                     style: theme.textTheme.headlineMedium
                         ?.copyWith(fontWeight: FontWeight.w800, height: 1.15),
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    tr(preferences, 'Record first. Organise everything later.',
-                        'Enregistrez d’abord. Organisez ensuite.'),
+                    tr(
+                        preferences,
+                        'Capture ideas, conversations and moments. RAVEN keeps them ready to revisit.',
+                        'Capturez vos idées, conversations et moments. RAVEN les garde prêts à retrouver.'),
                     style: theme.textTheme.bodyLarge
                         ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
                   ),
@@ -112,7 +114,7 @@ class HomeScreen extends StatelessWidget {
                       Expanded(
                           child: _StatCard(
                         icon: Icons.library_music_outlined,
-                        label: tr(preferences, 'Projects', 'Projets'),
+                        label: tr(preferences, 'Library items', 'Éléments'),
                         value: '${available.length}',
                       )),
                       const SizedBox(width: 12),
@@ -130,8 +132,8 @@ class HomeScreen extends StatelessWidget {
                     children: <Widget>[
                       Expanded(
                         child: Text(
-                            tr(preferences, 'Recent projects',
-                                'Projets récents'),
+                            tr(preferences, 'Recent recordings',
+                                'Enregistrements récents'),
                             style: theme.textTheme.titleLarge
                                 ?.copyWith(fontWeight: FontWeight.w700)),
                       ),
@@ -210,7 +212,8 @@ class _CaptureCard extends StatelessWidget {
               const SizedBox(width: 9),
               Expanded(
                 child: Text(
-                  tr(preferences, 'Quick capture', 'Capture rapide'),
+                  tr(preferences, 'Ready when you are',
+                      'Prêt quand vous l’êtes'),
                   style: theme.textTheme.titleMedium?.copyWith(
                       color: theme.colorScheme.onPrimaryContainer,
                       fontWeight: FontWeight.w700),
@@ -232,8 +235,8 @@ class _CaptureCard extends StatelessWidget {
           Text(
             tr(
                 preferences,
-                'Choose a project or standalone take each time you record.',
-                'Choisissez un projet ou une prise autonome à chaque enregistrement.'),
+                'Start a private standalone recording immediately. If it grows into something bigger, create a project from its menu.',
+                'Démarrez immédiatement un enregistrement autonome privé. S’il devient un projet plus vaste, créez un projet depuis son menu.'),
             style: theme.textTheme.bodyMedium?.copyWith(
                 color:
                     theme.colorScheme.onPrimaryContainer.withValues(alpha: 0.9),
@@ -245,8 +248,8 @@ class _CaptureCard extends StatelessWidget {
             child: FilledButton.icon(
               onPressed: onRecord,
               icon: const Icon(Icons.fiber_manual_record_rounded, size: 20),
-              label: Text(tr(
-                  preferences, 'Start recording', 'Démarrer l’enregistrement')),
+              label: Text(tr(preferences, 'Tap to start recording',
+                  'Touchez pour enregistrer')),
               style: FilledButton.styleFrom(
                 padding: const EdgeInsets.symmetric(vertical: 17),
                 backgroundColor: theme.colorScheme.primary,

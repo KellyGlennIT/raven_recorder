@@ -20,6 +20,8 @@ import '../services/ai_provider_service.dart';
 import '../services/ai_key_vault.dart';
 import '../services/audio_merge_service.dart';
 import '../services/audio_visibility_service.dart';
+import '../services/audio_share_service.dart';
+import '../services/audio_protection_service.dart';
 import 'recorder_screen.dart';
 
 class PlayerScreen extends StatefulWidget {
@@ -84,6 +86,77 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   RavenAudioSession? get _session =>
       _project.sessions.isEmpty ? null : _project.sessions.last;
+
+  Future<void> _toggleAudioEncryption() async {
+    if (_loading) return;
+    final enabling = !_project.isAudioProtected;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(tr(
+          widget.preferences,
+          enabling ? 'Encrypt recording audio?' : 'Decrypt recording audio?',
+          enabling ? 'Chiffrer l’audio ?' : 'Déchiffrer l’audio ?',
+        )),
+        content: Text(tr(
+          widget.preferences,
+          enabling
+              ? 'RAVEN will encrypt this recording’s audio on this device. This is separate from the app PIN and does not require the app lock. Keep a project backup: encrypted audio depends on this device’s secure key.'
+              : 'RAVEN will decrypt this recording’s audio into this app’s private storage. This does not change the app PIN setting.',
+          enabling
+              ? 'RAVEN chiffrera l’audio de cet enregistrement sur cet appareil. Cette protection est indépendante du code PIN de l’application. Gardez une sauvegarde : le déchiffrement dépend de la clé sécurisée de cet appareil.'
+              : 'RAVEN déchiffrera l’audio de cet enregistrement dans le stockage privé de l’application. Cela ne modifie pas le code PIN de l’application.',
+        )),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(tr(
+              widget.preferences,
+              enabling ? 'Encrypt audio' : 'Decrypt audio',
+              enabling ? 'Chiffrer' : 'Déchiffrer',
+            )),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _loading = true);
+    try {
+      await _player.stop();
+      final service = AudioProtectionService(repository: widget.repository);
+      final updated = enabling
+          ? await service.encrypt(_project)
+          : await service.decrypt(_project);
+      if (!mounted) return;
+      setState(() => _project = updated);
+      widget.onProjectChanged(updated);
+      await _loadSelectedSession();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(tr(
+          widget.preferences,
+          enabling
+              ? 'Recording audio encrypted. The app PIN was not changed.'
+              : 'Recording audio decrypted. The app PIN was not changed.',
+          enabling
+              ? 'Audio chiffré. Le code PIN de l’application est inchangé.'
+              : 'Audio déchiffré. Le code PIN de l’application est inchangé.',
+        )),
+      ));
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+            '${tr(widget.preferences, 'Could not change audio encryption', 'Impossible de modifier le chiffrement audio')}: $error'),
+      ));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
 
   int _globalPositionMs(int? index, Duration localPosition) =>
       (_project.masterAudioPath != null && !_project.isAudioProtected)
@@ -281,24 +354,65 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       : ListView.builder(
                           itemCount: files.length,
                           itemBuilder: (context, index) => ListTile(
-                            leading: const Icon(Icons.attach_file_rounded),
+                            leading: _isImageAttachment(files[index])
+                                ? ClipRRect(
+                                    borderRadius: BorderRadius.circular(8),
+                                    child: Image.file(
+                                      files[index],
+                                      width: 52,
+                                      height: 52,
+                                      fit: BoxFit.cover,
+                                      errorBuilder: (_, __, ___) => const Icon(
+                                          Icons.broken_image_outlined),
+                                    ),
+                                  )
+                                : const Icon(Icons.attach_file_rounded),
                             title: Text(files[index].uri.pathSegments.last,
                                 maxLines: 1, overflow: TextOverflow.ellipsis),
                             subtitle:
                                 Text(_formatBytes(files[index].lengthSync())),
-                            trailing: IconButton(
-                              tooltip: tr(
-                                  widget.preferences,
-                                  'Remove attachment',
-                                  'Supprimer la pièce jointe'),
-                              icon: const Icon(Icons.delete_outline_rounded),
-                              onPressed: () async {
-                                await service.remove(files[index]);
-                                if (sheetContext.mounted) {
-                                  Navigator.pop(sheetContext);
+                            onTap: _isImageAttachment(files[index])
+                                ? () => _previewAttachment(
+                                    sheetContext, files[index])
+                                : null,
+                            trailing: PopupMenuButton<String>(
+                              tooltip: tr(widget.preferences, 'File actions',
+                                  'Actions du fichier'),
+                              onSelected: (action) async {
+                                if (action == 'share') {
+                                  try {
+                                    await AudioShareService()
+                                        .shareFile(files[index]);
+                                  } catch (error) {
+                                    if (!mounted) return;
+                                    messenger.showSnackBar(SnackBar(
+                                      content: Text(
+                                          '${tr(widget.preferences, 'Could not share file', 'Impossible de partager le fichier')}: $error'),
+                                    ));
+                                  }
+                                } else if (action == 'remove') {
+                                  await service.remove(files[index]);
+                                  if (sheetContext.mounted) {
+                                    Navigator.pop(sheetContext);
+                                  }
+                                  if (mounted) await _manageAttachments();
                                 }
-                                if (mounted) await _manageAttachments();
                               },
+                              itemBuilder: (context) =>
+                                  <PopupMenuEntry<String>>[
+                                PopupMenuItem<String>(
+                                  value: 'share',
+                                  child: Text(tr(widget.preferences,
+                                      'Share file', 'Partager le fichier')),
+                                ),
+                                PopupMenuItem<String>(
+                                  value: 'remove',
+                                  child: Text(tr(
+                                      widget.preferences,
+                                      'Remove attachment',
+                                      'Supprimer la pièce jointe')),
+                                ),
+                              ],
                             ),
                           ),
                         ),
@@ -334,6 +448,53 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  bool _isImageAttachment(File file) {
+    final path = file.path.toLowerCase();
+    return path.endsWith('.jpg') ||
+        path.endsWith('.jpeg') ||
+        path.endsWith('.png') ||
+        path.endsWith('.gif') ||
+        path.endsWith('.webp') ||
+        path.endsWith('.bmp');
+  }
+
+  Future<void> _previewAttachment(BuildContext context, File file) async {
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => Dialog.fullscreen(
+        child: SafeArea(
+          child: Stack(
+            children: <Widget>[
+              Center(
+                child: InteractiveViewer(
+                  child: Image.file(
+                    file,
+                    fit: BoxFit.contain,
+                    errorBuilder: (_, __, ___) => Center(
+                      child: Text(tr(
+                          widget.preferences,
+                          'Image could not be opened',
+                          'Impossible d’ouvrir l’image')),
+                    ),
+                  ),
+                ),
+              ),
+              Positioned(
+                top: 8,
+                right: 8,
+                child: IconButton.filledTonal(
+                  tooltip: tr(widget.preferences, 'Close', 'Fermer'),
+                  onPressed: () => Navigator.pop(dialogContext),
+                  icon: const Icon(Icons.close_rounded),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _continueRecording() async {
@@ -378,6 +539,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  Future<void> _shareRecordingAudio() async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await AudioShareService().shareRecording(_project);
+    } catch (error) {
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text(
+            '${tr(widget.preferences, 'Could not share recording audio', 'Impossible de partager l’audio')}: $error'),
+      ));
+    }
+  }
+
   Future<void> _exportNotesPdf() async {
     final messenger = ScaffoldMessenger.of(context);
     try {
@@ -399,6 +573,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         await _addBookmark();
       case 'attachments':
         await _manageAttachments();
+      case 'share_audio':
+        await _shareRecordingAudio();
       case 'visibility':
         await _togglePublicCopy();
       case 'export':
@@ -409,6 +585,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         await _renameProject();
       case 'pin':
         await _toggleProjectPin();
+      case 'encryption':
+        await _toggleAudioEncryption();
     }
   }
 
@@ -1027,10 +1205,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         title: Text(tr(widget.preferences, 'Project', 'Projet')),
         actions: <Widget>[
           IconButton(
-              tooltip: tr(
-                  widget.preferences,
-                  'Continue recording in this project',
-                  'Continuer l’enregistrement dans ce projet'),
+              tooltip: tr(widget.preferences, 'Add another recording session',
+                  'Ajouter une session d’enregistrement'),
               onPressed:
                   _loading || _project.isTrashed ? null : _continueRecording,
               icon: const Icon(Icons.mic_none_rounded)),
@@ -1064,6 +1240,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   tr(widget.preferences, 'Project attachments',
                       'Pièces jointes du projet')),
               _projectMenuItem(
+                  'share_audio',
+                  Icons.share_outlined,
+                  tr(widget.preferences, 'Share recording audio',
+                      'Partager l’audio du projet'),
+                  enabled: !_loading),
+              _projectMenuItem(
                 'visibility',
                 _project.publicCopyLocation == null
                     ? Icons.folder_outlined
@@ -1076,6 +1258,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   _project.publicCopyLocation == null
                       ? 'Afficher dans les dossiers'
                       : 'Masquer des dossiers',
+                ),
+                enabled: !_loading,
+              ),
+              _projectMenuItem(
+                'encryption',
+                _project.isAudioProtected
+                    ? Icons.no_encryption_rounded
+                    : Icons.enhanced_encryption_rounded,
+                tr(
+                  widget.preferences,
+                  _project.isAudioProtected
+                      ? 'Decrypt recording audio'
+                      : 'Encrypt recording audio',
+                  _project.isAudioProtected
+                      ? 'Déchiffrer l’audio'
+                      : 'Chiffrer l’audio',
                 ),
                 enabled: !_loading,
               ),
@@ -1138,30 +1336,58 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     Text(createdLabel,
                         style: theme.textTheme.bodyMedium?.copyWith(
                             color: theme.colorScheme.onSurfaceVariant)),
+                    const SizedBox(height: 12),
+                    Card(
+                      color: theme.colorScheme.primaryContainer
+                          .withValues(alpha: 0.55),
+                      child: ListTile(
+                        leading: Icon(Icons.mic_none_rounded,
+                            color: theme.colorScheme.primary),
+                        title: Text(tr(
+                          widget.preferences,
+                          'Add a session or merge audio',
+                          'Ajouter une session ou fusionner l’audio',
+                        )),
+                        subtitle: Text(tr(
+                          widget.preferences,
+                          'The microphone button adds a new recording session to this project. Merging combines sessions for continuous playback; the original sessions remain available.',
+                          'Le bouton du microphone ajoute une session à ce projet. La fusion assemble les sessions pour une lecture continue ; les sessions originales restent disponibles.',
+                        )),
+                      ),
+                    ),
                     if (_project.bookmarks.isNotEmpty) ...<Widget>[
-                      Text(
-                          tr(widget.preferences, 'Timeline bookmarks',
-                              'Repères audio'),
-                          style: theme.textTheme.titleMedium
-                              ?.copyWith(fontWeight: FontWeight.w800)),
-                      const SizedBox(height: 8),
-                      ..._project.bookmarks.map((bookmark) => Card(
-                            child: ListTile(
-                              leading:
-                                  const Icon(Icons.bookmark_outline_rounded),
-                              title: Text(bookmark.label),
-                              subtitle: Text(
-                                  _formatBookmarkTime(bookmark.positionMs)),
-                              trailing: IconButton(
-                                tooltip: tr(widget.preferences,
-                                    'Jump to bookmark', 'Aller au repère'),
-                                icon: const Icon(Icons.play_arrow_rounded),
-                                onPressed: () async {
-                                  await _seekGlobal(bookmark.positionMs);
-                                },
-                              ),
-                            ),
-                          )),
+                      Card(
+                        child: ExpansionTile(
+                          leading: const Icon(Icons.bookmarks_outlined),
+                          title: Text(tr(
+                              widget.preferences,
+                              'Timeline bookmarks (${_project.bookmarks.length})',
+                              'Repères audio (${_project.bookmarks.length})')),
+                          children: _project.bookmarks
+                              .map((bookmark) => Card(
+                                    child: ListTile(
+                                      leading: const Icon(
+                                          Icons.bookmark_outline_rounded),
+                                      title: Text(bookmark.label),
+                                      subtitle: Text(_formatBookmarkTime(
+                                          bookmark.positionMs)),
+                                      trailing: IconButton(
+                                        tooltip: tr(
+                                            widget.preferences,
+                                            'Jump to bookmark',
+                                            'Aller au repère'),
+                                        icon: const Icon(
+                                            Icons.play_arrow_rounded),
+                                        onPressed: () async {
+                                          await _seekGlobal(
+                                              bookmark.positionMs);
+                                        },
+                                      ),
+                                    ),
+                                  ))
+                              .toList(),
+                        ),
+                      ),
                       const SizedBox(height: 18),
                     ],
                     const SizedBox(height: 22),

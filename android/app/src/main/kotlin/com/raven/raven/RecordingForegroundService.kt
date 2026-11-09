@@ -99,7 +99,7 @@ class RecordingForegroundService : Service() {
                 actionIntent(if (paused) ACTION_RESUME else ACTION_PAUSE, REQUEST_TOGGLE),
             )
             addAction(
-                android.R.drawable.ic_media_stop,
+                R.drawable.ic_media_stop,
                 "Stop",
                 actionIntent(ACTION_STOP_RECORDING, REQUEST_STOP),
             )

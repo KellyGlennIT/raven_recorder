@@ -8,7 +8,7 @@
 PRODUCT_NAME = raven_recorder
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = com.example.ravenRecorder
+PRODUCT_BUNDLE_IDENTIFIER = com.raven.ravenRecorder
 
 // The copyright displayed in application information
-PRODUCT_COPYRIGHT = Copyright © 2026 com.example. All rights reserved.
+PRODUCT_COPYRIGHT = Copyright © 2026 Raven. All rights reserved.

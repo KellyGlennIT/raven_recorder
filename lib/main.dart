@@ -18,6 +18,8 @@ import 'services/app_preferences.dart';
 import 'services/app_lock_service.dart';
 import 'services/audio_encryption_service.dart';
 import 'services/audio_visibility_service.dart';
+import 'services/audio_share_service.dart';
+import 'services/audio_protection_service.dart';
 import 'services/project_repository.dart';
 import 'services/project_archive_service.dart';
 import 'services/scheduled_recording_service.dart';
@@ -139,6 +141,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
   final ScheduledRecordingService _scheduleService =
       ScheduledRecordingService();
   Timer? _scheduleTimer;
+  Timer? _trashTimer;
   bool _checkingSchedule = false;
   bool _recordingRouteActive = false;
   String? _nextScheduledTitle;
@@ -150,7 +153,10 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _scheduleTimer = Timer.periodic(
         const Duration(seconds: 2), (_) => _checkScheduledRecording());
+    _trashTimer =
+        Timer.periodic(const Duration(hours: 12), (_) => _purgeExpiredTrash());
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      _purgeExpiredTrash();
       if (!_locked && !widget.preferences.hasCompletedOnboarding) {
         _showGuidedTour();
       } else {
@@ -159,26 +165,38 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     });
   }
 
+  Future<void> _purgeExpiredTrash() async {
+    try {
+      await widget.repository.purgeExpiredTrash(
+        retentionDays: widget.preferences.trashRetentionDays,
+      );
+      if (mounted) setState(() {});
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(tr(
+          widget.preferences,
+          'Some expired trash could not be removed: $error',
+          'Certains éléments expirés n’ont pas pu être supprimés : $error',
+        )),
+      ));
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _scheduleTimer?.cancel();
+    _trashTimer?.cancel();
     _lockPinController.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (widget.preferences.appLockEnabled &&
-        (state == AppLifecycleState.inactive ||
-            state == AppLifecycleState.paused ||
-            state == AppLifecycleState.hidden)) {
-      if (mounted && !_locked) {
-        setState(() => _locked = true);
-      }
-    }
     if (state == AppLifecycleState.resumed) {
       _checkScheduledRecording();
+      _purgeExpiredTrash();
     }
   }
 
@@ -329,9 +347,9 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         titleEn: 'Record first',
         titleFr: 'Enregistrez d’abord',
         bodyEn:
-            'Tap Record. RAVEN creates a project automatically, so you never need to prepare folders before capturing an idea.',
+            'Tap Record to start a private standalone take immediately. Create a project later from the recording menu whenever you need notes, files or more sessions.',
         bodyFr:
-            'Touchez Enregistrer. RAVEN crée automatiquement un projet : aucun dossier à préparer avant de capturer une idée.',
+            'Touchez Enregistrer pour lancer immédiatement une prise autonome privée. Créez ensuite un projet depuis le menu de l’enregistrement si vous avez besoin de notes, de fichiers ou d’autres sessions.',
         hintEn: 'Try the large Record button on Home.',
         hintFr: 'Essayez le grand bouton Enregistrer sur Accueil.'
       ),
@@ -462,35 +480,6 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     _nextScheduledTitle = null;
     try {
       final navigator = Navigator.of(context);
-      final createProjectChoice = await showDialog<bool>(
-        context: context,
-        builder: (dialogContext) => AlertDialog(
-          title: Text(tr(widget.preferences, 'New recording mode',
-              'Mode de l’enregistrement')),
-          content: Text(tr(
-            widget.preferences,
-            'Use this recording as a new project or as a standalone take?',
-            'Utiliser cet enregistrement comme nouveau projet ou comme prise autonome ?',
-          )),
-          actions: <Widget>[
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: Text(
-                  tr(widget.preferences, 'Standalone take', 'Prise autonome')),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: Text(
-                  tr(widget.preferences, 'Create project', 'Créer un projet')),
-            ),
-          ],
-        ),
-      );
-      final createProject =
-          createProjectChoice ?? widget.preferences.newRecordingsCreateProject;
-      widget.preferences.newRecordingsCreateProject = createProject;
-      await widget.preferences.save();
-      if (!context.mounted) return;
       await navigator.push<void>(
         MaterialPageRoute<void>(
           builder: (_) => RecorderScreen(
@@ -498,12 +487,38 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
             preferences: widget.preferences,
             onSaved: _refreshProjects,
             initialTitle: initialTitle,
-            createProject: createProject,
+            createProject: false,
           ),
         ),
       );
     } finally {
       _recordingRouteActive = false;
+    }
+
+    await _refreshProjects();
+  }
+
+  Future<void> _createProjectFromRecording(
+    RavenProject recording, {
+    bool replaceCurrentRoute = false,
+  }) async {
+    final project = recording.copyWith(isStandalone: false);
+    await widget.repository.update(project);
+    await _refreshProjects();
+    if (!mounted) return;
+    final route = MaterialPageRoute<void>(
+      builder: (_) => PlayerScreen(
+        project: project,
+        repository: widget.repository,
+        preferences: widget.preferences,
+        onProjectChanged: (_) => _refreshProjects(),
+      ),
+    );
+    final navigator = Navigator.of(context);
+    if (replaceCurrentRoute) {
+      await navigator.pushReplacement<void, void>(route);
+    } else {
+      await navigator.push<void>(route);
     }
     await _refreshProjects();
   }
@@ -621,6 +636,13 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
                 preferences: widget.preferences,
                 onResume: () => _resumeStandaloneFromPlayer(project),
                 onOpenDetails: () => _openProjectDetails(project),
+                onCreateProject: () => _createProjectFromRecording(
+                  project,
+                  replaceCurrentRoute: true,
+                ),
+                onShare: () => _shareRecording(project),
+                onRename: (title) => _renameStandalone(project, title),
+                onToggleEncryption: () => _toggleStandaloneEncryption(project),
               )
             : PlayerScreen(
                 project: project,
@@ -631,6 +653,90 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
       ),
     );
     await _refreshProjects();
+  }
+
+  Future<void> _shareRecording(RavenProject project) async {
+    try {
+      await AudioShareService().shareRecording(project);
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+            '${tr(widget.preferences, 'Could not share recording', 'Impossible de partager l’enregistrement')}: $error'),
+      ));
+    }
+  }
+
+  Future<bool> _renameStandalone(RavenProject project, String title) async {
+    try {
+      await widget.repository
+          .update(project.copyWith(title: title, updatedAt: DateTime.now()));
+      await _refreshProjects();
+      return true;
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              '${tr(widget.preferences, 'Could not rename recording', 'Impossible de renommer l’enregistrement')}: $error'),
+        ));
+      }
+      return false;
+    }
+  }
+
+  Future<void> _toggleStandaloneEncryption(RavenProject project) async {
+    final enabling = !project.isAudioProtected;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(tr(
+          widget.preferences,
+          enabling ? 'Encrypt recording audio?' : 'Decrypt recording audio?',
+          enabling ? 'Chiffrer l’audio ?' : 'Déchiffrer l’audio ?',
+        )),
+        content: Text(tr(
+          widget.preferences,
+          enabling
+              ? 'Audio encryption is separate from the app PIN and works even when the app lock is off. Keep a backup; the encryption key is stored securely on this device.'
+              : 'Decrypt this audio into RAVEN’s private storage. Your app PIN setting will not change.',
+          enabling
+              ? 'Le chiffrement audio est indépendant du code PIN et fonctionne même si le verrouillage de l’application est désactivé. Gardez une sauvegarde : la clé est conservée dans le stockage sécurisé de cet appareil.'
+              : 'Déchiffrez cet audio dans le stockage privé de RAVEN. Le réglage du code PIN ne changera pas.',
+        )),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(tr(
+              widget.preferences,
+              enabling ? 'Encrypt audio' : 'Decrypt audio',
+              enabling ? 'Chiffrer' : 'Déchiffrer',
+            )),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      final service = AudioProtectionService(repository: widget.repository);
+      if (enabling) {
+        await service.encrypt(project);
+      } else {
+        await service.decrypt(project);
+      }
+      if (!mounted) return;
+      await Navigator.of(context).maybePop();
+      await _refreshProjects();
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+            '${tr(widget.preferences, 'Could not change audio encryption', 'Impossible de modifier le chiffrement audio')}: $error'),
+      ));
+    }
   }
 
   Future<void> _openProjectDetails(RavenProject project) async {
@@ -682,6 +788,11 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
 
   Future<void> _renameProject(RavenProject project) async {
     await widget.repository.update(project.copyWith(updatedAt: DateTime.now()));
+    await _refreshProjects();
+  }
+
+  Future<void> _assignCategory(RavenProject project) async {
+    await widget.repository.update(project);
     await _refreshProjects();
   }
 
@@ -763,6 +874,9 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         onCreateCategory: _createCategory,
         onRenameCategory: _renameCategory,
         onDeleteCategory: _deleteCategory,
+        onAssignCategory: _assignCategory,
+        onCreateProject: (project) => _createProjectFromRecording(project),
+        onShareProject: _shareRecording,
       ),
       SettingsScreen(
         preferences: preferences,
@@ -770,6 +884,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         onShowTour: _showGuidedTour,
         onOpenScheduledRecordings: _openScheduledRecordings,
         onApplyPublicVisibility: _applyPublicVisibilityToAll,
+        onTrashRetentionChanged: _purgeExpiredTrash,
       ),
     ];
 

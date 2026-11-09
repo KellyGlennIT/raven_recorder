@@ -12,6 +12,7 @@ class AppPreferences {
     this.appLockEnabled = false,
     this.defaultPublicAudioVisible = false,
     this.newRecordingsCreateProject = true,
+    this.trashRetentionDays = 30,
     this.aiProvider = 'openrouter',
     this.aiModel = 'openrouter/free',
   });
@@ -26,6 +27,7 @@ class AppPreferences {
   bool appLockEnabled;
   bool defaultPublicAudioVisible;
   bool newRecordingsCreateProject;
+  int trashRetentionDays;
   String aiProvider;
   String aiModel;
 
@@ -47,6 +49,14 @@ class AppPreferences {
     'mp3',
     'wav',
     'flac'
+  ];
+  static const List<int> supportedTrashRetentionDays = <int>[
+    7,
+    14,
+    30,
+    60,
+    90,
+    0
   ];
 
   static Future<AppPreferences> load() async {
@@ -73,6 +83,10 @@ class AppPreferences {
           prefs.getBool('raven.defaultPublicAudioVisible') ?? false,
       newRecordingsCreateProject:
           prefs.getBool('raven.newRecordingsCreateProject') ?? true,
+      trashRetentionDays: supportedTrashRetentionDays
+              .contains(prefs.getInt('raven.trashRetentionDays'))
+          ? prefs.getInt('raven.trashRetentionDays')!
+          : 30,
       aiProvider: prefs.getString('raven.aiProvider') ?? 'openrouter',
       aiModel: prefs.getString('raven.aiModel') ?? 'openrouter/free',
     );
@@ -92,6 +106,7 @@ class AppPreferences {
         'raven.defaultPublicAudioVisible', defaultPublicAudioVisible);
     await prefs.setBool(
         'raven.newRecordingsCreateProject', newRecordingsCreateProject);
+    await prefs.setInt('raven.trashRetentionDays', trashRetentionDays);
     await prefs.setString('raven.aiProvider', aiProvider);
     await prefs.setString('raven.aiModel', aiModel);
   }
