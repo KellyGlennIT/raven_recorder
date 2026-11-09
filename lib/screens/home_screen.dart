@@ -7,6 +7,7 @@ import 'library_screen.dart';
 class HomeScreen extends StatelessWidget {
   const HomeScreen({
     required this.projects,
+    required this.categories,
     required this.preferences,
     required this.onRecord,
     required this.onOpenProject,
@@ -15,6 +16,7 @@ class HomeScreen extends StatelessWidget {
   });
 
   final List<RavenProject> projects;
+  final List<String> categories;
   final AppPreferences preferences;
   final VoidCallback onRecord;
   final ValueChanged<RavenProject> onOpenProject;
@@ -25,8 +27,6 @@ class HomeScreen extends StatelessWidget {
     final theme = Theme.of(context);
     final available = projects.where((project) => !project.isTrashed).toList();
     final recent = available.take(4).toList();
-    final totalDuration =
-        available.fold<int>(0, (sum, project) => sum + project.durationMs);
 
     return SafeArea(
       child: LayoutBuilder(
@@ -120,10 +120,9 @@ class HomeScreen extends StatelessWidget {
                       const SizedBox(width: 12),
                       Expanded(
                           child: _StatCard(
-                        icon: Icons.schedule_rounded,
-                        label:
-                            tr(preferences, 'Audio captured', 'Audio capturé'),
-                        value: _formatDuration(totalDuration),
+                        icon: Icons.folder_copy_outlined,
+                        label: tr(preferences, 'Categories', 'Catégories'),
+                        value: '${categories.length}',
                       )),
                     ],
                   ),
@@ -167,15 +166,6 @@ class HomeScreen extends StatelessWidget {
         },
       ),
     );
-  }
-
-  String _formatDuration(int milliseconds) {
-    final duration = Duration(milliseconds: milliseconds);
-    if (duration.inHours > 0) {
-      return '${duration.inHours}h ${duration.inMinutes.remainder(60).toString().padLeft(2, '0')}m';
-    }
-    if (duration.inMinutes > 0) return '${duration.inMinutes}m';
-    return '${duration.inSeconds}s';
   }
 }
 

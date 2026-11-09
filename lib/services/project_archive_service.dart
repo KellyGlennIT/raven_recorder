@@ -105,8 +105,10 @@ class ProjectArchiveService {
 
   Future<void> shareProject(RavenProject project) async {
     final file = await exportProject(project);
-    await Share.shareXFiles(<XFile>[XFile(file.path)],
-        text: 'RAVEN project: ${project.title}');
+    await SharePlus.instance.share(ShareParams(
+      files: <XFile>[XFile(file.path)],
+      text: 'RAVEN project: ${project.title}',
+    ));
   }
 
   /// Installs a staged import as a new project with a fresh stable ID.

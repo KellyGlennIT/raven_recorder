@@ -1,7 +1,6 @@
 package com.raven.raven
 
 import android.Manifest
-import android.app.AlarmManager
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -10,7 +9,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
-import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -19,16 +17,14 @@ import java.io.FileInputStream
 
 class MainActivity : FlutterActivity() {
     private val visibilityChannelName = "raven/audio_visibility"
-    private val schedulerChannelName = "raven/scheduled_recording"
+    private val permissionChannelName = "raven/recording_permissions"
     private val recordingControlChannelName = "raven/recording_controls"
-    private var pendingScheduleId: String? = null
     private var pendingRecordingAction: String? = null
     private var recordingControlChannel: MethodChannel? = null
     private var notificationPermissionResult: MethodChannel.Result? = null
     private val notificationPermissionRequestCode = 7341
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        pendingScheduleId = intent?.getStringExtra(ScheduledRecordingReceiver.EXTRA_SCHEDULE_ID)
         pendingRecordingAction = recordingAction(intent?.action)
         super.onCreate(savedInstanceState)
     }
@@ -36,7 +32,6 @@ class MainActivity : FlutterActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        pendingScheduleId = intent.getStringExtra(ScheduledRecordingReceiver.EXTRA_SCHEDULE_ID)
         pendingRecordingAction = recordingAction(intent.action)
         dispatchPendingRecordingAction()
     }
@@ -160,64 +155,10 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, schedulerChannelName)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, permissionChannelName)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "requestNotificationPermission" -> requestNotificationPermission(result)
-                    "canScheduleExactAlarms" -> {
-                        val allowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
-                            (getSystemService(ALARM_SERVICE) as AlarmManager).canScheduleExactAlarms()
-                        result.success(allowed)
-                    }
-                    "openExactAlarmSettings" -> {
-                        try {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                                startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
-                            }
-                            result.success(null)
-                        } catch (error: Exception) {
-                            result.error("ALARM_SETTINGS_FAILED", error.message ?: "Could not open alarm settings.", null)
-                        }
-                    }
-                    "scheduleAlarm" -> {
-                        val id = call.argument<String>("id")
-                        val title = call.argument<String>("title")
-                        val atMillis = call.argument<Number>("triggerAtMillis")?.toLong()
-                        if (id.isNullOrBlank() || atMillis == null || atMillis <= System.currentTimeMillis()) {
-                            result.error("BAD_ALARM", "A future time, schedule ID and title are required.", null)
-                            return@setMethodCallHandler
-                        }
-                        try {
-                            ScheduledRecordingReceiver.schedule(
-                                this,
-                                id,
-                                title ?: "Scheduled recording",
-                                atMillis,
-                            )
-                            result.success(null)
-                        } catch (error: Exception) {
-                            result.error("SCHEDULE_FAILED", error.message ?: "Could not set the alarm.", null)
-                        }
-                    }
-                    "cancelAlarm" -> {
-                        val id = call.argument<String>("id")
-                        if (id.isNullOrBlank()) {
-                            result.error("BAD_ALARM", "A schedule ID is required.", null)
-                        } else {
-                            try {
-                                ScheduledRecordingReceiver.cancel(this, id)
-                                result.success(null)
-                            } catch (error: Exception) {
-                                result.error("CANCEL_FAILED", error.message ?: "Could not cancel the alarm.", null)
-                            }
-                        }
-                    }
-                    "consumeTappedScheduleId" -> {
-                        val resultId = pendingScheduleId ?: intent?.getStringExtra(ScheduledRecordingReceiver.EXTRA_SCHEDULE_ID)
-                        pendingScheduleId = null
-                        intent?.removeExtra(ScheduledRecordingReceiver.EXTRA_SCHEDULE_ID)
-                        result.success(resultId)
-                    }
                     else -> result.notImplemented()
                 }
             }

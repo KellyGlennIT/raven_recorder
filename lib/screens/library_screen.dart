@@ -20,6 +20,7 @@ class LibraryScreen extends StatefulWidget {
     required this.onRestore,
     required this.onDelete,
     required this.onImportProject,
+    required this.onImportAudio,
     required this.onResumeProject,
     required this.onCreateCategory,
     required this.onRenameCategory,
@@ -27,6 +28,8 @@ class LibraryScreen extends StatefulWidget {
     required this.onAssignCategory,
     required this.onCreateProject,
     required this.onShareProject,
+    required this.onToggleVisibility,
+    required this.onToggleProtection,
     super.key,
   });
 
@@ -40,6 +43,7 @@ class LibraryScreen extends StatefulWidget {
   final ValueChanged<RavenProject> onRestore;
   final ValueChanged<RavenProject> onDelete;
   final VoidCallback onImportProject;
+  final VoidCallback onImportAudio;
   final ValueChanged<RavenProject> onResumeProject;
   final Future<void> Function(String name) onCreateCategory;
   final Future<void> Function(String currentName, String newName)
@@ -48,6 +52,8 @@ class LibraryScreen extends StatefulWidget {
   final ValueChanged<RavenProject> onAssignCategory;
   final ValueChanged<RavenProject> onCreateProject;
   final ValueChanged<RavenProject> onShareProject;
+  final Future<void> Function(RavenProject project) onToggleVisibility;
+  final Future<void> Function(RavenProject project) onToggleProtection;
 
   @override
   State<LibraryScreen> createState() => _LibraryScreenState();
@@ -144,13 +150,33 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       icon: const Icon(Icons.folder_copy_outlined),
                     ),
                     const SizedBox(width: 4),
-                    IconButton.filledTonal(
-                      tooltip: tr(
-                          widget.preferences,
-                          'Import RAVEN project bundle',
-                          'Importer un projet RAVEN'),
-                      onPressed: widget.onImportProject,
-                      icon: const Icon(Icons.archive_outlined),
+                    PopupMenuButton<String>(
+                      tooltip: tr(widget.preferences, 'Import audio or project',
+                          'Importer un audio ou un projet'),
+                      onSelected: (value) {
+                        if (value == 'audio') {
+                          widget.onImportAudio();
+                        } else {
+                          widget.onImportProject();
+                        }
+                      },
+                      itemBuilder: (context) => <PopupMenuEntry<String>>[
+                        PopupMenuItem<String>(
+                          value: 'audio',
+                          child: Text(tr(
+                              widget.preferences,
+                              'Import audio file',
+                              'Importer un fichier audio')),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'project',
+                          child: Text(tr(
+                              widget.preferences,
+                              'Import RAVEN project bundle',
+                              'Importer un projet RAVEN')),
+                        ),
+                      ],
+                      icon: const Icon(Icons.file_upload_outlined),
                     ),
                   ],
                 ),
@@ -219,6 +245,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         onShare: project.isTrashed
                             ? null
                             : () => widget.onShareProject(project),
+                        onToggleVisibility: project.isTrashed
+                            ? null
+                            : () => _toggleVisibility(project),
+                        onToggleProtection: project.isTrashed
+                            ? null
+                            : () => widget.onToggleProtection(project),
                         onDetails: () => _showDetails(context, project),
                         onAssignCategory: project.isTrashed
                             ? null
@@ -239,6 +271,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       child: _LibrarySidebar(
                         preferences: widget.preferences,
                         categories: widget.categories,
+                        projects: widget.projects,
                         filter: _filter,
                         selectedCategory: _selectedCategory,
                         closeOnSelect: true,
@@ -250,6 +283,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                           _filter = LibraryFilter.all;
                           _selectedCategory = category;
                         }),
+                        onManageCategories: () => _manageCategories(context),
                       ),
                     ),
                   )
@@ -263,10 +297,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     : Row(
                         children: <Widget>[
                           SizedBox(
-                            width: 205,
+                            width: 240,
                             child: _LibrarySidebar(
                               preferences: widget.preferences,
                               categories: widget.categories,
+                              projects: widget.projects,
                               filter: _filter,
                               selectedCategory: _selectedCategory,
                               closeOnSelect: false,
@@ -278,6 +313,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                 _filter = LibraryFilter.all;
                                 _selectedCategory = category;
                               }),
+                              onManageCategories: () =>
+                                  _manageCategories(context),
                             ),
                           ),
                           const VerticalDivider(width: 1),
@@ -327,6 +364,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final file = File(path);
         if (await file.exists()) totalBytes += await file.length();
       }
+
       if (!context.mounted) return;
       final formats = project.sessions
           .map((session) => session.format.toUpperCase())
@@ -401,6 +439,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
             content: Text(
                 '${tr(widget.preferences, 'Could not load recording details', 'Impossible de charger les détails')}: $error')));
       }
+    }
+  }
+
+  Future<void> _toggleVisibility(RavenProject project) async {
+    try {
+      await widget.onToggleVisibility(project);
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Could not update recording visibility: $error'),
+      ));
     }
   }
 
@@ -764,6 +813,8 @@ class ProjectTile extends StatelessWidget {
     this.onAssignCategory,
     this.onCreateProject,
     this.onShare,
+    this.onToggleVisibility,
+    this.onToggleProtection,
     super.key,
   });
 
@@ -780,6 +831,8 @@ class ProjectTile extends StatelessWidget {
   final VoidCallback? onAssignCategory;
   final VoidCallback? onCreateProject;
   final VoidCallback? onShare;
+  final VoidCallback? onToggleVisibility;
+  final VoidCallback? onToggleProtection;
 
   @override
   Widget build(BuildContext context) {
@@ -880,6 +933,8 @@ class ProjectTile extends StatelessWidget {
                   onAssignCategory != null ||
                   onCreateProject != null ||
                   onShare != null ||
+                  onToggleVisibility != null ||
+                  onToggleProtection != null ||
                   onRename != null ||
                   onTrash != null ||
                   onRestore != null ||
@@ -906,6 +961,12 @@ class ProjectTile extends StatelessWidget {
                         break;
                       case 'share':
                         onShare?.call();
+                        break;
+                      case 'visibility':
+                        onToggleVisibility?.call();
+                        break;
+                      case 'protection':
+                        onToggleProtection?.call();
                         break;
                       case 'trash':
                         onTrash?.call();
@@ -942,6 +1003,32 @@ class ProjectTile extends StatelessWidget {
                         child: Text(
                             tr(preferences, 'Share audio', 'Partager l’audio')),
                       ),
+                    if (onToggleVisibility != null)
+                      PopupMenuItem(
+                        value: 'visibility',
+                        child: Text(tr(
+                          preferences,
+                          project.publicCopyLocation == null
+                              ? 'Make public'
+                              : 'Make private',
+                          project.publicCopyLocation == null
+                              ? 'Rendre public'
+                              : 'Rendre privé',
+                        )),
+                      ),
+                    if (onToggleProtection != null)
+                      PopupMenuItem(
+                        value: 'protection',
+                        child: Text(tr(
+                          preferences,
+                          project.isAudioProtected
+                              ? 'Unlock audio'
+                              : 'Lock audio with a password',
+                          project.isAudioProtected
+                              ? 'Déverrouiller l’audio'
+                              : 'Verrouiller l’audio avec un mot de passe',
+                        )),
+                      ),
                     if (onResume != null)
                       PopupMenuItem(
                         value: 'resume',
@@ -966,7 +1053,7 @@ class ProjectTile extends StatelessWidget {
                       PopupMenuItem(
                           value: 'restore',
                           child: Text(tr(preferences, 'Restore', 'Restaurer'))),
-                    if (project.isTrashed && onDelete != null)
+                    if (onDelete != null)
                       PopupMenuItem(
                           value: 'delete',
                           child: Text(tr(preferences, 'Delete permanently',
@@ -1007,39 +1094,72 @@ class _LibrarySidebar extends StatelessWidget {
   const _LibrarySidebar({
     required this.preferences,
     required this.categories,
+    required this.projects,
     required this.filter,
     required this.selectedCategory,
     required this.closeOnSelect,
     required this.onFilter,
     required this.onCategory,
+    required this.onManageCategories,
   });
 
   final AppPreferences preferences;
   final List<String> categories;
+  final List<RavenProject> projects;
   final LibraryFilter filter;
   final String? selectedCategory;
   final bool closeOnSelect;
   final ValueChanged<LibraryFilter> onFilter;
   final ValueChanged<String> onCategory;
+  final VoidCallback onManageCategories;
+
+  int _count(bool Function(RavenProject) predicate) =>
+      projects.where(predicate).length;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
     return ListView(
-      padding: const EdgeInsets.fromLTRB(12, 24, 8, 24),
+      padding: const EdgeInsets.fromLTRB(10, 20, 10, 24),
       children: <Widget>[
         Padding(
-          padding: const EdgeInsets.fromLTRB(12, 0, 8, 8),
+          padding: const EdgeInsets.fromLTRB(12, 0, 8, 14),
+          child: Row(
+            children: <Widget>[
+              Image.asset(
+                'assets/images/raven_logo.png',
+                width: 34,
+                height: 34,
+                errorBuilder: (_, __, ___) => Icon(Icons.graphic_eq_rounded,
+                    color: colorScheme.primary, size: 30),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'RAVEN',
+                  style: theme.textTheme.titleMedium
+                      ?.copyWith(fontWeight: FontWeight.w800, letterSpacing: 2),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 8, 6),
           child: Text(
             tr(preferences, 'Browse', 'Parcourir'),
-            style: theme.textTheme.labelLarge
-                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            style: theme.textTheme.labelSmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.1),
           ),
         ),
         _sidebarItem(
           context,
           icon: Icons.library_music_outlined,
           title: tr(preferences, 'All recordings', 'Tous les enregistrements'),
+          count: _count((project) => !project.isTrashed),
           selected: filter == LibraryFilter.all && selectedCategory == null,
           onTap: () => onFilter(LibraryFilter.all),
         ),
@@ -1047,6 +1167,7 @@ class _LibrarySidebar extends StatelessWidget {
           context,
           icon: Icons.star_outline_rounded,
           title: tr(preferences, 'Favourites', 'Favoris'),
+          count: _count((project) => !project.isTrashed && project.isFavorite),
           selected: filter == LibraryFilter.favorites,
           onTap: () => onFilter(LibraryFilter.favorites),
         ),
@@ -1054,16 +1175,32 @@ class _LibrarySidebar extends StatelessWidget {
           context,
           icon: Icons.delete_outline_rounded,
           title: tr(preferences, 'Trash', 'Corbeille'),
+          count: _count((project) => project.isTrashed),
           selected: filter == LibraryFilter.trash,
           onTap: () => onFilter(LibraryFilter.trash),
         ),
-        const Divider(height: 28),
         Padding(
-          padding: const EdgeInsets.fromLTRB(12, 0, 8, 8),
-          child: Text(
-            tr(preferences, 'Categories', 'Catégories'),
-            style: theme.textTheme.labelLarge
-                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          padding: const EdgeInsets.fromLTRB(12, 20, 8, 6),
+          child: Row(
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  tr(preferences, 'Categories', 'Catégories'),
+                  style: theme.textTheme.labelSmall?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1.1),
+                ),
+              ),
+              IconButton(
+                tooltip: tr(preferences, 'Manage categories',
+                    'Gérer les catégories'),
+                visualDensity: VisualDensity.compact,
+                iconSize: 18,
+                onPressed: onManageCategories,
+                icon: const Icon(Icons.tune_rounded),
+              ),
+            ],
           ),
         ),
         for (final category in categories)
@@ -1075,6 +1212,8 @@ class _LibrarySidebar extends StatelessWidget {
             title: category == 'Uncategorized'
                 ? tr(preferences, 'Uncategorized', 'Non classé')
                 : category,
+            count: _count((project) =>
+                !project.isTrashed && project.category == category),
             selected: selectedCategory == category,
             onTap: () => onCategory(category),
           ),
@@ -1086,20 +1225,83 @@ class _LibrarySidebar extends StatelessWidget {
     BuildContext context, {
     required IconData icon,
     required String title,
+    required int count,
     required bool selected,
     required VoidCallback onTap,
   }) {
-    return ListTile(
-      dense: true,
-      selected: selected,
-      leading: Icon(icon, size: 20),
-      title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
-      contentPadding: const EdgeInsets.symmetric(horizontal: 12),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-      onTap: () {
-        onTap();
-        if (closeOnSelect) Scaffold.of(context).closeDrawer();
-      },
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Material(
+        color: selected
+            ? colorScheme.primaryContainer.withValues(alpha: 0.55)
+            : Colors.transparent,
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: () {
+            onTap();
+            if (closeOnSelect) Scaffold.of(context).closeDrawer();
+          },
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: selected
+                ? BoxDecoration(
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                        color: colorScheme.primary.withValues(alpha: 0.4)),
+                  )
+                : null,
+            child: Row(
+              children: <Widget>[
+                Icon(
+                  icon,
+                  size: 20,
+                  color: selected
+                      ? colorScheme.primary
+                      : colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                      color: selected
+                          ? colorScheme.primary
+                          : colorScheme.onSurface,
+                    ),
+                  ),
+                ),
+                if (count > 0)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 8, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: selected
+                          ? colorScheme.primary.withValues(alpha: 0.15)
+                          : colorScheme.surfaceContainerHighest
+                              .withValues(alpha: 0.6),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      '$count',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                        color: selected
+                            ? colorScheme.primary
+                            : colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

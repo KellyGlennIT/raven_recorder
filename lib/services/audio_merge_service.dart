@@ -1,13 +1,27 @@
 import 'dart:io';
 
-import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
+import 'package:flutter/foundation.dart';
 
 import '../models/raven_project.dart';
 
 /// Builds one user-facing master audio file from a project's ordered source
 /// sessions. Originals are deliberately retained as recovery sources.
+///
+/// The `ffmpeg_kit_flutter_new_audio` package is excluded from Android builds
+/// (`platform_plugins: false` in pubspec) because it is desktop-only and would
+/// otherwise add large unused native libraries to the APK. Its types are loaded
+/// dynamically so that simply referencing this service never forces the plugin
+/// into the Android binary. On Android the merge is skipped and playback
+/// falls back to the continuous session playlist, which is equivalent to the
+/// README's documented master-failure path.
 class AudioMergeService {
+  /// FFmpeg is only bundled on desktop targets in this project.
+  static bool get isSupported =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.windows ||
+          defaultTargetPlatform == TargetPlatform.macOS ||
+          defaultTargetPlatform == TargetPlatform.linux);
+
   Future<File> mergeProject({
     required List<RavenAudioSession> sessions,
     required Directory outputDirectory,
@@ -35,6 +49,10 @@ class AudioMergeService {
       'mp3' => 'mp3',
       _ => 'm4a',
     };
+    if (!isSupported) {
+      throw UnsupportedError(
+          'Continuous master audio is created on desktop only. Sessions are played as one timeline on this device.');
+    }
     final output = File('${outputDirectory.path}/$projectId.master.$extension');
     final pending =
         File('${outputDirectory.path}/$projectId.master.pending.$extension');
@@ -61,12 +79,12 @@ class AudioMergeService {
           '${normalized.join(';')};${labels}concat=n=${sessions.length}:v=0:a=1[outa]';
       final command =
           '-hide_banner -nostdin -y $inputs -filter_complex ${_quote(filter)} -map ${_quote('[outa]')} -vn -ar $rate -ac 1 $codecArgs ${_quote(pending.path)}';
-      final session = await FFmpegKit.execute(command);
-      final code = await session.getReturnCode();
-      if (!ReturnCode.isSuccess(code)) {
-        final logs = await session.getOutput();
+      final ffmpegSession = await _ffmpeg.execute(command);
+      final code = await _ffmpeg.returnCode(ffmpegSession);
+      if (!_ffmpeg.isSuccess(code)) {
+        final logs = await _ffmpeg.output(ffmpegSession);
         throw StateError(
-            'Audio merge failed (code ${code?.getValue() ?? 'unknown'}). ${_trimLog(logs ?? '')}');
+            'Audio merge failed (code ${_ffmpeg.codeValue(code) ?? 'unknown'}). ${_trimLog(logs ?? '')}');
       }
       if (!await pending.exists() || await pending.length() < 64) {
         throw StateError(
@@ -120,6 +138,9 @@ class AudioMergeService {
     }
   }
 
+  _FfmpegBridge get _ffmpeg => _ffmpegBridge ??= _FfmpegBridge();
+  _FfmpegBridge? _ffmpegBridge;
+
   String _quote(String path) {
     final portable = path.replaceAll('\\', '/');
     return "'${portable.replaceAll("'", "'\\''")}'";
@@ -133,3 +154,57 @@ class AudioMergeService {
         : '${clean.substring(clean.length - 220)}…';
   }
 }
+
+/// Lazily resolved handle to the desktop-only FFmpeg plugin.
+///
+/// The plugin types are bound at runtime so Android does not need the native
+/// package to be present. If a build includes this file without the plugin
+/// (e.g. a platform without a packaged FFmpeg binary), the call fails with a
+/// clear [UnsupportedError] instead of a missing-method crash.
+class _FfmpegBridge {
+  static const String _package = 'package:ffmpeg_kit_flutter_new_audio';
+
+  Future<Object> _load<T>() async {
+    try {
+      return await _loader.load<T>(_package);
+    } catch (error) {
+      throw UnsupportedError(
+          'Continuous audio merging is not available on this platform ($error).');
+    }
+  }
+
+  Future<Object> execute(String command) async {
+    final kit = await _load<Object>();
+    return (kit as dynamic).execute(command) as Future<Object>;
+  }
+
+  Future<Object?> returnCode(Object session) async =>
+      await (session as dynamic).getReturnCode() as Object?;
+
+  Future<String?> output(Object session) async =>
+      await (session as dynamic).getOutput() as String?;
+
+  bool isSuccess(Object? code) => code != null && (code as dynamic).isValueSuccess() as bool;
+
+  int? codeValue(Object? code) => code == null ? null : (code as dynamic).getValue() as int;
+
+  static const _loader = _DynamicLoader();
+}
+
+/// Minimal wrapper so the plugin import stays out of the app's static graph.
+class _DynamicLoader {
+  const _DynamicLoader();
+
+  Future<Object> load<T>(String package) {
+    // The plugin registers its own types; Dart cannot import it lazily, so the
+    // desktop build wires the concrete implementation through this hook.
+    final factory = ffmpegBridgeFactory;
+    if (factory == null) {
+      throw UnsupportedError('No FFmpeg bridge registered for this build.');
+    }
+    return Future<Object>.value(factory());
+  }
+}
+
+/// Set by `main.dart` on desktop builds to bind the FFmpeg plugin.
+Object Function()? ffmpegBridgeFactory;

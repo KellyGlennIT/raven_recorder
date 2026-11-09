@@ -30,7 +30,6 @@ required = [
     "lib/main.dart",
     "lib/models/raven_project.dart",
     "lib/services/project_repository.dart",
-    "lib/services/scheduled_recording_service.dart",
     "lib/services/audio_encryption_service.dart",
     "lib/services/audio_timeline.dart",
     "lib/services/app_lock_service.dart",
@@ -45,8 +44,6 @@ required = [
     "lib/screens/library_screen.dart",
     "lib/screens/player_screen.dart",
     "lib/screens/settings_screen.dart",
-    "lib/screens/scheduled_recordings_screen.dart",
-    "android/app/src/main/kotlin/com/raven/raven/ScheduledRecordingReceiver.kt",
     "assets/images/raven_logo.png",
     "README.md",
     "ARCHITECTURE_REVIEW.md",
@@ -58,13 +55,17 @@ for relative in required:
 
 manifest = (ROOT / "android/app/src/main/AndroidManifest.xml").read_text(encoding="utf-8")
 for required_manifest_entry in [
-    "android.permission.SCHEDULE_EXACT_ALARM",
     "android.permission.POST_NOTIFICATIONS",
-    ".ScheduledRecordingReceiver",
-    ".ScheduledRecordingBootReceiver",
 ]:
     if required_manifest_entry not in manifest:
         errors.append(f"Android manifest is missing: {required_manifest_entry}")
+for removed_schedule_entry in [
+    "android.permission.SCHEDULE_EXACT_ALARM",
+    ".ScheduledRecordingReceiver",
+    ".ScheduledRecordingBootReceiver",
+]:
+    if removed_schedule_entry in manifest:
+        errors.append(f"Scheduled recording is still configured: {removed_schedule_entry}")
 
 if errors:
     print("RAVEN structural check FAILED:")

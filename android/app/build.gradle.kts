@@ -27,6 +27,13 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // Android ships arm64 (and 32-bit arm for older devices) only. Dropping
+        // desktop/emulator ABIs keeps the APK smaller; add one back only if you
+        // need to run on an x86 emulator.
+        ndk {
+            abiFilters.clear()
+            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
+        }
     }
 
     buildTypes {
@@ -34,7 +41,36 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // Strip unused resources and shrink code in release builds.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
+    }
+
+    packaging {
+        // Only keep the resource-language defaults RAVEN actually uses.
+        resources {
+            excludes += listOf(
+                "META-INF/*.kotlin_module",
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*"
+            )
+        }
+    }
+}
+
+// FFmpeg (ffmpeg_kit_flutter_new_audio) is used only to build continuous master
+// audio, which is a desktop feature. Excluding it from the Android variant keeps
+// roughly 20–30 MB of native libraries (arm64/armv7/x86_64) out of the APK.
+// The Dart side already skips merging on Android (see AudioMergeService).
+configurations.configureEach {
+    if (name.startsWith("implementation") || name.startsWith("api")) {
+        exclude(group = "com.antonkarpenko", module = "ffmpeg-kit-audio")
     }
 }
 

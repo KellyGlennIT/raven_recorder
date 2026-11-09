@@ -11,7 +11,6 @@ class SettingsScreen extends StatelessWidget {
     required this.preferences,
     required this.onSettingsChanged,
     required this.onShowTour,
-    required this.onOpenScheduledRecordings,
     required this.onApplyPublicVisibility,
     required this.onTrashRetentionChanged,
     super.key,
@@ -20,7 +19,6 @@ class SettingsScreen extends StatelessWidget {
   final AppPreferences preferences;
   final VoidCallback onSettingsChanged;
   final VoidCallback onShowTour;
-  final VoidCallback onOpenScheduledRecordings;
   final Future<void> Function({required bool visible}) onApplyPublicVisibility;
   final VoidCallback onTrashRetentionChanged;
 
@@ -132,23 +130,6 @@ class SettingsScreen extends StatelessWidget {
                           ),
                         ),
                       ],
-                    ),
-                  ),
-                  const SizedBox(height: 24),
-                  _SectionHeading(
-                      title: tr(preferences, 'Recording schedule',
-                          'Programmation des enregistrements')),
-                  Card(
-                    child: ListTile(
-                      leading: const Icon(Icons.event_available_rounded),
-                      title: Text(tr(preferences, 'Scheduled recordings',
-                          'Enregistrements programmés')),
-                      subtitle: Text(tr(
-                          preferences,
-                          'Choose a date and time for a recording.',
-                          'Choisissez une date et une heure pour un enregistrement.')),
-                      trailing: const Icon(Icons.chevron_right_rounded),
-                      onTap: onOpenScheduledRecordings,
                     ),
                   ),
                   const SizedBox(height: 24),
@@ -339,8 +320,8 @@ class SettingsScreen extends StatelessWidget {
                               'Chiffrement audio')),
                           subtitle: Text(tr(
                               preferences,
-                              'Open a project and tap the lock icon to encrypt its audio files with AES-256-GCM. The key is device-bound secure storage, not a user password; keep backups and do not clear app data while encrypted files matter.',
-                              'Ouvrez un projet et touchez le cadenas pour chiffrer ses fichiers audio avec AES-256-GCM. La clé dépend du stockage sécurisé de l’appareil, pas d’un mot de passe utilisateur ; gardez des sauvegardes et ne videz pas les données de l’application tant que les fichiers chiffrés sont importants.')),
+                              'Use a recording’s three-dot menu → Lock audio with a password. The password is not stored; forgetting it means the audio cannot be recovered. This is separate from the RAVEN app PIN.',
+                              'Utilisez le menu à trois points d’un enregistrement → Verrouiller l’audio avec un mot de passe. Le mot de passe n’est pas enregistré ; si vous l’oubliez, l’audio ne pourra pas être récupéré. Cette protection est indépendante du code PIN de RAVEN.')),
                         ),
                         const Divider(height: 1),
                         SwitchListTile.adaptive(

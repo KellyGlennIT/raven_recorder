@@ -6,7 +6,7 @@ class RecordingNotificationService {
   static const MethodChannel _channel =
       MethodChannel('raven/recording_controls');
   static const MethodChannel _permissionChannel =
-      MethodChannel('raven/scheduled_recording');
+      MethodChannel('raven/recording_permissions');
 
   static void setActionHandler(Future<void> Function(String action)? handler) {
     if (!Platform.isAndroid) return;

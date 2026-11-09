@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:cryptography/cryptography.dart';
 import 'package:path/path.dart' as p;
 
 import '../models/raven_project.dart';
@@ -16,8 +17,11 @@ class AudioProtectionService {
   final ProjectRepository _repository;
   final AudioEncryptionService _encryption;
 
-  Future<RavenProject> encrypt(RavenProject project) async {
+  Future<RavenProject> encrypt(RavenProject project, String password) async {
     if (project.isAudioProtected) return project;
+    if (password.length < 8) {
+      throw ArgumentError('Audio passwords must be at least 8 characters.');
+    }
     if (project.publicCopyLocation != null) {
       throw StateError(
         'Remove the public copy before encrypting this recording.',
@@ -28,6 +32,8 @@ class AudioProtectionService {
     }
 
     final encryptedPaths = <String, String>{};
+    final salt = _encryption.createProtectionSalt();
+    final key = await _encryption.derivePasswordKey(password, salt);
     try {
       for (final session in project.sessions) {
         if (session.audioPath.endsWith('.ravenenc')) {
@@ -40,12 +46,14 @@ class AudioProtectionService {
               'A recording audio file is missing.', source.path);
         }
         final destination = File('${source.path}.ravenenc');
-        await _encryption.encryptFile(input: source, output: destination);
+        await _encryption.encryptFile(
+            input: source, output: destination, key: key);
         encryptedPaths[session.id] = destination.path;
       }
 
       final protected = project.copyWith(
         isAudioProtected: true,
+        audioProtectionSalt: salt,
         sessions: project.sessions
             .map((session) =>
                 session.copyWith(audioPath: encryptedPaths[session.id]!))
@@ -76,8 +84,22 @@ class AudioProtectionService {
     }
   }
 
-  Future<RavenProject> decrypt(RavenProject project) async {
+  Future<RavenProject> decrypt(
+    RavenProject project, {
+    String? password,
+    SecretKey? key,
+  }) async {
     if (!project.isAudioProtected) return project;
+    final salt = project.audioProtectionSalt;
+    final decryptionKey = salt == null
+        ? null
+        : key ??
+            await _encryption.derivePasswordKey(
+              password ??
+                  (throw ArgumentError(
+                      'The audio password is required to unlock this recording.')),
+              salt,
+            );
     final restoredPaths = <String, String>{};
     try {
       for (final session in project.sessions) {
@@ -99,12 +121,14 @@ class AudioProtectionService {
               'A file already exists at the decrypted audio path.',
               restored.path);
         }
-        await _encryption.decryptFile(input: source, output: restored);
+        await _encryption.decryptFile(
+            input: source, output: restored, key: decryptionKey);
         restoredPaths[session.id] = restored.path;
       }
 
       final unprotected = project.copyWith(
         isAudioProtected: false,
+        clearAudioProtectionSalt: true,
         sessions: project.sessions
             .map((session) =>
                 session.copyWith(audioPath: restoredPaths[session.id]!))

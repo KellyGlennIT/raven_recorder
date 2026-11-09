@@ -1,4 +1,6 @@
-# RAVEN build status — scheduled recording review
+# RAVEN build status — historical review
+
+> This file records an earlier review snapshot. Scheduled recording was subsequently removed from the Flutter app and Android manifest; see the current feature list in `README.md`.
 
 ## Changes in this review build
 

@@ -1,28 +1,11 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:raven/models/raven_project.dart';
-import 'package:raven/services/scheduled_recording_service.dart';
 import 'package:raven/services/app_preferences.dart';
 import 'package:raven/services/project_repository.dart';
 
 void main() {
   test('recording format options include MP3 export', () {
     expect(AppPreferences.supportedRecordingFormats, contains('mp3'));
-  });
-
-  group('ScheduledRecording persistence model', () {
-    test('serializes and restores the requested local date and title', () {
-      final schedule = ScheduledRecording(
-        id: 'schedule-1',
-        title: 'Morning voice note',
-        scheduledAt: DateTime(2026, 11, 3, 7, 15),
-      );
-      final restored = ScheduledRecording.fromJson(
-        Map<String, Object?>.from(schedule.toJson()),
-      );
-      expect(restored.id, schedule.id);
-      expect(restored.title, schedule.title);
-      expect(restored.scheduledAt, schedule.scheduledAt);
-    });
   });
 
   group('RavenProject persistence model', () {
@@ -43,6 +26,7 @@ void main() {
             createdAt: createdAt,
             durationMs: 42000,
             format: 'm4a',
+            name: 'Sermon idea · Session 1',
           ),
         ],
         notes: 'Keep the opening exactly as recorded.',
@@ -62,12 +46,25 @@ void main() {
       expect(restored.sessions.single.id, project.sessions.single.id);
       expect(restored.sessions.single.audioPath,
           project.sessions.single.audioPath);
+      expect(restored.sessions.single.name, project.sessions.single.name);
       expect(restored.durationMs, 42000);
       expect(restored.notes, project.notes);
       expect(restored.tags, project.tags);
       expect(restored.masterAudioPath, project.masterAudioPath);
       expect(restored.latestAudioPath, project.masterAudioPath);
       expect(restored.publicCopyLocation, project.publicCopyLocation);
+    });
+
+    test('reads older sessions without a display name', () {
+      final restored = RavenAudioSession.fromJson(<String, Object?>{
+        'id': 'legacy-session',
+        'audioPath': '/private/legacy.m4a',
+        'createdAt': DateTime.utc(2026, 10, 28).toIso8601String(),
+        'durationMs': 1000,
+        'format': 'm4a',
+      });
+
+      expect(restored.name, isEmpty);
     });
 
     test('persists timeline bookmarks and new optional metadata', () {
@@ -95,6 +92,7 @@ void main() {
           ),
         ],
         isAudioProtected: true,
+        audioProtectionSalt: 'c2FsdC1mb3ItdGVzdA==',
         aiGeneratedContent: const <String, String>{
           'summary': 'Separate generated summary'
         },
@@ -104,6 +102,7 @@ void main() {
       expect(restored.bookmarks.single.positionMs, 15500);
       expect(restored.bookmarks.single.sessionId, 'session-1');
       expect(restored.isAudioProtected, isTrue);
+      expect(restored.audioProtectionSalt, 'c2FsdC1mb3ItdGVzdA==');
       expect(
           restored.aiGeneratedContent['summary'], 'Separate generated summary');
     });

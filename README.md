@@ -21,14 +21,13 @@ RAVEN is a Flutter-first audio workspace for recording, organising, reviewing an
 - M4A/AAC, MP3, WAV and FLAC format choices (actual encoder support depends on the target platform/plugin; MP3 encoding uses the FFmpeg `libmp3lame` encoder).
 - Adjustable sample rate and bitrate plus optional platform voice processing requests.
 - Project library with search, rename, favourites, Trash/restore and permanent delete. Renaming changes the title stored against the stable project ID; it does not move or rename audio/session files, notes, bookmarks or the continuous master.
-- Audio playback, seeking across a single continuous project timeline, playback-speed control, editable project notes, timeline bookmarks and PDF notes output. Continued recordings are automatically merged into a single master file after Stop, while original segments remain internally available for recovery. Playback uses the master when valid and falls back to the combined timeline if merging fails. Player export and Library import move portable project bundles, including source audio and attachments; imports get a new stable project ID and are kept private.
+- Audio playback, seeking across a single continuous project timeline, playback-speed control, editable project notes, timeline bookmarks and plain-text `.txt` notes sharing. Project sessions remain individually playable, shareable, renameable and manageable from their own action menus. Continued recordings are automatically merged into a single master file after Stop, while original segments remain available for recovery. Library import accepts supported audio files (M4A, MP3, WAV and FLAC) as resumable standalone recordings, as well as portable RAVEN project bundles.
 - English/French UI strings and a first-run guided tour with explanations of recording, library, settings and privacy. The tour can be replayed from Settings.
 - Secure-storage vault and provider REST clients for OpenRouter, OpenAI API and Gemini API; users can configure models, test connections and manage keys. Notes AI actions require confirmation and never send audio in the current implementation.
 - Optional app-wide PIN gate stored using platform secure storage with a salted PBKDF2-HMAC-SHA256 verifier. Individual recordings can require the same RAVEN PIN before opening. This is an app-access lock, not file encryption. Per-recording public-copy control can create/remove a managed copy in Android Music/RAVEN (Android 10+) or Windows Downloads/RAVEN while preserving the private original.
 - Recovery-aware JSON project index and category manifests. At startup, RAVEN also makes a best-effort cleanup of abandoned plaintext playback caches left after an interrupted process.
 - **Interrupted-recording recovery:** if a process is force-killed mid-recording, the session is kept as a draft. Draft sessions appear in the Library as "Interrupted draft — review audio"; opening one repairs the WAV header of a partial PCM16 recording (recomputing RIFF/data sizes) and lets the user save or discard it. Drafts are excluded from playback shortcuts, export and continue-recording flows until recovered.
 - Direct sharing of a recording via the platform share sheet. Encrypted recordings are decrypted to temporary files for sharing and those temporaries are removed afterwards; the master file is shared when valid, otherwise sessions are shared.
-- One-off scheduled recordings in Settings: choose a date/time and optional recording title, view/cancel scheduled items, and automatically start when RAVEN is active at the due time. On Android, when RAVEN is not active, a silent but visible notification is posted; tapping it opens RAVEN and starts the scheduled recording within a 15-minute grace window. This is notification-assisted, not covert background recording.
 
 ## Architecture and data model
 
@@ -38,7 +37,7 @@ RAVEN is a Flutter-first audio workspace for recording, organising, reviewing an
 - `lib/models/raven_project.dart` — serializable project, audio-session and timeline-bookmark models.
 - `lib/screens/` — UI only: Home, Recorder, Library, Player and Settings.
 - `lib/services/project_repository.dart` — filesystem persistence, project index, backup/recovery and category manifests.
-- `lib/services/audio_encryption_service.dart` — experimental authenticated AES-GCM file encryption exposed in Player; memory-heavy and not production-safe for large recordings.
+- `lib/services/audio_encryption_service.dart` — authenticated AES-GCM encryption with a per-recording password-derived key and PBKDF2; the password is never persisted.
 - `lib/services/audio_protection_service.dart` — project-level encrypt/decrypt orchestration, including removal of the master file on encryption and refusal to encrypt while a public copy exists.
 - `lib/services/audio_share_service.dart` — platform share-sheet export of a recording (master preferred, session fallback) with temporary decryption of protected sources.
 - `lib/services/wav_recovery_service.dart` — PCM16 WAV header repair for recordings interrupted by process death.
@@ -46,15 +45,11 @@ RAVEN is a Flutter-first audio workspace for recording, organising, reviewing an
 - `android/app/src/main/kotlin/com/raven/raven/RecordingForegroundService.kt` — microphone-type foreground service keeping an active recording alive with a visible, actionable notification.
 - `lib/services/ai_key_vault.dart` — OS secure-storage access for user-provided credentials.
 - `lib/services/app_preferences.dart` — non-secret preferences (language, theme, quality options, app-lock toggle and tour completion).
-- `lib/services/scheduled_recording_service.dart` — persistent one-off schedules, due-time checks and the Android method-channel bridge.
-- `lib/screens/scheduled_recordings_screen.dart` — schedule creation, date/time picker, upcoming schedules and cancellation.
-- `android/app/src/main/kotlin/com/raven/raven/ScheduledRecordingReceiver.kt` — exact-alarm receiver that posts a silent, visible reminder; it does not itself activate the microphone.
 - `lib/services/app_lock_service.dart` — PIN verifier derivation and verification using secure storage; no plaintext PIN is persisted.
 - `lib/services/category_service.dart` — category listing, safe renaming and category reassignment/deletion without touching audio directories.
 - `lib/services/attachment_service.dart` — sanitized attachment picking, project attachment listing and deletion.
 - `lib/services/project_archive_service.dart` — safe ZIP bundle export/import with path-traversal guards, staged extraction and ID remapping.
 - `lib/services/audio_visibility_service.dart` — optional public-copy publishing to Android MediaStore or Windows Downloads with verify/cleanup.
-- `lib/services/notes_pdf_service.dart` — PDF generation/print/share.
 - `lib/services/audio_timeline.dart` — deterministic mapping between internal sessions and the single user-facing playback timeline.
 - `lib/services/audio_merge_service.dart` — FFmpeg-backed, validated master-audio creation from retained source sessions.
 - `lib/services/ai_provider_service.dart` — opt-in REST integration for OpenRouter, OpenAI API, and Gemini API, with bounded prompts, timeouts, and provider error handling.
@@ -91,11 +86,11 @@ On Android, this app-support directory is private to the app sandbox and is not 
 
 RAVEN stores recordings under the application-support directory by default. On Android, this is app-private storage and recordings normally do not appear in public music folders or a general file manager. This is different from encrypting a file: app-private storage limits ordinary access by other apps, while the app PIN gate prevents someone casually opening RAVEN on an already-unlocked device.
 
-- Enable **Lock RAVEN with a PIN** in Settings and choose 6–12 digits. The PIN is not stored in plaintext; RAVEN stores a random salt and a PBKDF2-HMAC-SHA256 verifier in platform secure storage.
+- Enable **Lock RAVEN with a PIN** in Settings and choose 4–12 digits. The PIN is not stored in plaintext; RAVEN stores a random salt and a PBKDF2-HMAC-SHA256 verifier in platform secure storage.
 - Individual projects can require that PIN before opening. Existing projects remain compatible because the field defaults to false when absent from older project JSON.
 - The app lock is not a substitute for the phone/computer account lock, and it does not encrypt audio files against someone with filesystem/debug access or a compromised device.
 - Turning off the app-wide lock keeps the verifier in secure storage so recordings individually locked with the PIN do not become inaccessible. If the PIN is forgotten, there is no automatic recovery flow yet; keep a backup of important recordings.
-- The Player screen currently exposes an **experimental AES-GCM audio-encryption action**. It reads whole files into memory and may consume several times the file size while transforming the data; playback also decrypts protected sources into app-temporary plaintext files. This is not production-grade at-rest protection for long recordings. Do not use it on long/large or irreplaceable recordings until a streaming-safe format, temporary-file lifecycle, recovery and device testing are completed. The app PIN is an access barrier, not file encryption.
+- Use a recording's three-dot menu and select **Lock audio with a password** to encrypt just that recording; this is separate from the app PIN. RAVEN requests a password and confirmation, derives an AES-256-GCM key using PBKDF2, and does not store the password. The password cannot be reset: forgetting it makes the protected audio unrecoverable. Playback asks for the password and temporarily decrypts audio into app storage. Encryption currently buffers whole files in memory, so very large recordings may use substantial RAM; keep a separate backup and test with small files first.
 
 The Player screen includes a managed public-copy control for supported targets. “Show” creates a separate user-visible copy, while “Hide” removes the managed copy and leaves the private original in place. This is not encryption; users should not assume deleting a copy securely erases flash storage.
 
@@ -161,7 +156,7 @@ If a dependency does not support the selected platform/version, record the exact
 
 ## Android setup notes
 
-The Android app scaffold and plugin configuration are in `android/`. Scheduled recording requires notification permission and, where Android requests it, Alarms & reminders access. Android restricts starting microphone capture from a background alarm; RAVEN therefore starts automatically only while its UI is already active, and otherwise requires the user to tap the scheduled notification. The notification itself is silent but visible. Test this flow on physical devices across Android versions, including screen lock, app force-stop, battery restrictions, denied notifications, denied exact alarms, reboot restoration, and calls/notifications. Alarms cannot override the operating system’s force-stop behavior.
+The Android app scaffold and plugin configuration are in `android/`. Recording notifications require notification permission on Android versions that request it. Android also requires the microphone foreground-service type for continuing a recording while RAVEN is backgrounded.
 
 ## Recording notifications on Android
 
@@ -176,10 +171,10 @@ While a recording is active, a microphone-type foreground service shows a visibl
 5. Android app records, pauses, resumes, saves, and recovers correctly on a real device.
 6. Rename/favourite/category/trash/restore do not break session paths.
 7. Encrypt/decrypt a small test file, compare the restored bytes with the original, reject a modified ciphertext, and test failure/restart scenarios before using important recordings.
-8. Check notes PDF, French UI, first-run tour and tour replay.
+8. Check editable `.txt` notes sharing, French UI, first-run tour and tour replay.
 9. Test long recordings, low storage, denied permissions, missing files, interrupted writes and app process termination; confirm the interrupted draft appears in the Library, its WAV header is repaired on open, and it can be saved or discarded.
 10. Test project bundle export/import with long audio, attachments, special characters, missing source files and interrupted import; verify the imported project receives a new ID and stays private.
 
 ## Scope still to finish
 
-This codebase does not yet constitute the entire planned RAVEN product. Remaining larger features include backup hardening, advanced audio editing/noise removal, transcription and AI processing of audio, additional platform-specific public-copy support, streaming-safe encryption, and end-to-end recovery verification on every platform. Interrupted-recording draft recovery is wired end to end but still needs device verification across Android versions and storage conditions. Portable project export/import is now wired into the Player/Library UI but requires round-trip testing with real archives and large attachments. Scheduled recording and the Android notification bridge are in source but still require Flutter analysis, tests, Android compilation and real-device verification before release. The Flutter/Dart toolchain was unavailable in the preparation environment, so compiler/device checks are not claimed as passed.
+This codebase does not yet constitute the entire planned RAVEN product. Remaining larger features include backup hardening, advanced audio editing/noise removal, transcription and AI processing of audio, additional platform-specific public-copy support, streaming-safe encryption, and end-to-end recovery verification on every platform. Interrupted-recording draft recovery is wired end to end but still needs device verification across Android versions and storage conditions. Portable project export/import is wired into the Player/Library UI but requires round-trip testing with real archives, imported audio and large attachments.

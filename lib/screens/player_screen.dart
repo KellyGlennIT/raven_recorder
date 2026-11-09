@@ -1,8 +1,10 @@
+import 'dart:convert';
 import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:cryptography/cryptography.dart';
 import 'package:intl/intl.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
@@ -13,7 +15,6 @@ import '../services/app_preferences.dart';
 import '../services/attachment_service.dart';
 import '../services/project_archive_service.dart';
 import '../services/audio_encryption_service.dart';
-import '../services/notes_pdf_service.dart';
 import '../services/audio_timeline.dart';
 import '../services/project_repository.dart';
 import '../services/ai_provider_service.dart';
@@ -22,6 +23,7 @@ import '../services/audio_merge_service.dart';
 import '../services/audio_visibility_service.dart';
 import '../services/audio_share_service.dart';
 import '../services/audio_protection_service.dart';
+import '../widgets/audio_password_dialog.dart';
 import 'recorder_screen.dart';
 
 class PlayerScreen extends StatefulWidget {
@@ -50,6 +52,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   late RavenProject _project;
   bool _loading = true;
   bool _savingNotes = false;
+  SecretKey? _audioKey;
   String? _error;
   String? _securityWarning;
 
@@ -66,6 +69,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.project.id != widget.project.id) {
       _project = widget.project;
+      _audioKey = null;
       _notesController.text = _project.notes;
       _loadSelectedSession();
     }
@@ -90,49 +94,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _toggleAudioEncryption() async {
     if (_loading) return;
     final enabling = !_project.isAudioProtected;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: Text(tr(
-          widget.preferences,
-          enabling ? 'Encrypt recording audio?' : 'Decrypt recording audio?',
-          enabling ? 'Chiffrer l’audio ?' : 'Déchiffrer l’audio ?',
-        )),
-        content: Text(tr(
-          widget.preferences,
-          enabling
-              ? 'RAVEN will encrypt this recording’s audio on this device. This is separate from the app PIN and does not require the app lock. Keep a project backup: encrypted audio depends on this device’s secure key.'
-              : 'RAVEN will decrypt this recording’s audio into this app’s private storage. This does not change the app PIN setting.',
-          enabling
-              ? 'RAVEN chiffrera l’audio de cet enregistrement sur cet appareil. Cette protection est indépendante du code PIN de l’application. Gardez une sauvegarde : le déchiffrement dépend de la clé sécurisée de cet appareil.'
-              : 'RAVEN déchiffrera l’audio de cet enregistrement dans le stockage privé de l’application. Cela ne modifie pas le code PIN de l’application.',
-        )),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: Text(tr(
-              widget.preferences,
-              enabling ? 'Encrypt audio' : 'Decrypt audio',
-              enabling ? 'Chiffrer' : 'Déchiffrer',
-            )),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
+    String? password;
+    SecretKey? key;
+    if (enabling) {
+      password = await showAudioPasswordDialog(
+        context,
+        preferences: widget.preferences,
+        createPassword: true,
+      );
+      if (password == null || !mounted) return;
+    } else if (_project.audioProtectionSalt != null) {
+      key = await _requestAudioKey();
+      if (key == null || !mounted) return;
+    }
+
     setState(() => _loading = true);
     try {
       await _player.stop();
       final service = AudioProtectionService(repository: widget.repository);
       final updated = enabling
-          ? await service.encrypt(_project)
-          : await service.decrypt(_project);
+          ? await service.encrypt(_project, password!)
+          : await service.decrypt(_project, key: key);
+      if (enabling) {
+        key = await _encryption.derivePasswordKey(
+            password!, updated.audioProtectionSalt!);
+      }
       if (!mounted) return;
-      setState(() => _project = updated);
+      setState(() {
+        _project = updated;
+        _audioKey = enabling ? key : null;
+      });
       widget.onProjectChanged(updated);
       await _loadSelectedSession();
       if (!mounted) return;
@@ -140,11 +131,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
         content: Text(tr(
           widget.preferences,
           enabling
-              ? 'Recording audio encrypted. The app PIN was not changed.'
-              : 'Recording audio decrypted. The app PIN was not changed.',
+              ? 'Audio locked with your password. RAVEN did not store it.'
+              : 'Audio unlocked. The app PIN was not changed.',
           enabling
-              ? 'Audio chiffré. Le code PIN de l’application est inchangé.'
-              : 'Audio déchiffré. Le code PIN de l’application est inchangé.',
+              ? 'Audio verrouillé avec votre mot de passe. RAVEN ne l’a pas enregistré.'
+              : 'Audio déverrouillé. Le code PIN de l’application est inchangé.',
         )),
       ));
     } catch (error) {
@@ -156,6 +147,44 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } finally {
       if (mounted) setState(() => _loading = false);
     }
+  }
+
+  Future<SecretKey?> _requestAudioKey() async {
+    final existingKey = _audioKey;
+    if (existingKey != null) return existingKey;
+    final salt = _project.audioProtectionSalt;
+    if (salt == null) return null;
+    while (mounted) {
+      final password = await showAudioPasswordDialog(
+        context,
+        preferences: widget.preferences,
+        createPassword: false,
+      );
+      if (password == null || !mounted) return null;
+      final key = await _encryption.derivePasswordKey(password, salt);
+      final session = _project.sessions.first;
+      final source = File(session.audioPath);
+      final directory = await getTemporaryDirectory();
+      final temporary = File(
+          '${directory.path}/raven-password-check-${_project.id}-${session.id}.${session.format}');
+      try {
+        await _encryption.decryptFile(
+            input: source, output: temporary, key: key);
+        return key;
+      } on AudioPasswordException {
+        if (!mounted) return null;
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(tr(
+            widget.preferences,
+            'That audio password is incorrect. Try again.',
+            'Mot de passe incorrect. Réessayez.',
+          )),
+        ));
+      } finally {
+        if (await temporary.exists()) await temporary.delete();
+      }
+    }
+    return null;
   }
 
   int _globalPositionMs(int? index, Duration localPosition) =>
@@ -191,6 +220,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
             'This project has no audio session yet.',
             'Ce projet ne contient pas encore de session audio.');
         return false;
+      }
+
+      if (_project.isAudioProtected && _project.audioProtectionSalt != null) {
+        _audioKey ??= await _requestAudioKey();
+        if (_audioKey == null) {
+          _error = tr(
+            widget.preferences,
+            'Enter the audio password to play this recording.',
+            'Saisissez le mot de passe audio pour lire cet enregistrement.',
+          );
+          return false;
+        }
       }
 
       final cache = await getTemporaryDirectory();
@@ -261,7 +302,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
             final temp = File(
                 '${cache.path}/raven-playback-${_project.id}-${session.id}.$extension');
             if (await temp.exists()) await temp.delete();
-            await _encryption.decryptFile(input: source, output: temp);
+            await _encryption.decryptFile(
+                input: source, output: temp, key: _audioKey);
             _temporaryDecryptedPaths.add(temp.path);
             playbackPath = temp.path;
           }
@@ -320,119 +362,267 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  /// Opens the attachments manager. Attachments live in their own expandable
+  /// panel on the project screen; this sheet adds full multi-select support so
+  /// several files can be selected, shared or removed at once.
   Future<void> _manageAttachments() async {
     final service = AttachmentService(widget.repository);
     final messenger = ScaffoldMessenger.of(context);
     try {
-      await service.pickAndAttach(_project.id);
+      var files = await service.list(_project.id);
       if (!mounted) return;
-      final files = await service.list(_project.id);
-      if (!mounted) return;
+      var selection = <String>{};
+      var selecting = false;
+
+      Future<void> reload(StateSetter refresh) async {
+        files = await service.list(_project.id);
+        selection.retainWhere((path) => files.any((file) => file.path == path));
+        if (selection.isEmpty) selecting = false;
+        refresh(() {});
+      }
+
+      Future<void> removeSelected(StateSetter refresh) async {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text(tr(widget.preferences, 'Remove attachments?',
+                'Supprimer les pièces jointes ?')),
+            content: Text(tr(
+                widget.preferences,
+                '${selection.length} attachment(s) will be permanently removed from this project.',
+                '${selection.length} pièce(s) jointe(s) seront définitivement supprimées de ce projet.')),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: Text(tr(widget.preferences, 'Remove', 'Supprimer')),
+              ),
+            ],
+          ),
+        );
+        if (confirmed != true || !mounted) return;
+        for (final file in List<File>.from(files)) {
+          if (selection.contains(file.path)) await service.remove(file);
+        }
+        selection.clear();
+        selecting = false;
+        await reload(refresh);
+        if (!mounted) return;
+        messenger.showSnackBar(SnackBar(
+            content: Text(tr(widget.preferences, 'Attachments removed',
+                'Pièces jointes supprimées'))));
+      }
+
+      Future<void> shareSelected() async {
+        final chosen = files.where((f) => selection.contains(f.path)).toList();
+        try {
+          await AudioShareService().shareFiles(chosen);
+        } catch (error) {
+          if (!mounted) return;
+          messenger.showSnackBar(SnackBar(
+            content: Text(
+                '${tr(widget.preferences, 'Could not share files', 'Impossible de partager les fichiers')}: $error'),
+          ));
+        }
+      }
+
       await showModalBottomSheet<void>(
         context: context,
         showDragHandle: true,
         isScrollControlled: true,
-        builder: (sheetContext) => SafeArea(
-          child: SizedBox(
-            height: MediaQuery.of(sheetContext).size.height * 0.65,
-            child: Column(
-              children: <Widget>[
-                Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(
-                      tr(widget.preferences, 'Project attachments',
-                          'Pièces jointes du projet'),
-                      style: Theme.of(sheetContext).textTheme.titleLarge),
-                ),
-                Expanded(
-                  child: files.isEmpty
-                      ? Center(
-                          child: Text(tr(
-                              widget.preferences,
-                              'No attachments yet. Use Add files to attach documents or images.',
-                              'Aucune pièce jointe. Utilisez Ajouter des fichiers pour joindre des documents ou des images.')))
-                      : ListView.builder(
-                          itemCount: files.length,
-                          itemBuilder: (context, index) => ListTile(
-                            leading: _isImageAttachment(files[index])
-                                ? ClipRRect(
-                                    borderRadius: BorderRadius.circular(8),
-                                    child: Image.file(
-                                      files[index],
-                                      width: 52,
-                                      height: 52,
-                                      fit: BoxFit.cover,
-                                      errorBuilder: (_, __, ___) => const Icon(
-                                          Icons.broken_image_outlined),
-                                    ),
-                                  )
-                                : const Icon(Icons.attach_file_rounded),
-                            title: Text(files[index].uri.pathSegments.last,
-                                maxLines: 1, overflow: TextOverflow.ellipsis),
-                            subtitle:
-                                Text(_formatBytes(files[index].lengthSync())),
-                            onTap: _isImageAttachment(files[index])
-                                ? () => _previewAttachment(
-                                    sheetContext, files[index])
-                                : null,
-                            trailing: PopupMenuButton<String>(
-                              tooltip: tr(widget.preferences, 'File actions',
-                                  'Actions du fichier'),
-                              onSelected: (action) async {
-                                if (action == 'share') {
-                                  try {
-                                    await AudioShareService()
-                                        .shareFile(files[index]);
-                                  } catch (error) {
-                                    if (!mounted) return;
-                                    messenger.showSnackBar(SnackBar(
-                                      content: Text(
-                                          '${tr(widget.preferences, 'Could not share file', 'Impossible de partager le fichier')}: $error'),
-                                    ));
-                                  }
-                                } else if (action == 'remove') {
-                                  await service.remove(files[index]);
-                                  if (sheetContext.mounted) {
-                                    Navigator.pop(sheetContext);
-                                  }
-                                  if (mounted) await _manageAttachments();
-                                }
-                              },
-                              itemBuilder: (context) =>
-                                  <PopupMenuEntry<String>>[
-                                PopupMenuItem<String>(
-                                  value: 'share',
-                                  child: Text(tr(widget.preferences,
-                                      'Share file', 'Partager le fichier')),
-                                ),
-                                PopupMenuItem<String>(
-                                  value: 'remove',
-                                  child: Text(tr(
-                                      widget.preferences,
-                                      'Remove attachment',
-                                      'Supprimer la pièce jointe')),
-                                ),
-                              ],
-                            ),
-                          ),
+        builder: (sheetContext) => StatefulBuilder(
+          builder: (sheetContext, refresh) => SafeArea(
+            child: SizedBox(
+              height: MediaQuery.of(sheetContext).size.height * 0.72,
+              child: Column(
+                children: <Widget>[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
+                    child: Row(
+                      children: <Widget>[
+                        Expanded(
+                          child: Text(
+                              tr(widget.preferences, 'Project attachments',
+                                  'Pièces jointes du projet'),
+                              style:
+                                  Theme.of(sheetContext).textTheme.titleLarge),
                         ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: FilledButton.icon(
-                    onPressed: () async {
-                      await service.pickAndAttach(_project.id);
-                      if (sheetContext.mounted) Navigator.pop(sheetContext);
-                      if (mounted) {
-                        await _manageAttachments();
-                      }
-                    },
-                    icon: const Icon(Icons.add_rounded),
-                    label: Text(tr(widget.preferences, 'Add files',
-                        'Ajouter des fichiers')),
+                        if (files.isNotEmpty)
+                          TextButton.icon(
+                            onPressed: () => refresh(() {
+                              if (!selecting) {
+                                selecting = true;
+                                selection = files.map((f) => f.path).toSet();
+                              } else {
+                                selecting = false;
+                                selection.clear();
+                              }
+                            }),
+                            icon: Icon(selecting
+                                ? Icons.deselect_rounded
+                                : Icons.select_all_rounded),
+                            label: Text(selecting
+                                ? tr(widget.preferences, 'Clear', 'Effacer')
+                                : tr(widget.preferences, 'Select all',
+                                    'Tout sélectionner')),
+                          ),
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                  if (selection.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Row(
+                        children: <Widget>[
+                          Text(tr(
+                              widget.preferences,
+                              '${selection.length} selected',
+                              '${selection.length} sélectionné(s)')),
+                          const Spacer(),
+                          IconButton(
+                            tooltip: tr(widget.preferences, 'Share selected',
+                                'Partager la sélection'),
+                            onPressed: shareSelected,
+                            icon: const Icon(Icons.share_rounded),
+                          ),
+                          IconButton(
+                            tooltip: tr(widget.preferences, 'Remove selected',
+                                'Supprimer la sélection'),
+                            onPressed: () => removeSelected(refresh),
+                            icon: Icon(Icons.delete_outline_rounded,
+                                color:
+                                    Theme.of(sheetContext).colorScheme.error),
+                          ),
+                        ],
+                      ),
+                    ),
+                  Expanded(
+                    child: files.isEmpty
+                        ? Center(
+                            child: Padding(
+                              padding: const EdgeInsets.all(24),
+                              child: Text(
+                                tr(
+                                    widget.preferences,
+                                    'No attachments yet. Use Add files to attach documents or images.',
+                                    'Aucune pièce jointe. Utilisez Ajouter des fichiers pour joindre des documents ou des images.'),
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                          )
+                        : ListView.builder(
+                            itemCount: files.length,
+                            itemBuilder: (context, index) {
+                              final file = files[index];
+                              final isSelected = selection.contains(file.path);
+                              return ListTile(
+                                leading: _isImageAttachment(file)
+                                    ? ClipRRect(
+                                        borderRadius: BorderRadius.circular(8),
+                                        child: Image.file(
+                                          file,
+                                          width: 52,
+                                          height: 52,
+                                          fit: BoxFit.cover,
+                                          errorBuilder: (_, __, ___) =>
+                                              const Icon(
+                                                  Icons.broken_image_outlined),
+                                        ),
+                                      )
+                                    : const Icon(Icons.attach_file_rounded),
+                                title: Text(file.uri.pathSegments.last,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis),
+                                subtitle: Text(_formatBytes(file.lengthSync())),
+                                selected: isSelected,
+                                onTap: () {
+                                  if (selecting) {
+                                    refresh(() {
+                                      if (isSelected) {
+                                        selection.remove(file.path);
+                                      } else {
+                                        selection.add(file.path);
+                                      }
+                                      if (selection.isEmpty) {
+                                        selecting = false;
+                                      }
+                                    });
+                                  } else if (_isImageAttachment(file)) {
+                                    _previewAttachment(sheetContext, file);
+                                  } else {
+                                    refresh(() {
+                                      selecting = true;
+                                      selection.add(file.path);
+                                    });
+                                  }
+                                },
+                                onLongPress: () => refresh(() {
+                                  selecting = true;
+                                  selection.add(file.path);
+                                }),
+                                trailing: isSelected
+                                    ? const Icon(Icons.check_circle_rounded)
+                                    : PopupMenuButton<String>(
+                                        tooltip: tr(
+                                            widget.preferences,
+                                            'File actions',
+                                            'Actions du fichier'),
+                                        onSelected: (action) async {
+                                          if (action == 'share') {
+                                            try {
+                                              await AudioShareService()
+                                                  .shareFile(file);
+                                            } catch (error) {
+                                              if (!mounted) return;
+                                              messenger.showSnackBar(SnackBar(
+                                                content: Text(
+                                                    '${tr(widget.preferences, 'Could not share file', 'Impossible de partager le fichier')}: $error'),
+                                              ));
+                                            }
+                                          } else if (action == 'remove') {
+                                            selection = {file.path};
+                                            await removeSelected(refresh);
+                                          }
+                                        },
+                                        itemBuilder: (context) =>
+                                            <PopupMenuEntry<String>>[
+                                          PopupMenuItem<String>(
+                                            value: 'share',
+                                            child: Text(tr(
+                                                widget.preferences,
+                                                'Share file',
+                                                'Partager le fichier')),
+                                          ),
+                                          PopupMenuItem<String>(
+                                            value: 'remove',
+                                            child: Text(tr(
+                                                widget.preferences,
+                                                'Remove attachment',
+                                                'Supprimer la pièce jointe')),
+                                          ),
+                                        ],
+                                      ),
+                              );
+                            },
+                          ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: FilledButton.icon(
+                      onPressed: () async {
+                        await service.pickAndAttach(_project.id);
+                        await reload(refresh);
+                      },
+                      icon: const Icon(Icons.add_rounded),
+                      label: Text(tr(widget.preferences, 'Add files',
+                          'Ajouter des fichiers')),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -542,7 +732,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _shareRecordingAudio() async {
     final messenger = ScaffoldMessenger.of(context);
     try {
-      await AudioShareService().shareRecording(_project);
+      await AudioShareService().shareRecording(_project, key: _audioKey);
     } catch (error) {
       if (!mounted) return;
       messenger.showSnackBar(SnackBar(
@@ -552,17 +742,30 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  Future<void> _exportNotesPdf() async {
+  Future<void> _exportNotesTxt() async {
     final messenger = ScaffoldMessenger.of(context);
     try {
-      await NotesPdfService().printOrShare(
-        _project,
-        locale: widget.preferences.isFrench ? 'fr' : 'en',
-      );
+      await _saveProject(_project.copyWith(notes: _notesController.text));
+      final directory = Directory(
+          '${widget.repository.projectsDirectory.path}/${_project.id}/notes');
+      await directory.create(recursive: true);
+      final safeTitle = _project.title
+          .trim()
+          .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_');
+      final file = File(
+          '${directory.path}/${safeTitle.isEmpty ? 'project' : safeTitle}.txt');
+      await file.writeAsString(_notesController.text,
+          encoding: utf8, flush: true);
+      await AudioShareService().shareFile(file);
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text(tr(widget.preferences, 'Notes saved as a .txt file',
+            'Notes enregistrées dans un fichier .txt')),
+      ));
     } catch (error) {
       if (!mounted) return;
       messenger.showSnackBar(
-        SnackBar(content: Text('PDF export failed: $error')),
+        SnackBar(content: Text('Could not save notes as a .txt file: $error')),
       );
     }
   }
@@ -579,8 +782,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         await _togglePublicCopy();
       case 'export':
         await _exportProjectBundle();
-      case 'pdf':
-        await _exportNotesPdf();
+      case 'notes_txt':
+        await _exportNotesTxt();
       case 'rename':
         await _renameProject();
       case 'pin':
@@ -588,6 +791,344 @@ class _PlayerScreenState extends State<PlayerScreen> {
       case 'encryption':
         await _toggleAudioEncryption();
     }
+  }
+
+  Future<void> _handleSessionAction(
+      String action, RavenAudioSession session, int index) async {
+    switch (action) {
+      case 'play':
+        await _seekGlobal(AudioTimeline.offsetOf(_project.sessions, index));
+        await _player.play();
+      case 'share':
+        try {
+          await AudioShareService()
+              .shareSession(_project, session, key: _audioKey);
+        } catch (error) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text('Could not share recording session: $error'),
+          ));
+        }
+      case 'details':
+        await _showSessionDetails(session, index);
+      case 'rename':
+        await _renameSession(session, index);
+      case 'delete':
+        await _deleteSession(session, index);
+    }
+  }
+
+  Future<void> _showSessionDetails(RavenAudioSession session, int index) async {
+    final file = File(session.audioPath);
+    final exists = await file.exists();
+    final size = exists ? await file.length() : null;
+    if (!mounted) return;
+    final createdAt = DateFormat(
+      'dd MMM yyyy, HH:mm',
+      widget.preferences.isFrench ? 'fr' : 'en',
+    ).format(session.createdAt);
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(session.name.isEmpty
+            ? tr(widget.preferences, 'Session ${index + 1}',
+                'Session ${index + 1}')
+            : session.name),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            _detailRow(tr(widget.preferences, 'Created', 'Créé'), createdAt),
+            _detailRow(
+              tr(widget.preferences, 'Duration', 'Durée'),
+              _formatDuration(session.durationMs),
+            ),
+            _detailRow(
+              tr(widget.preferences, 'Format', 'Format'),
+              session.format.toUpperCase(),
+            ),
+            _detailRow(
+              tr(widget.preferences, 'Sample rate', 'Fréquence'),
+              '${session.sampleRate} Hz',
+            ),
+            _detailRow(
+              tr(widget.preferences, 'File size', 'Taille du fichier'),
+              size == null
+                  ? tr(widget.preferences, 'Missing', 'Manquant')
+                  : _formatBytes(size),
+            ),
+          ],
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: Text(tr(widget.preferences, 'Close', 'Fermer')),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _detailRow(String label, String value) => Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            SizedBox(width: 104, child: Text(label)),
+            Expanded(child: Text(value)),
+          ],
+        ),
+      );
+
+  Future<void> _renameSession(RavenAudioSession session, int index) async {
+    final controller = TextEditingController(
+        text: session.name.isEmpty ? 'Session ${index + 1}' : session.name);
+    final name = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(
+            tr(widget.preferences, 'Rename session', 'Renommer la session')),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 80,
+          onSubmitted: (value) => Navigator.pop(dialogContext, value.trim()),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, controller.text.trim()),
+            child: Text(tr(widget.preferences, 'Save', 'Enregistrer')),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (name == null || name.trim().isEmpty || !mounted) return;
+    final sessions = List<RavenAudioSession>.of(_project.sessions);
+    sessions[index] = session.copyWith(name: name.trim());
+    try {
+      // Bookmarks store a sessionId; renaming a part must keep those links
+      // valid so the bookmark panel still shows the right recording part.
+      final validIds = sessions.map((s) => s.id).toSet();
+      final bookmarks = _project.bookmarks
+          .where((b) => b.sessionId.isEmpty || validIds.contains(b.sessionId))
+          .toList();
+      await _saveProject(
+          _project.copyWith(sessions: sessions, bookmarks: bookmarks));
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Could not rename recording session: $error'),
+      ));
+    }
+  }
+
+  Future<void> _deleteSession(RavenAudioSession session, int index) async {
+    final deletesProject = _project.sessions.length == 1;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(tr(
+          widget.preferences,
+          deletesProject ? 'Move recording to Trash?' : 'Delete this session?',
+          deletesProject
+              ? 'Déplacer dans la corbeille ?'
+              : 'Supprimer cette session ?',
+        )),
+        content: Text(tr(
+          widget.preferences,
+          deletesProject
+              ? 'The recording will remain recoverable in Trash.'
+              : 'This removes this session from the project. Other sessions remain available.',
+          deletesProject
+              ? 'L’enregistrement pourra être restauré depuis la corbeille.'
+              : 'Cette session sera supprimée du projet. Les autres sessions resteront disponibles.',
+        )),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(tr(
+              widget.preferences,
+              deletesProject ? 'Move to Trash' : 'Delete session',
+              deletesProject ? 'Mettre à la corbeille' : 'Supprimer la session',
+            )),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await _player.stop();
+      if (deletesProject) {
+        await widget.repository.moveToTrash(_project);
+        widget.onProjectChanged(
+            widget.repository.projectById(_project.id) ?? _project);
+        if (mounted) Navigator.of(context).pop();
+        return;
+      }
+
+      final previousPublicLocation = _project.publicCopyLocation;
+      if (previousPublicLocation != null) {
+        await AudioVisibilityService().remove(previousPublicLocation);
+        await _saveProject(_project.copyWith(clearPublicCopyLocation: true));
+      }
+      final oldMasterPath = _project.masterAudioPath;
+      final sessions = List<RavenAudioSession>.of(_project.sessions)
+        ..removeAt(index);
+      await _saveProject(_project.copyWith(
+        sessions: sessions,
+        clearMasterAudioPath: true,
+      ));
+
+      final sourceFile = File(session.audioPath);
+      if (await sourceFile.exists()) await sourceFile.delete();
+      if (oldMasterPath != null && oldMasterPath != session.audioPath) {
+        final oldMaster = File(oldMasterPath);
+        if (await oldMaster.exists()) await oldMaster.delete();
+      }
+
+      String? mergeFailure;
+      if (sessions.length > 1 && !_project.isAudioProtected) {
+        try {
+          final merged = await AudioMergeService().mergeProject(
+            sessions: sessions,
+            outputDirectory: Directory(
+                '${widget.repository.projectsDirectory.path}/${_project.id}/sessions'),
+            projectId: _project.id,
+            format: widget.preferences.recordingFormat,
+            bitRate: widget.preferences.bitRate,
+            sampleRate: widget.preferences.sampleRate,
+          );
+          await _saveProject(_project.copyWith(masterAudioPath: merged.path));
+        } catch (error) {
+          mergeFailure = '$error';
+        }
+      }
+      if (previousPublicLocation != null &&
+          sessions.isNotEmpty &&
+          !_project.isAudioProtected &&
+          !_project.requiresAppPin) {
+        var sourcePath = _project.masterAudioPath;
+        if (sessions.length == 1) {
+          sourcePath = sessions.single.audioPath;
+        }
+        if (sourcePath != null) {
+          try {
+            final location = await AudioVisibilityService().publish(
+              source: File(sourcePath),
+              title: _project.title,
+              projectId: _project.id,
+            );
+            await _saveProject(_project.copyWith(publicCopyLocation: location));
+          } catch (error) {
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text(
+                  'Session deleted, but the public copy was not recreated: $error'),
+            ));
+            return;
+          }
+        }
+      }
+      if (mergeFailure != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              'Session deleted, but the continuous audio could not be rebuilt: $mergeFailure'),
+        ));
+      }
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Could not delete recording session: $error'),
+      ));
+    }
+  }
+
+  Widget _buildSessionsSection(ThemeData theme) {
+    return Card(
+      child: ExpansionTile(
+        initiallyExpanded: true,
+        leading: Icon(Icons.multitrack_audio_rounded,
+            color: theme.colorScheme.primary),
+        title: Text(tr(
+          widget.preferences,
+          'Recording sessions (${_project.sessions.length})',
+          'Sessions d’enregistrement (${_project.sessions.length})',
+        )),
+        subtitle: Text(tr(
+          widget.preferences,
+          'Each session stays available separately while the project plays as one.',
+          'Chaque session reste disponible séparément tandis que le projet est lu en continu.',
+        )),
+        children: _project.sessions.asMap().entries.map((entry) {
+          final index = entry.key;
+          final session = entry.value;
+          final title = session.name.isEmpty
+              ? tr(widget.preferences, 'Session ${index + 1}',
+                  'Session ${index + 1}')
+              : session.name;
+          return ListTile(
+            leading: CircleAvatar(child: Text('${index + 1}')),
+            title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text(
+              '${_formatDuration(session.durationMs)} · ${session.format.toUpperCase()} · ${DateFormat('dd MMM yyyy, HH:mm', widget.preferences.isFrench ? 'fr' : 'en').format(session.createdAt)}',
+              maxLines: 2,
+            ),
+            onTap: _loading
+                ? null
+                : () => _handleSessionAction('play', session, index),
+            trailing: PopupMenuButton<String>(
+              tooltip: tr(widget.preferences, 'Session actions',
+                  'Actions de la session'),
+              onSelected: (action) =>
+                  _handleSessionAction(action, session, index),
+              itemBuilder: (context) => <PopupMenuEntry<String>>[
+                PopupMenuItem(
+                  value: 'play',
+                  child: Text(tr(
+                      widget.preferences, 'Play session', 'Lire la session')),
+                ),
+                PopupMenuItem(
+                  value: 'share',
+                  child: Text(tr(widget.preferences, 'Share session',
+                      'Partager la session')),
+                ),
+                PopupMenuItem(
+                  value: 'details',
+                  child: Text(tr(widget.preferences, 'Details', 'Détails')),
+                ),
+                PopupMenuItem(
+                  value: 'rename',
+                  child: Text(tr(widget.preferences, 'Rename session',
+                      'Renommer la session')),
+                ),
+                PopupMenuItem(
+                  value: 'delete',
+                  child: Text(tr(
+                    widget.preferences,
+                    _project.sessions.length == 1
+                        ? 'Move recording to Trash'
+                        : 'Delete session',
+                    _project.sessions.length == 1
+                        ? 'Mettre dans la corbeille'
+                        : 'Supprimer la session',
+                  )),
+                ),
+              ],
+            ),
+          );
+        }).toList(),
+      ),
+    );
   }
 
   Future<void> _renameProject() async {
@@ -645,7 +1186,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           '${cache.path}/raven-probe-${_project.id}-${selected.id}.$extension');
       if (await temporaryPlaintext.exists()) await temporaryPlaintext.delete();
       await _encryption.decryptFile(
-          input: original, output: temporaryPlaintext);
+          input: original, output: temporaryPlaintext, key: _audioKey);
       pathToMeasure = temporaryPlaintext.path;
     }
 
@@ -790,60 +1331,201 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  Future<void> _addBookmark() async {
-    final session = _session;
-    if (session == null) return;
-    final controller = TextEditingController();
-    final label = await showDialog<String>(
+  /// Adds a bookmark at the current playback position. Works even while audio
+  /// is paused (uses the paused position) and always records the position on the
+  /// single continuous project timeline.
+  Future<void> _addBookmark({RavenBookmark? existing}) async {
+    if (_project.sessions.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(tr(
+            widget.preferences,
+            'Add or record audio before creating a bookmark.',
+            'Ajoutez ou enregistrez de l’audio avant de créer un repère.')),
+      ));
+      return;
+    }
+
+    final activeIndex = _player.currentIndex ?? 0;
+    final globalPosition = existing?.positionMs ??
+        _globalPositionMs(activeIndex, _player.position);
+    // Resolve which recording part the position lives in on the single
+    // continuous timeline, whether playback uses the master or the sessions.
+    final timelineIndex = AudioTimeline.locate(
+            _project.sessions, globalPosition)
+        .index;
+    final activeSession = timelineIndex >= 0 &&
+            timelineIndex < _project.sessions.length
+        ? _project.sessions[timelineIndex]
+        : _project.sessions.last;
+    final sessionNumber = _project.sessions.indexWhere(
+            (s) => s.id == activeSession.id) +
+        1;
+
+    final wasPlaying = _player.playing;
+    if (wasPlaying) await _player.pause();
+
+    final controller = TextEditingController(
+      text: existing?.label ??
+          tr(widget.preferences, 'Bookmark', 'Repère') +
+              ' ${_project.bookmarks.length + 1}',
+    );
+    controller.selection = TextSelection(
+        baseOffset: 0, extentOffset: controller.text.length);
+
+    final result = await showDialog<String>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: Text(tr(widget.preferences, 'Add timeline bookmark',
-            'Ajouter un repère audio')),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: 80,
-          decoration: InputDecoration(
-              labelText:
-                  tr(widget.preferences, 'Bookmark label', 'Nom du repère')),
-          onSubmitted: (value) => Navigator.pop(dialogContext, value.trim()),
+        icon: const Icon(Icons.bookmark_add_rounded),
+        title: Text(
+            tr(
+                widget.preferences,
+                existing == null ? 'New bookmark' : 'Edit bookmark',
+                existing == null ? 'Nouveau repère' : 'Modifier le repère'),
+            textAlign: TextAlign.center),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                color: Theme.of(dialogContext)
+                    .colorScheme
+                    .primaryContainer
+                    .withValues(alpha: 0.5),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: <Widget>[
+                  const Icon(Icons.schedule_rounded, size: 18),
+                  const SizedBox(width: 8),
+                  Text(
+                    _formatBookmarkTime(globalPosition),
+                    style: const TextStyle(
+                        fontWeight: FontWeight.w700, fontSize: 16),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    tr(
+                      widget.preferences,
+                      '· Part $sessionNumber',
+                      '· Partie $sessionNumber',
+                    ),
+                    style: Theme.of(dialogContext).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              maxLength: 80,
+              textCapitalization: TextCapitalization.sentences,
+              decoration: InputDecoration(
+                labelText:
+                    tr(widget.preferences, 'Bookmark label', 'Nom du repère'),
+                hintText: tr(widget.preferences, 'e.g. Chorus starts',
+                    'ex. Début du refrain'),
+              ),
+              onSubmitted: (value) {
+                final trimmed = value.trim();
+                if (trimmed.isNotEmpty) Navigator.pop(dialogContext, trimmed);
+              },
+            ),
+          ],
         ),
         actions: <Widget>[
           TextButton(
               onPressed: () => Navigator.pop(dialogContext),
               child: Text(tr(widget.preferences, 'Cancel', 'Annuler'))),
-          FilledButton(
-              onPressed: () =>
-                  Navigator.pop(dialogContext, controller.text.trim()),
-              child: Text(tr(widget.preferences, 'Save', 'Enregistrer'))),
+          FilledButton.icon(
+              onPressed: () {
+                final trimmed = controller.text.trim();
+                if (trimmed.isEmpty) return;
+                Navigator.pop(dialogContext, trimmed);
+              },
+              icon: const Icon(Icons.check_rounded, size: 18),
+              label: Text(existing == null
+                  ? tr(widget.preferences, 'Save bookmark', 'Enregistrer')
+                  : tr(widget.preferences, 'Update', 'Mettre à jour'))),
         ],
       ),
     );
     controller.dispose();
-    if (label == null || label.trim().isEmpty) return;
-    final activeIndex = _player.currentIndex ?? 0;
-    final globalPosition = _globalPositionMs(activeIndex, _player.position);
-    final timelineIndex =
-        _project.masterAudioPath != null && !_project.isAudioProtected
-            ? AudioTimeline.locate(_project.sessions, globalPosition).index
-            : activeIndex;
-    final activeSession = timelineIndex < _project.sessions.length
-        ? _project.sessions[timelineIndex]
-        : session;
+    if (wasPlaying && mounted) unawaited(_player.play());
+    if (result == null || result.isEmpty) return;
+
     final bookmark = RavenBookmark(
-      id: const Uuid().v4(),
+      id: existing?.id ?? const Uuid().v4(),
       sessionId: activeSession.id,
       positionMs: globalPosition,
-      label: label.trim(),
-      createdAt: DateTime.now(),
+      label: result,
+      createdAt: existing?.createdAt ?? DateTime.now(),
     );
-    await _saveProject(_project
-        .copyWith(bookmarks: <RavenBookmark>[..._project.bookmarks, bookmark]));
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(tr(
-              widget.preferences, 'Bookmark saved.', 'Repère enregistré.'))));
+    final bookmarks = List<RavenBookmark>.of(_project.bookmarks);
+    if (existing == null) {
+      bookmarks.add(bookmark);
+    } else {
+      final index = bookmarks.indexWhere((b) => b.id == existing.id);
+      if (index >= 0) bookmarks[index] = bookmark;
     }
+    bookmarks.sort((a, b) => a.positionMs.compareTo(b.positionMs));
+    try {
+      await _saveProject(_project.copyWith(bookmarks: bookmarks));
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(existing == null
+            ? tr(widget.preferences,
+                'Bookmark added at ${_formatBookmarkTime(globalPosition)}.',
+                'Repère ajouté à ${_formatBookmarkTime(globalPosition)}.')
+            : tr(widget.preferences, 'Bookmark updated.',
+                'Repère mis à jour.')),
+      ));
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('${tr(widget.preferences, 'Could not save bookmark', 'Impossible d’enregistrer le repère')}: $error'),
+      ));
+    }
+  }
+
+  Future<void> _deleteBookmark(RavenBookmark bookmark) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(tr(widget.preferences, 'Delete bookmark?',
+            'Supprimer le repère ?')),
+        content: Text('${bookmark.label}\n${_formatBookmarkTime(bookmark.positionMs)}'),
+        actions: <Widget>[
+          TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: Text(tr(widget.preferences, 'Cancel', 'Annuler'))),
+          FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: Text(tr(widget.preferences, 'Delete', 'Supprimer'))),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final remaining = _project.bookmarks
+        .where((b) => b.id != bookmark.id)
+        .toList();
+    try {
+      await _saveProject(_project.copyWith(bookmarks: remaining));
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('${tr(widget.preferences, 'Could not delete bookmark', 'Impossible de supprimer le repère')}: $error'),
+      ));
+    }
+  }
+
+  Future<void> _jumpToBookmark(RavenBookmark bookmark) async {
+    await _seekGlobal(bookmark.positionMs);
+    if (mounted) await _player.play();
   }
 
   Future<void> _runAiTask(String task) async {
@@ -1211,6 +1893,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   _loading || _project.isTrashed ? null : _continueRecording,
               icon: const Icon(Icons.mic_none_rounded)),
           IconButton(
+            tooltip: tr(widget.preferences, 'Add bookmark at current position',
+                'Ajouter un repère à la position actuelle'),
+            onPressed: _loading || _error != null || _project.sessions.isEmpty
+                ? null
+                : () => _addBookmark(),
+            icon: const Icon(Icons.bookmark_add_rounded),
+          ),
+          IconButton(
             tooltip: _project.isFavorite
                 ? tr(widget.preferences, 'Remove favourite',
                     'Retirer des favoris')
@@ -1269,11 +1959,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 tr(
                   widget.preferences,
                   _project.isAudioProtected
-                      ? 'Decrypt recording audio'
-                      : 'Encrypt recording audio',
+                      ? 'Unlock audio'
+                      : 'Lock audio with a password',
                   _project.isAudioProtected
-                      ? 'Déchiffrer l’audio'
-                      : 'Chiffrer l’audio',
+                      ? 'Déverrouiller l’audio'
+                      : 'Verrouiller l’audio avec un mot de passe',
                 ),
                 enabled: !_loading,
               ),
@@ -1283,10 +1973,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   tr(widget.preferences, 'Export complete project',
                       'Exporter le projet complet')),
               _projectMenuItem(
-                  'pdf',
-                  Icons.picture_as_pdf_outlined,
-                  tr(widget.preferences, 'Export notes as PDF',
-                      'Exporter les notes en PDF')),
+                  'notes_txt',
+                  Icons.description_outlined,
+                  tr(widget.preferences, 'Save and share notes as .txt',
+                      'Enregistrer et partager les notes en .txt')),
               _projectMenuItem(
                   'rename',
                   Icons.edit_outlined,
@@ -1355,39 +2045,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         )),
                       ),
                     ),
-                    if (_project.bookmarks.isNotEmpty) ...<Widget>[
-                      Card(
-                        child: ExpansionTile(
-                          leading: const Icon(Icons.bookmarks_outlined),
-                          title: Text(tr(
-                              widget.preferences,
-                              'Timeline bookmarks (${_project.bookmarks.length})',
-                              'Repères audio (${_project.bookmarks.length})')),
-                          children: _project.bookmarks
-                              .map((bookmark) => Card(
-                                    child: ListTile(
-                                      leading: const Icon(
-                                          Icons.bookmark_outline_rounded),
-                                      title: Text(bookmark.label),
-                                      subtitle: Text(_formatBookmarkTime(
-                                          bookmark.positionMs)),
-                                      trailing: IconButton(
-                                        tooltip: tr(
-                                            widget.preferences,
-                                            'Jump to bookmark',
-                                            'Aller au repère'),
-                                        icon: const Icon(
-                                            Icons.play_arrow_rounded),
-                                        onPressed: () async {
-                                          await _seekGlobal(
-                                              bookmark.positionMs);
-                                        },
-                                      ),
-                                    ),
-                                  ))
-                              .toList(),
-                        ),
-                      ),
+                    if (_project.sessions.isNotEmpty) ...<Widget>[
+                      const SizedBox(height: 12),
+                      _buildSessionsSection(theme),
+                    ],
+                    if (_project.sessions.isNotEmpty) ...<Widget>[
+                      const SizedBox(height: 12),
+                      _buildBookmarksSection(theme),
                       const SizedBox(height: 18),
                     ],
                     const SizedBox(height: 22),
@@ -1529,11 +2193,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: <Widget>[
                                     IconButton(
-                                        onPressed: () => _player
-                                            .seek(Duration.zero, index: 0),
-                                        icon: const Icon(Icons.replay_rounded),
-                                        iconSize: 27),
-                                    const SizedBox(width: 20),
+                                      tooltip: tr(
+                                          widget.preferences,
+                                          'Restart from the beginning',
+                                          'Recommencer au début'),
+                                      onPressed: () => _seekGlobal(0),
+                                      icon: const Icon(Icons.replay_rounded),
+                                      iconSize: 27,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    IconButton.filledTonal(
+                                      tooltip: tr(
+                                          widget.preferences,
+                                          'Bookmark this exact moment',
+                                          'Repérer ce moment exact'),
+                                      onPressed:
+                                          _loading || _error != null
+                                              ? null
+                                              : () => _addBookmark(),
+                                      icon: const Icon(
+                                          Icons.bookmark_add_rounded),
+                                      iconSize: 24,
+                                    ),
+                                    const SizedBox(width: 10),
                                     SizedBox(
                                       width: 66,
                                       height: 66,
@@ -1557,7 +2239,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                             size: 34),
                                       ),
                                     ),
-                                    const SizedBox(width: 20),
+                                    const SizedBox(width: 10),
+                                    IconButton(
+                                      tooltip: tr(
+                                          widget.preferences,
+                                          'Show bookmarks',
+                                          'Afficher les repères'),
+                                      onPressed: () => _showBookmarksSheet(),
+                                      icon: const Icon(
+                                          Icons.bookmarks_outlined),
+                                      iconSize: 25,
+                                    ),
+                                    const SizedBox(width: 4),
                                     PopupMenuButton<double>(
                                       tooltip: tr(
                                           widget.preferences,
@@ -1731,6 +2424,336 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
+  /// Full-screen-sized sheet listing every bookmark with jump/edit/delete.
+  /// Reached from the player controls so bookmarks are one tap away.
+  Future<void> _showBookmarksSheet() async {
+    if (_project.sessions.isEmpty) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, refresh) {
+          final bookmarks = List<RavenBookmark>.of(_project.bookmarks)
+            ..sort((a, b) => a.positionMs.compareTo(b.positionMs));
+          final colorScheme = Theme.of(sheetContext).colorScheme;
+          return SafeArea(
+            child: SizedBox(
+              height: MediaQuery.of(sheetContext).size.height * 0.7,
+              child: Column(
+                children: <Widget>[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 0, 12, 8),
+                    child: Row(
+                      children: <Widget>[
+                        const Icon(Icons.bookmarks_rounded),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            tr(widget.preferences, 'Bookmarks', 'Repères'),
+                            style: Theme.of(sheetContext)
+                                .textTheme
+                                .titleLarge,
+                          ),
+                        ),
+                        FilledButton.tonalIcon(
+                          onPressed: () async {
+                            Navigator.pop(sheetContext);
+                            await _addBookmark();
+                          },
+                          icon: const Icon(Icons.add_rounded, size: 18),
+                          label: Text(tr(widget.preferences, 'Add here',
+                              'Ajouter ici')),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  Expanded(
+                    child: bookmarks.isEmpty
+                        ? Center(
+                            child: Padding(
+                              padding: const EdgeInsets.all(24),
+                              child: Text(
+                                tr(
+                                    widget.preferences,
+                                    'No bookmarks yet.\nPlay the recording and tap Add here to mark a moment.',
+                                    'Aucun repère.\nLancez la lecture et touchez Ajouter ici pour marquer un moment.'),
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                          )
+                        : ListView.separated(
+                            padding: const EdgeInsets.all(12),
+                            itemCount: bookmarks.length,
+                            separatorBuilder: (_, __) =>
+                                const SizedBox(height: 6),
+                            itemBuilder: (context, index) {
+                              final bookmark = bookmarks[index];
+                              return ListTile(
+                                shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14)),
+                                tileColor: colorScheme.surfaceContainerHighest
+                                    .withValues(alpha: 0.45),
+                                leading: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 9, vertical: 5),
+                                  decoration: BoxDecoration(
+                                    color: colorScheme.primary,
+                                    borderRadius: BorderRadius.circular(9),
+                                  ),
+                                  child: Text(
+                                    _formatBookmarkTime(bookmark.positionMs),
+                                    style: TextStyle(
+                                      color: colorScheme.onPrimary,
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ),
+                                title: Text(bookmark.label,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis),
+                                onTap: () {
+                                  Navigator.pop(sheetContext);
+                                  _jumpToBookmark(bookmark);
+                                },
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: <Widget>[
+                                    IconButton(
+                                      tooltip: tr(widget.preferences,
+                                          'Rename', 'Renommer'),
+                                      onPressed: () async {
+                                        Navigator.pop(sheetContext);
+                                        await _addBookmark(
+                                            existing: bookmark);
+                                      },
+                                      icon: const Icon(Icons.edit_outlined),
+                                    ),
+                                    IconButton(
+                                      tooltip: tr(widget.preferences,
+                                          'Delete', 'Supprimer'),
+                                      onPressed: () async {
+                                        Navigator.pop(sheetContext);
+                                        await _deleteBookmark(bookmark);
+                                      },
+                                      icon: Icon(Icons.delete_outline_rounded,
+                                          color: colorScheme.error),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  /// Bookmark panel: visible add button, sorted list, per-marker jump, rename
+  /// and delete. Each entry shows its own timestamp and recording part so a
+  /// multi-session project never hides where a bookmark really lives.
+  Widget _buildBookmarksSection(ThemeData theme) {
+    final bookmarks = List<RavenBookmark>.of(_project.bookmarks)
+      ..sort((a, b) => a.positionMs.compareTo(b.positionMs));
+    final totalMs = AudioTimeline.totalDurationMs(_project.sessions);
+    final colorScheme = theme.colorScheme;
+
+    String partLabel(RavenBookmark bookmark) {
+      final index = _project.sessions
+          .indexWhere((session) => session.id == bookmark.sessionId);
+      if (index < 0) return '';
+      final session = _project.sessions[index];
+      final name =
+          session.name.isEmpty ? 'Part ${index + 1}' : session.name;
+      return ' · $name';
+    }
+
+    return Card(
+      clipBehavior: Clip.antiAlias,
+      child: ExpansionTile(
+        initiallyExpanded: bookmarks.isNotEmpty,
+        leading: Container(
+          width: 40,
+          height: 40,
+          decoration: BoxDecoration(
+            color: colorScheme.tertiaryContainer,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(Icons.bookmarks_rounded,
+              size: 22, color: colorScheme.onTertiaryContainer),
+        ),
+        title: Text(tr(
+            widget.preferences,
+            'Timeline bookmarks',
+            'Repères audio')),
+        subtitle: Text(
+          bookmarks.isEmpty
+              ? tr(
+                  widget.preferences,
+                  'Mark a moment so you can jump straight back to it.',
+                  'Marquez un moment pour y revenir directement.')
+              : tr(
+                  widget.preferences,
+                  '${bookmarks.length} saved · tap to jump',
+                  '${bookmarks.length} enregistré(s) · touchez pour accéder'),
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: colorScheme.onSurfaceVariant),
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            IconButton.filledTonal(
+              tooltip: tr(widget.preferences, 'Add bookmark here',
+                  'Ajouter un repère ici'),
+              onPressed: _loading || _error != null
+                  ? null
+                  : () => _addBookmark(),
+              icon: const Icon(Icons.add_rounded),
+              visualDensity: VisualDensity.compact,
+            ),
+            const Icon(Icons.expand_more_rounded),
+          ],
+        ),
+        childrenPadding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+        children: <Widget>[
+          if (bookmarks.isEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  Text(
+                    tr(
+                        widget.preferences,
+                        'No bookmarks yet. Play the recording, then tap “Add bookmark” to pin this moment.',
+                        'Aucun repère. Lancez la lecture, puis touchez « Ajouter un repère » pour épingler ce moment.'),
+                    style: theme.textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 10),
+                  FilledButton.tonalIcon(
+                    onPressed: _loading || _error != null
+                        ? null
+                        : () => _addBookmark(),
+                    icon: const Icon(Icons.bookmark_add_outlined, size: 18),
+                    label: Text(tr(widget.preferences, 'Add bookmark',
+                        'Ajouter un repère')),
+                  ),
+                ],
+              ),
+            )
+          else ...<Widget>[
+            for (final bookmark in bookmarks)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Material(
+                  color: colorScheme.surfaceContainerHighest
+                      .withValues(alpha: 0.45),
+                  borderRadius: BorderRadius.circular(14),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(14),
+                    onTap: () => _jumpToBookmark(bookmark),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+                      child: Row(
+                        children: <Widget>[
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: colorScheme.primary,
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Text(
+                              _formatBookmarkTime(bookmark.positionMs),
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: colorScheme.onPrimary,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: <Widget>[
+                                Text(
+                                  bookmark.label,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                      fontWeight: FontWeight.w600),
+                                ),
+                                if (partLabel(bookmark).isNotEmpty)
+                                  Text(
+                                    partLabel(bookmark).replaceFirst(' · ', ''),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.labelSmall
+                                        ?.copyWith(
+                                            color: colorScheme
+                                                .onSurfaceVariant),
+                                  ),
+                              ],
+                            ),
+                          ),
+                          PopupMenuButton<String>(
+                            tooltip: tr(widget.preferences,
+                                'Bookmark actions', 'Actions du repère'),
+                            onSelected: (action) {
+                              switch (action) {
+                                case 'play':
+                                  _jumpToBookmark(bookmark);
+                                case 'rename':
+                                  _addBookmark(existing: bookmark);
+                                case 'delete':
+                                  _deleteBookmark(bookmark);
+                              }
+                            },
+                            itemBuilder: (context) =>
+                                <PopupMenuEntry<String>>[
+                              PopupMenuItem<String>(
+                                  value: 'play',
+                                  child: Text(tr(widget.preferences,
+                                      'Play from here', 'Lire à partir d’ici'))),
+                              PopupMenuItem<String>(
+                                  value: 'rename',
+                                  child: Text(tr(widget.preferences,
+                                      'Rename bookmark', 'Renommer le repère'))),
+                              PopupMenuItem<String>(
+                                  value: 'delete',
+                                  child: Text(tr(widget.preferences,
+                                      'Delete bookmark',
+                                      'Supprimer le repère'))),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            if (bookmarks.length > 1 && totalMs > 0)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(4, 6, 4, 4),
+                child: _BookmarkTimelineStrip(
+                  bookmarks: bookmarks,
+                  totalMs: totalMs,
+                  onTap: _seekGlobal,
+                ),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+
   PopupMenuItem<String> _projectMenuItem(
     String value,
     IconData icon,
@@ -1756,6 +2779,68 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
     final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
     return d.inHours > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+}
+
+/// Compact visual overview of where bookmarks sit on the project timeline.
+/// Tapping a marker seeks to it, so users can see spacing at a glance.
+class _BookmarkTimelineStrip extends StatelessWidget {
+  const _BookmarkTimelineStrip({
+    required this.bookmarks,
+    required this.totalMs,
+    required this.onTap,
+  });
+
+  final List<RavenBookmark> bookmarks;
+  final int totalMs;
+  final Future<void> Function(int milliseconds) onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        return SizedBox(
+          height: 34,
+          child: Stack(
+            children: <Widget>[
+              Positioned(
+                left: 0,
+                right: 0,
+                top: 15,
+                child: Container(
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: colorScheme.outlineVariant,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              for (final bookmark in bookmarks)
+                Positioned(
+                  left: ((bookmark.positionMs / totalMs).clamp(0.0, 1.0) *
+                              (width - 22))
+                          .clamp(0.0, width - 22)
+                          .toDouble(),
+                  top: 0,
+                  child: Tooltip(
+                    message:
+                        '${bookmark.label} · ${_formatBookmarkTime(bookmark.positionMs)}',
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(8),
+                      onTap: () => onTap(bookmark.positionMs),
+                      child: Icon(Icons.bookmark_rounded,
+                          size: 20, color: colorScheme.primary),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
   }
 }
 

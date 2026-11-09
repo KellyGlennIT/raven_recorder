@@ -14,6 +14,9 @@ dependencies:
     sdk: flutter
   record: ^6.2.1
   just_audio: ^0.9.46
+  # Desktop-only: builds one continuous master file for multi-session projects.
+  # Its native Android AARs are excluded in android/app/build.gradle.kts so the
+  # APK does not carry ~20–30 MB of unused FFmpeg libraries.
   ffmpeg_kit_flutter_new_audio: ^2.5.7
   path: ^1.9.1
   path_provider: ^2.1.5
@@ -25,8 +28,6 @@ dependencies:
   archive: ^4.0.7
   file_picker: ^10.3.3
   share_plus: ^12.0.1
-  pdf: ^3.11.3
-  printing: ^5.14.2
 
 dev_dependencies:
   flutter_test:

@@ -163,14 +163,16 @@ try:
     root = manifest_tree.getroot()
     android_ns = '{http://schemas.android.com/apk/res/android}'
     permissions = {node.get(android_ns + 'name') for node in root.findall('uses-permission')}
-    for permission in ['android.permission.INTERNET', 'android.permission.RECORD_AUDIO', 'android.permission.POST_NOTIFICATIONS', 'android.permission.SCHEDULE_EXACT_ALARM', 'android.permission.RECEIVE_BOOT_COMPLETED']:
+    for permission in ['android.permission.INTERNET', 'android.permission.RECORD_AUDIO', 'android.permission.POST_NOTIFICATIONS']:
         if permission not in permissions:
             errors.append(f'AndroidManifest.xml missing permission {permission}')
     app_text = manifest_path.read_text(encoding='utf-8')
-    for component in ['.MainActivity', '.ScheduledRecordingReceiver', '.ScheduledRecordingBootReceiver']:
+    for component in ['.MainActivity', '.RecordingForegroundService']:
         if component not in app_text:
             errors.append(f'AndroidManifest.xml missing component {component}')
-    checks.append('Android manifest parsed; permissions and scheduling components checked')
+    if 'SCHEDULE_EXACT_ALARM' in app_text or 'ScheduledRecordingReceiver' in app_text:
+        errors.append('AndroidManifest.xml still configures scheduled recording')
+    checks.append('Android manifest parsed; recording permissions and components checked')
 except Exception as exc:
     errors.append(f'AndroidManifest.xml could not be parsed: {exc}')
 
@@ -179,10 +181,10 @@ required = [
     'lib/main.dart', 'lib/models/raven_project.dart', 'lib/services/project_repository.dart',
     'lib/services/audio_merge_service.dart', 'lib/services/audio_timeline.dart',
     'lib/services/ai_provider_service.dart', 'lib/services/ai_key_vault.dart',
-    'lib/services/scheduled_recording_service.dart', 'lib/services/app_lock_service.dart',
+    'lib/services/app_lock_service.dart',
     'lib/services/audio_visibility_service.dart', 'lib/screens/recorder_screen.dart',
     'lib/screens/player_screen.dart', 'lib/screens/library_screen.dart',
-    'lib/screens/settings_screen.dart', 'lib/screens/scheduled_recordings_screen.dart',
+    'lib/screens/settings_screen.dart',
     'test/raven_project_test.dart', 'test/audio_timeline_test.dart',
     'test/ai_provider_service_test.dart', 'test/project_archive_safety_test.dart', 'README.md', 'BUILD_STATUS.md',
 ]
@@ -194,7 +196,6 @@ checks_for_text = {
     'stable project identity/model': ('lib/models/raven_project.dart', 'RavenProject copyWith'),
     'AI request timeout': ('lib/services/ai_provider_service.dart', 'Duration(seconds: 45)'),
     'AI redirects disabled': ('lib/services/ai_provider_service.dart', 'request.followRedirects = false'),
-    'schedule visible notification path': ('android/app/src/main/kotlin/com/raven/raven/ScheduledRecordingReceiver.kt', 'Tap to open RAVEN and start recording.'),
     'atomic master pending output': ('lib/services/audio_merge_service.dart', '.master.pending.'),
     'master rollback backup': ('lib/services/audio_merge_service.dart', '.previous'),
     'rename regression test': ('test/raven_project_test.dart', 'renaming never changes audio paths'),

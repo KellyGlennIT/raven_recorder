@@ -41,6 +41,7 @@ class RavenAudioSession {
     required this.createdAt,
     required this.durationMs,
     this.format = 'm4a',
+    this.name = '',
     this.sampleRate = 44100,
     this.recoverablePcm16 = false,
   });
@@ -50,6 +51,7 @@ class RavenAudioSession {
   final DateTime createdAt;
   final int durationMs;
   final String format;
+  final String name;
   final int sampleRate;
   final bool recoverablePcm16;
 
@@ -58,6 +60,7 @@ class RavenAudioSession {
     DateTime? createdAt,
     int? durationMs,
     String? format,
+    String? name,
     int? sampleRate,
     bool? recoverablePcm16,
   }) {
@@ -67,6 +70,7 @@ class RavenAudioSession {
       createdAt: createdAt ?? this.createdAt,
       durationMs: durationMs ?? this.durationMs,
       format: format ?? this.format,
+      name: name ?? this.name,
       sampleRate: sampleRate ?? this.sampleRate,
       recoverablePcm16: recoverablePcm16 ?? this.recoverablePcm16,
     );
@@ -78,6 +82,7 @@ class RavenAudioSession {
         'createdAt': createdAt.toIso8601String(),
         'durationMs': durationMs,
         'format': format,
+        'name': name,
         'sampleRate': sampleRate,
         'recoverablePcm16': recoverablePcm16,
       };
@@ -89,6 +94,7 @@ class RavenAudioSession {
       createdAt: DateTime.parse(json['createdAt'] as String),
       durationMs: (json['durationMs'] as num?)?.toInt() ?? 0,
       format: json['format'] as String? ?? 'm4a',
+      name: json['name'] as String? ?? '',
       sampleRate: (json['sampleRate'] as num?)?.toInt() ?? 44100,
       recoverablePcm16: json['recoverablePcm16'] as bool? ?? false,
     );
@@ -113,6 +119,7 @@ class RavenProject {
     this.tags = const <String>[],
     this.bookmarks = const <RavenBookmark>[],
     this.isAudioProtected = false,
+    this.audioProtectionSalt,
     this.requiresAppPin = false,
     this.aiGeneratedContent = const <String, String>{},
     this.masterAudioPath,
@@ -136,6 +143,9 @@ class RavenProject {
 
   /// Metadata flag only. Playback gating must be enforced by the security service.
   final bool isAudioProtected;
+
+  /// Random PBKDF2 salt for password-protected audio; never contains a password.
+  final String? audioProtectionSalt;
 
   /// Requires the configured RAVEN app PIN before opening this project.
   final bool requiresAppPin;
@@ -170,6 +180,8 @@ class RavenProject {
     List<String>? tags,
     List<RavenBookmark>? bookmarks,
     bool? isAudioProtected,
+    String? audioProtectionSalt,
+    bool clearAudioProtectionSalt = false,
     bool? requiresAppPin,
     Map<String, String>? aiGeneratedContent,
     String? masterAudioPath,
@@ -195,6 +207,9 @@ class RavenProject {
       tags: tags ?? this.tags,
       bookmarks: bookmarks ?? this.bookmarks,
       isAudioProtected: isAudioProtected ?? this.isAudioProtected,
+      audioProtectionSalt: clearAudioProtectionSalt
+          ? null
+          : (audioProtectionSalt ?? this.audioProtectionSalt),
       requiresAppPin: requiresAppPin ?? this.requiresAppPin,
       aiGeneratedContent: aiGeneratedContent ?? this.aiGeneratedContent,
       masterAudioPath: clearMasterAudioPath
@@ -222,6 +237,7 @@ class RavenProject {
         'tags': tags,
         'bookmarks': bookmarks.map((bookmark) => bookmark.toJson()).toList(),
         'isAudioProtected': isAudioProtected,
+        'audioProtectionSalt': audioProtectionSalt,
         'requiresAppPin': requiresAppPin,
         'aiGeneratedContent': aiGeneratedContent,
         'masterAudioPath': masterAudioPath,
@@ -263,6 +279,7 @@ class RavenProject {
               .toList() ??
           <RavenBookmark>[],
       isAudioProtected: json['isAudioProtected'] as bool? ?? false,
+      audioProtectionSalt: json['audioProtectionSalt'] as String?,
       requiresAppPin: json['requiresAppPin'] as bool? ?? false,
       aiGeneratedContent: (json['aiGeneratedContent'] is Map)
           ? (json['aiGeneratedContent'] as Map)

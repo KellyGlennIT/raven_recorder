@@ -101,6 +101,7 @@ void main() {
           onToggleEncryption: () async {
             encrypted = true;
           },
+          onToggleVisibility: () async => null,
         ),
       ),
     );
@@ -123,8 +124,9 @@ void main() {
 
     await tester.tap(find.byTooltip('More actions'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Encrypt audio'));
+    await tester.tap(find.text('Lock audio with a password'));
     expect(encrypted, isTrue);
+    await tester.pumpAndSettle();
 
     await tester.tap(find.byTooltip('More actions'));
     await tester.pumpAndSettle();
@@ -152,6 +154,7 @@ void main() {
               onRestore: (_) {},
               onDelete: (_) {},
               onImportProject: () {},
+              onImportAudio: () {},
               onResumeProject: (_) {},
               onCreateCategory: (_) async {},
               onRenameCategory: (_, __) async {},
@@ -159,6 +162,8 @@ void main() {
               onAssignCategory: (_) {},
               onCreateProject: (_) {},
               onShareProject: (_) {},
+              onToggleVisibility: (_) async {},
+              onToggleProtection: (_) async {},
             ),
           ),
         ),
@@ -189,6 +194,7 @@ void main() {
             onRestore: (_) {},
             onDelete: (_) {},
             onImportProject: () {},
+            onImportAudio: () {},
             onResumeProject: (_) {},
             onCreateCategory: (name) async {
               createdCategories.add(name);
@@ -198,6 +204,8 @@ void main() {
             onAssignCategory: (_) {},
             onCreateProject: (_) {},
             onShareProject: (_) {},
+            onToggleVisibility: (_) async {},
+            onToggleProtection: (_) async {},
           ),
         ),
       ),
@@ -271,6 +279,7 @@ void main() {
             onRestore: (_) {},
             onDelete: (_) {},
             onImportProject: () {},
+            onImportAudio: () {},
             onResumeProject: (_) {},
             onCreateCategory: (_) async {},
             onRenameCategory: (_, __) async {},
@@ -278,6 +287,8 @@ void main() {
             onAssignCategory: (_) {},
             onCreateProject: (project) => promotedRecordingId = project.id,
             onShareProject: (project) => sharedRecordingId = project.id,
+            onToggleVisibility: (_) async {},
+            onToggleProtection: (_) async {},
           ),
         ),
       ),
@@ -335,7 +346,6 @@ void main() {
               preferences: AppPreferences(),
               onSettingsChanged: () {},
               onShowTour: () {},
-              onOpenScheduledRecordings: () {},
               onApplyPublicVisibility: ({required visible}) async {},
               onTrashRetentionChanged: () {},
             ),

@@ -20,7 +20,6 @@ class RecorderScreen extends StatefulWidget {
     required this.preferences,
     required this.onSaved,
     this.continueProject,
-    this.initialTitle,
     this.createProject = true,
     super.key,
   });
@@ -31,9 +30,6 @@ class RecorderScreen extends StatefulWidget {
 
   /// When set, this recording becomes another session in the existing project.
   final RavenProject? continueProject;
-
-  /// Optional display title for a user-created scheduled recording.
-  final String? initialTitle;
 
   /// Controls whether a fresh recording starts as a new project or a single take.
   final bool createProject;
@@ -61,7 +57,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
   String? _outputPath;
   String? _recordingTitle;
   int _lastNotificationSecond = -1;
-  DateTime? _startedAt;
   Object? _lastError;
 
   bool get _hasUnsavedRecording => _started;
@@ -119,11 +114,17 @@ class _RecorderScreenState extends State<RecorderScreen> {
         throw StateError(
             'Decrypt this project before adding another recording session.');
       }
+
       final projectId = existingProject?.id ?? widget.repository.newId();
       final shouldCreateProject =
           existingProject != null || widget.createProject;
       final sessionId = const Uuid().v4();
       final createdAt = DateTime.now();
+      final titleStamp =
+          DateFormat('dd MMM yyyy, HH:mm', 'en').format(createdAt);
+      final draftTitle = existingProject?.title ??
+          '${tr(widget.preferences, 'Recording', 'Enregistrement')} — $titleStamp';
+      final sessionNumber = (existingProject?.sessions.length ?? 0) + 1;
       final projectDirectory = shouldCreateProject
           ? (existingProject == null
               ? await widget.repository.createProjectDirectory(projectId)
@@ -136,18 +137,20 @@ class _RecorderScreenState extends State<RecorderScreen> {
       // Keep the active capture as PCM WAV so an interrupted process can be
       // recovered even when the selected final export format is compressed.
       const extension = 'wav';
-      final filePath = '${sessionDirectory.path}/$sessionId.$extension';
+      final safeTitle = draftTitle
+          .trim()
+          .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_')
+          .replaceAll(RegExp(r'\s+'), '_');
+      final fileTitle = safeTitle.isEmpty
+          ? 'Recording'
+          : safeTitle.length > 48
+              ? safeTitle.substring(0, 48)
+              : safeTitle;
+      final filePath =
+          '${sessionDirectory.path}/$fileTitle-session-$sessionNumber-$sessionId.$extension';
       _projectId = projectId;
       _sessionId = sessionId;
       _outputPath = filePath;
-      _startedAt = createdAt;
-      final titleStamp =
-          DateFormat('dd MMM yyyy, HH:mm', 'en').format(createdAt);
-      final scheduledTitle = widget.initialTitle?.trim();
-      final draftTitle = existingProject?.title ??
-          (scheduledTitle != null && scheduledTitle.isNotEmpty
-              ? scheduledTitle
-              : '${tr(widget.preferences, 'Recording', 'Enregistrement')} — $titleStamp');
       _recordingTitle = draftTitle;
       final newSession = RavenAudioSession(
         id: sessionId,
@@ -155,6 +158,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
         createdAt: createdAt,
         durationMs: 0,
         format: extension,
+        name: '$draftTitle · Session $sessionNumber',
         sampleRate: widget.preferences.sampleRate,
         recoverablePcm16: true,
       );
@@ -381,7 +385,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
         throw const FileSystemException('The recording file was not created.');
       }
 
-      final createdAt = _startedAt ?? DateTime.now();
       final projectId = _projectId;
       final sessionId = _sessionId;
       if (projectId == null || sessionId == null) {
@@ -396,10 +399,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
       final previousMasterPath = widget.continueProject?.masterAudioPath;
       final previousPublicCopy = widget.continueProject?.publicCopyLocation;
       var project = draft.copyWith(
-        title: widget.continueProject?.title ??
-            ((widget.initialTitle?.trim().isNotEmpty ?? false)
-                ? widget.initialTitle!.trim()
-                : '${tr(widget.preferences, 'Recording', 'Enregistrement')} — ${DateFormat('dd MMM yyyy, HH:mm', 'en').format(createdAt)}'),
+        title: draft.title,
         updatedAt: DateTime.now(),
         sessions: draft.sessions
             .map((session) => session.id == sessionId
@@ -437,7 +437,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
             'Merged audio was saved privately because this recording is protected.',
             'L’audio fusionné a été enregistré en privé, car cet enregistrement est protégé.',
           ));
-        } else {
+        } else if (previousPublicCopy != null ||
+            widget.preferences.defaultPublicAudioVisible) {
           try {
             project = await _publishMergedAudio(
               project,

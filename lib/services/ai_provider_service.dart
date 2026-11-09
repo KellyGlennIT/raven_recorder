@@ -22,9 +22,9 @@ extension RavenAiProviderDetails on RavenAiProvider {
       };
 
   String get defaultModel => switch (this) {
-        RavenAiProvider.openRouter => 'openrouter/free',
+        RavenAiProvider.openRouter => 'meta-llama/llama-3.3-70b-instruct:free',
         RavenAiProvider.openAi => 'gpt-4o-mini',
-        RavenAiProvider.gemini => 'gemini-3.8-flash',
+        RavenAiProvider.gemini => 'gemini-2.0-flash',
       };
 
   String get keyInstructions => switch (this) {
@@ -194,7 +194,15 @@ class RavenAiProviderService {
       }
     }
     final feedback = json['promptFeedback'];
-    if (feedback is Map) throw RavenAiException('Gemini did not process this prompt (${feedback['blockReason'] ?? 'blocked'}).');
+    if (feedback is Map) {
+      throw RavenAiException(
+          'Gemini did not process this prompt (${feedback['blockReason'] ?? 'blocked'}).');
+    }
+    final error = json['error'];
+    if (error is Map) {
+      throw RavenAiException(
+          error['message']?.toString() ?? 'Provider rejected the request.');
+    }
     return '';
   }
 
