@@ -47,7 +47,8 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
   void initState() {
     super.initState();
     _title = widget.project.title;
-    _publicCopyLocation = widget.project.publicCopyLocation;
+    _publicCopyLocation = widget.project.publicFolderLocation ??
+        widget.project.publicCopyLocation;
     _loadAudio();
   }
 
@@ -164,11 +165,11 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
                 child: Text(tr(
                   widget.preferences,
                   _publicCopyLocation == null
-                      ? 'Make recording public'
-                      : 'Make recording private',
+                      ? 'Make project public'
+                      : 'Make project private',
                   _publicCopyLocation == null
-                      ? 'Rendre l’enregistrement public'
-                      : 'Rendre l’enregistrement privé',
+                      ? 'Rendre le projet public'
+                      : 'Rendre le projet privé',
                 )),
               ),
               PopupMenuItem<String>(

@@ -124,6 +124,7 @@ class RavenProject {
     this.aiGeneratedContent = const <String, String>{},
     this.masterAudioPath,
     this.publicCopyLocation,
+    this.publicFolderLocation,
   });
 
   final String id;
@@ -159,6 +160,14 @@ class RavenProject {
   /// URI or path for RAVEN-managed user-visible copy, separate from the private original.
   final String? publicCopyLocation;
 
+  /// URI or path of the public copy of the whole project folder (audio, notes,
+  /// attachments). Null while the project folder is private.
+  final String? publicFolderLocation;
+
+  /// True when the project folder is visible in the device's public RAVEN folder.
+  bool get isPublic =>
+      publicFolderLocation != null || publicCopyLocation != null;
+
   String? get latestAudioPath =>
       masterAudioPath ?? (sessions.isEmpty ? null : sessions.last.audioPath);
 
@@ -188,6 +197,8 @@ class RavenProject {
     bool clearMasterAudioPath = false,
     String? publicCopyLocation,
     bool clearPublicCopyLocation = false,
+    String? publicFolderLocation,
+    bool clearPublicFolderLocation = false,
   }) {
     return RavenProject(
       id: id,
@@ -218,6 +229,9 @@ class RavenProject {
       publicCopyLocation: clearPublicCopyLocation
           ? null
           : (publicCopyLocation ?? this.publicCopyLocation),
+      publicFolderLocation: clearPublicFolderLocation
+          ? null
+          : (publicFolderLocation ?? this.publicFolderLocation),
     );
   }
 
@@ -242,6 +256,7 @@ class RavenProject {
         'aiGeneratedContent': aiGeneratedContent,
         'masterAudioPath': masterAudioPath,
         'publicCopyLocation': publicCopyLocation,
+        'publicFolderLocation': publicFolderLocation,
       };
 
   factory RavenProject.fromJson(Map<String, Object?> json) {
@@ -287,6 +302,7 @@ class RavenProject {
           : <String, String>{},
       masterAudioPath: json['masterAudioPath'] as String?,
       publicCopyLocation: json['publicCopyLocation'] as String?,
+      publicFolderLocation: json['publicFolderLocation'] as String?,
     );
   }
 }

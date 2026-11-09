@@ -163,6 +163,96 @@ class MainActivity : FlutterActivity() {
                             result.error("PUBLISH_FAILED", error.message ?: "Could not save the document.", null)
                         }
                     }
+                    "publishFolder" -> {
+                        // Copies a whole project folder (audio, notes, attachments)
+                        // into Music/RAVEN/<folder> so it is browsable with any
+                        // file manager. Returns the folder's MediaStore URI.
+                        val sourcePath = call.argument<String>("sourcePath")
+                        val folderName = call.argument<String>("folderName")
+                        if (sourcePath.isNullOrBlank() || folderName.isNullOrBlank()) {
+                            result.error("BAD_ARGUMENTS", "Missing source folder or folder name.", null)
+                            return@setMethodCallHandler
+                        }
+                        val createdUris = mutableListOf<Uri>()
+                        try {
+                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                                throw IllegalStateException("Public folders require Android 10 or newer.")
+                            }
+                            val source = File(sourcePath)
+                            if (!source.isDirectory) throw IllegalStateException("Source folder does not exist.")
+                            val relativeRoot = Environment.DIRECTORY_MUSIC + "/RAVEN/" + folderName
+                            var folderUri: Uri? = null
+                            source.walkTopDown().forEach { file ->
+                                if (!file.isFile) return@forEach
+                                val relative = file.relativeTo(source).invariantSeparatorsPath
+                                val mime = mimeTypeFor(file.name)
+                                val values = ContentValues().apply {
+                                    put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+                                    put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                                    put(MediaStore.MediaColumns.RELATIVE_PATH, relativeRoot)
+                                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                                }
+                                val collection = if (mime.startsWith("audio/")) {
+                                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                                } else {
+                                    MediaStore.Files.getContentUri("external")
+                                }
+                                val uri = contentResolver.insert(collection, values)
+                                    ?: throw IllegalStateException("Could not create a public entry for ${file.name}.")
+                                createdUris.add(uri)
+                                contentResolver.openOutputStream(uri)?.use { stream ->
+                                    FileInputStream(file).use { input -> input.copyTo(stream) }
+                                } ?: throw IllegalStateException("Could not open the public destination for ${file.name}.")
+                                contentResolver.update(
+                                    uri,
+                                    ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
+                                    null,
+                                    null,
+                                )
+                                if (folderUri == null) folderUri = uri
+                            }
+                            if (folderUri == null) {
+                                throw IllegalStateException("The project folder contains no files to publish.")
+                            }
+                            result.success(folderUri.toString())
+                        } catch (error: Exception) {
+                            for (uri in createdUris) {
+                                try { contentResolver.delete(uri, null, null) } catch (_: Exception) { }
+                            }
+                            result.error("PUBLISH_FAILED", error.message ?: "Could not publish the project folder.", null)
+                        }
+                    }
+                    "deletePublishedFolder" -> {
+                        // Removes every file RAVEN published for a project folder.
+                        val rawUri = call.argument<String>("uri")
+                        if (rawUri.isNullOrBlank() || !rawUri.startsWith("content://")) {
+                            result.error("BAD_URI", "A managed MediaStore URI is required.", null)
+                        } else {
+                            try {
+                                val uri = Uri.parse(rawUri)
+                                val relativePath = contentResolver.query(
+                                    uri,
+                                    arrayOf(MediaStore.MediaColumns.RELATIVE_PATH),
+                                    null,
+                                    null,
+                                    null,
+                                )?.use { cursor ->
+                                    if (cursor.moveToFirst()) cursor.getString(0) else null
+                                }
+                                if (relativePath.isNullOrBlank()) {
+                                    result.success(false)
+                                    return@setMethodCallHandler
+                                }
+                                val selection = "${MediaStore.MediaColumns.RELATIVE_PATH}=?"
+                                val args = arrayOf(relativePath)
+                                contentResolver.delete(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, selection, args)
+                                contentResolver.delete(MediaStore.Files.getContentUri("external"), selection, args)
+                                result.success(true)
+                            } catch (error: Exception) {
+                                result.error("DELETE_FAILED", error.message ?: "Could not remove the public folder.", null)
+                            }
+                        }
+                    }
                     "deletePublishedAudio" -> {
                         val rawUri = call.argument<String>("uri")
                         if (rawUri.isNullOrBlank() || !rawUri.startsWith("content://")) {
@@ -202,6 +292,20 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    private fun mimeTypeFor(fileName: String): String = when (fileName.substringAfterLast('.', "").lowercase()) {
+        "wav" -> "audio/wav"
+        "flac" -> "audio/flac"
+        "mp3" -> "audio/mpeg"
+        "m4a", "aac" -> "audio/mp4"
+        "txt" -> "text/plain"
+        "json" -> "application/json"
+        "pdf" -> "application/pdf"
+        "png" -> "image/png"
+        "jpg", "jpeg" -> "image/jpeg"
+        "webp" -> "image/webp"
+        else -> "application/octet-stream"
     }
 
     private fun recordingAction(action: String?): String? = when (action) {

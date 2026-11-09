@@ -188,6 +188,15 @@ class _RecorderScreenState extends State<RecorderScreen> {
       } else {
         await widget.repository.update(draft);
       }
+      // Every project owns a real folder on the device (audio, notes,
+      // attachments, exports, metadata).
+      if (shouldCreateProject) {
+        try {
+          await widget.repository.ensureProjectFolder(draft);
+        } catch (_) {
+          // The recording must still start; the folder is recreated on save.
+        }
+      }
 
       await _recorder.start(
         RecordConfig(
@@ -397,7 +406,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
       // Continuing clears the master pointer while source sessions are appended.
       // Keep the previous file until this new source session is durably committed.
       final previousMasterPath = widget.continueProject?.masterAudioPath;
-      final previousPublicCopy = widget.continueProject?.publicCopyLocation;
+      final wasPublic = widget.continueProject?.isPublic ?? false;
       var project = draft.copyWith(
         title: draft.title,
         updatedAt: DateTime.now(),
@@ -437,20 +446,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
             'Merged audio was saved privately because this recording is protected.',
             'L’audio fusionné a été enregistré en privé, car cet enregistrement est protégé.',
           ));
-        } else if (previousPublicCopy != null ||
-            widget.preferences.defaultPublicAudioVisible) {
-          try {
-            project = await _publishMergedAudio(
-              project,
-              previousPublicCopy: previousPublicCopy,
-            );
-          } catch (publishError) {
-            _showMessage(tr(
-              widget.preferences,
-              'Merged audio is saved in RAVEN, but its public copy could not be updated: $publishError',
-              'L’audio fusionné est enregistré dans RAVEN, mais sa copie publique n’a pas pu être mise à jour : $publishError',
-            ));
-          }
         }
       } catch (mergeError) {
         // Keep the successful recording even if an optional master rebuild fails.
@@ -458,6 +453,21 @@ class _RecorderScreenState extends State<RecorderScreen> {
             widget.preferences,
             'Recording saved. RAVEN will play the parts in sequence because the master merge could not finish: $mergeError',
             'Enregistrement sauvegardé. RAVEN lira les parties à la suite, car la fusion principale n’a pas abouti : $mergeError'));
+      }
+      // Refresh the public folder copy when the project is public (or when the
+      // user asked for public audio by default).
+      if (!project.isAudioProtected &&
+          !project.requiresAppPin &&
+          (wasPublic || widget.preferences.defaultPublicAudioVisible)) {
+        try {
+          project = await _publishProjectFolder(project);
+        } catch (publishError) {
+          _showMessage(tr(
+            widget.preferences,
+            'Recording is saved in RAVEN, but its public folder could not be updated: $publishError',
+            'L’enregistrement est sauvegardé dans RAVEN, mais son dossier public n’a pas pu être mis à jour : $publishError',
+          ));
+        }
       }
       // The segment files are now the durable source of truth and the project
       // index no longer refers to the old master. Clean it up only after commit;
@@ -489,38 +499,26 @@ class _RecorderScreenState extends State<RecorderScreen> {
     }
   }
 
-  Future<RavenProject> _publishMergedAudio(
-    RavenProject project, {
-    String? previousPublicCopy,
-  }) async {
+  /// Publishes the whole project folder (audio, notes, attachments) into the
+  /// device's public RAVEN folder and records its location on the project.
+  Future<RavenProject> _publishProjectFolder(RavenProject project) async {
     final visibility = AudioVisibilityService();
-    final location = await visibility.publish(
-      source: File(project.masterAudioPath!),
-      title: project.title,
-      projectId: project.id,
+    final folder = await widget.repository.ensureProjectFolder(project);
+    final location = await visibility.publishFolder(
+      source: folder,
+      folderName: widget.repository.projectFolderName(project),
     );
-    final published = project.copyWith(publicCopyLocation: location);
+    final published = project.copyWith(publicFolderLocation: location);
     try {
       await widget.repository.update(published);
     } catch (error) {
       try {
-        await visibility.remove(location);
+        await visibility.removeFolder(location);
       } catch (cleanupError) {
         throw StateError(
-            '$error The new public copy could not be cleaned up: $cleanupError');
+            '$error The new public folder could not be cleaned up: $cleanupError');
       }
       rethrow;
-    }
-    if (previousPublicCopy != null && previousPublicCopy != location) {
-      try {
-        await visibility.remove(previousPublicCopy);
-      } catch (cleanupError) {
-        _showMessage(tr(
-          widget.preferences,
-          'The new merged audio was published, but its previous public copy could not be removed: $cleanupError',
-          'Le nouvel audio fusionné a été publié, mais l’ancienne copie publique n’a pas pu être supprimée : $cleanupError',
-        ));
-      }
     }
     return published;
   }

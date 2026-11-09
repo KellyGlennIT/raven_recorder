@@ -410,11 +410,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 _detailRow(
                     widget.preferences,
                     'Privacy',
-                    project.publicCopyLocation == null
-                        ? tr(widget.preferences, 'Private in RAVEN',
-                            'Privé dans RAVEN')
-                        : tr(widget.preferences, 'Has a device-folder copy',
-                            'Possède une copie dans les dossiers')),
+                    project.isPublic
+                        ? tr(widget.preferences, 'Public project folder',
+                            'Dossier de projet public')
+                        : tr(widget.preferences, 'Private in RAVEN',
+                            'Privé dans RAVEN')),
                 if (project.isAudioProtected)
                   _detailRow(widget.preferences, 'Encryption', 'Encrypted'),
                 if (project.requiresAppPin)
@@ -1008,12 +1008,12 @@ class ProjectTile extends StatelessWidget {
                         value: 'visibility',
                         child: Text(tr(
                           preferences,
-                          project.publicCopyLocation == null
-                              ? 'Make public'
-                              : 'Make private',
-                          project.publicCopyLocation == null
-                              ? 'Rendre public'
-                              : 'Rendre privé',
+                          project.isPublic
+                              ? 'Make project private'
+                              : 'Make project public',
+                          project.isPublic
+                              ? 'Rendre le projet privé'
+                              : 'Rendre le projet public',
                         )),
                       ),
                     if (onToggleProtection != null)
@@ -1036,8 +1036,8 @@ class ProjectTile extends StatelessWidget {
                           project.isStandalone
                               ? tr(preferences, 'Resume recording',
                                   'Reprendre l’enregistrement')
-                              : tr(preferences, 'Add another session',
-                                  'Ajouter une session'),
+                              : tr(preferences, 'Add a recording',
+                                  'Ajouter un enregistrement'),
                         ),
                       ),
                     if (!project.isTrashed && onRename != null)

@@ -46,6 +46,74 @@ class AudioVisibilityService {
     throw UnsupportedError('Public-folder visibility is currently supported on Android and Windows.');
   }
 
+  /// Publishes a whole project folder (audio + notes + attachments) into the
+  /// device's public RAVEN folder so it can be browsed with a file manager.
+  /// Returns the public folder location.
+  Future<String> publishFolder({
+    required Directory source,
+    required String folderName,
+  }) async {
+    if (!await source.exists()) {
+      throw FileSystemException('The project folder does not exist.', source.path);
+    }
+    final safeFolder = _safeName(folderName);
+    if (Platform.isAndroid) {
+      final location = await _channel.invokeMethod<String>(
+        'publishFolder',
+        <String, Object?>{
+          'sourcePath': source.path,
+          'folderName': safeFolder,
+        },
+      );
+      if (location == null || location.isEmpty) {
+        throw StateError('Android did not return the published folder URI.');
+      }
+      return location;
+    }
+    if (Platform.isWindows) {
+      final downloads = await getDownloadsDirectory();
+      if (downloads == null) {
+        throw StateError('Windows Downloads folder could not be located.');
+      }
+      final destination = Directory(
+          '${downloads.path}${Platform.pathSeparator}RAVEN${Platform.pathSeparator}$safeFolder');
+      if (await destination.exists()) {
+        await destination.delete(recursive: true);
+      }
+      await destination.create(recursive: true);
+      await for (final entity in source.list(recursive: true, followLinks: false)) {
+        if (entity is! File) continue;
+        final relative = entity.path.substring(source.path.length + 1);
+        final target = File('${destination.path}${Platform.pathSeparator}$relative');
+        await target.parent.create(recursive: true);
+        await entity.copy(target.path);
+      }
+      return destination.path;
+    }
+    throw UnsupportedError(
+        'Public project folders are currently supported on Android and Windows.');
+  }
+
+  Future<void> removeFolder(String location) async {
+    if (location.startsWith('content://') && Platform.isAndroid) {
+      final removed = await _channel.invokeMethod<bool>(
+        'deletePublishedFolder',
+        <String, Object?>{'uri': location},
+      );
+      if (removed != true) {
+        throw StateError('RAVEN could not confirm removal of the public folder.');
+      }
+      return;
+    }
+    if (Platform.isWindows) {
+      final directory = Directory(location);
+      if (await directory.exists()) await directory.delete(recursive: true);
+      return;
+    }
+    throw UnsupportedError(
+        'Removing public project folders is currently supported on Android and Windows.');
+  }
+
   Future<void> remove(String location) async {
     if (location.startsWith('content://') && Platform.isAndroid) {
       final removed = await _channel.invokeMethod<bool>(

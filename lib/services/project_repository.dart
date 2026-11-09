@@ -57,6 +57,34 @@ class ProjectRepository {
     return directory;
   }
 
+  /// Creates the on-device folder tree for a project. Every project owns a
+  /// stable folder named after its title (with the ID appended so two projects
+  /// with the same title never collide), containing the audio, notes,
+  /// attachments, exports and metadata sub-folders.
+  Future<Directory> ensureProjectFolder(RavenProject project) async {
+    final folder = Directory('${projectsDirectory.path}/${projectFolderName(project)}');
+    await folder.create(recursive: true);
+    for (final child in <String>[
+      'sessions',
+      'notes',
+      'attachments',
+      'exports',
+      'metadata'
+    ]) {
+      await Directory('${folder.path}/$child').create(recursive: true);
+    }
+    return folder;
+  }
+
+  /// Human-readable, filesystem-safe folder name for a project.
+  String projectFolderName(RavenProject project) {
+    final base = _safeFolderName(project.title);
+    final shortId = project.id.length > 8
+        ? project.id.substring(0, 8)
+        : project.id;
+    return '${base.isEmpty ? 'Project' : base}-$shortId';
+  }
+
   Future<void> load() async {
     _projects.clear();
     await _loadCategories();
@@ -91,9 +119,24 @@ class ProjectRepository {
       }
       await _recoverInterruptedDrafts();
       await _includeProjectCategories();
+      await _ensureProjectFolders();
       return;
     }
     await _includeProjectCategories();
+    await _ensureProjectFolders();
+  }
+
+  /// Older projects were stored under their raw ID. Give every project the
+  /// same on-device folder tree (audio, notes, attachments, exports, metadata)
+  /// so the folder structure is consistent for new and existing projects.
+  Future<void> _ensureProjectFolders() async {
+    for (final project in _projects) {
+      try {
+        await ensureProjectFolder(project);
+      } on FileSystemException {
+        // A missing folder must never prevent the library from loading.
+      }
+    }
   }
 
   Future<void> _loadCategories() async {
@@ -410,6 +453,9 @@ class ProjectRepository {
           'category': project.category,
           'updatedAt': project.updatedAt.toIso8601String(),
           'projectDirectory': '${projectsDirectory.path}/${project.id}',
+          'projectFolder':
+              '${projectsDirectory.path}/${projectFolderName(project)}',
+          'isPublic': project.publicCopyLocation != null,
         }),
         flush: true);
     // Remove stale category pointers when a project moves; project files stay in

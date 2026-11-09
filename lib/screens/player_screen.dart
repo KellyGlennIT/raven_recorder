@@ -14,7 +14,6 @@ import '../services/app_preferences.dart';
 import '../services/attachment_service.dart';
 import '../services/project_archive_service.dart';
 import '../services/audio_encryption_service.dart';
-import '../services/audio_timeline.dart';
 import '../services/project_repository.dart';
 import '../services/ai_provider_service.dart';
 import '../services/ai_key_vault.dart';
@@ -56,11 +55,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
   String? _error;
   String? _securityWarning;
 
+  /// Index of the recording currently loaded in the player. Each recording is
+  /// played on its own: tapping a recording loads only that file, so the
+  /// position, duration and seek bar always refer to a single recording.
+  int _activeIndex = 0;
+
   @override
   void initState() {
     super.initState();
     _project = widget.project;
     _notesController.text = _project.notes;
+    _activeIndex = _project.sessions.isEmpty ? 0 : _project.sessions.length - 1;
     _loadSelectedSession();
   }
 
@@ -71,6 +76,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _project = widget.project;
       _audioKey = null;
       _notesController.text = _project.notes;
+      _activeIndex =
+          _project.sessions.isEmpty ? 0 : _project.sessions.length - 1;
       _loadSelectedSession();
     }
   }
@@ -88,8 +95,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
     super.dispose();
   }
 
-  RavenAudioSession? get _session =>
-      _project.sessions.isEmpty ? null : _project.sessions.last;
+  RavenAudioSession? get _session => _project.sessions.isEmpty
+      ? null
+      : _project.sessions[_activeIndex.clamp(0, _project.sessions.length - 1)];
+
+  /// Loads one recording into the player. Only the selected recording is
+  /// played; the other recordings in the project stay untouched on disk.
+  Future<void> _playRecording(int index) async {
+    if (_project.sessions.isEmpty) return;
+    final target = index.clamp(0, _project.sessions.length - 1);
+    if (target == _activeIndex && !_loading && _error == null) {
+      await _player.seek(Duration.zero);
+      await _player.play();
+      return;
+    }
+    setState(() => _activeIndex = target);
+    final loaded = await _loadSelectedSession();
+    if (loaded && mounted) await _player.play();
+  }
 
   Future<void> _toggleAudioEncryption() async {
     if (_loading) return;
@@ -187,21 +210,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return null;
   }
 
+  /// Position inside the recording that is currently loaded.
   int _globalPositionMs(int? index, Duration localPosition) =>
-      (_project.masterAudioPath != null && !_project.isAudioProtected)
-          ? localPosition.inMilliseconds
-          : AudioTimeline.offsetOf(_project.sessions, index ?? 0) +
-              localPosition.inMilliseconds;
+      localPosition.inMilliseconds;
 
   Future<void> _seekGlobal(int milliseconds) async {
     if (_project.sessions.isEmpty) return;
-    if (_project.masterAudioPath != null && !_project.isAudioProtected) {
-      await _player.seek(Duration(milliseconds: milliseconds));
-      return;
-    }
-    final target = AudioTimeline.locate(_project.sessions, milliseconds);
-    await _player.seek(Duration(milliseconds: target.localMs),
-        index: target.index);
+    await _player.seek(Duration(milliseconds: milliseconds));
+  }
+
+  /// Duration of the recording currently loaded in the player.
+  int get _activeDurationMs {
+    final session = _session;
+    if (session == null) return 0;
+    final playerDuration = _player.duration?.inMilliseconds ?? 0;
+    return playerDuration > 0 ? playerDuration : session.durationMs;
   }
 
   Future<bool> _loadSelectedSession() async {
@@ -260,10 +283,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
         }
       }
 
-      // Prefer the fast master file, but a present file can still be truncated
-      // or corrupt. Validate it through the player and fall back to retained
-      // source sessions instead of making the entire project unplayable.
-      if (masterPath != null && !_project.isAudioProtected && masterExists) {
+      // Each recording is played on its own. The merged master is only used
+      // when the project holds a single recording, so tapping a recording never
+      // plays the other recordings of the project.
+      final selected = _session;
+      if (selected == null) {
+        _error = tr(
+            widget.preferences,
+            'This project has no audio session yet.',
+            'Ce projet ne contient pas encore de session audio.');
+        return false;
+      }
+      final useMaster = masterPath != null &&
+          !_project.isAudioProtected &&
+          masterExists &&
+          _project.sessions.length == 1;
+      if (useMaster) {
         try {
           await _player.setAudioSource(
             AudioSource.uri(Uri.file(masterPath), tag: 'master'),
@@ -285,33 +320,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
 
       if (!loaded) {
-        final sources = <AudioSource>[];
-        for (final session in _project.sessions) {
-          final source = File(session.audioPath);
-          if (!await source.exists()) {
-            throw FileSystemException(
-                'An audio segment is missing', source.path);
-          }
-          var playbackPath = session.audioPath;
-          if (_project.isAudioProtected) {
-            final extension = session.format == 'wav'
-                ? 'wav'
-                : session.format == 'flac'
-                    ? 'flac'
-                    : 'm4a';
-            final temp = File(
-                '${cache.path}/raven-playback-${_project.id}-${session.id}.$extension');
-            if (await temp.exists()) await temp.delete();
-            await _encryption.decryptFile(
-                input: source, output: temp, key: _audioKey);
-            _temporaryDecryptedPaths.add(temp.path);
-            playbackPath = temp.path;
-          }
-          sources.add(AudioSource.uri(Uri.file(playbackPath), tag: session.id));
+        final source = File(selected.audioPath);
+        if (!await source.exists()) {
+          throw FileSystemException(
+              'The selected recording is missing', source.path);
+        }
+        var playbackPath = selected.audioPath;
+        if (_project.isAudioProtected) {
+          final extension = selected.format == 'wav'
+              ? 'wav'
+              : selected.format == 'flac'
+                  ? 'flac'
+                  : 'm4a';
+          final temp = File(
+              '${cache.path}/raven-playback-${_project.id}-${selected.id}.$extension');
+          if (await temp.exists()) await temp.delete();
+          await _encryption.decryptFile(
+              input: source, output: temp, key: _audioKey);
+          _temporaryDecryptedPaths.add(temp.path);
+          playbackPath = temp.path;
         }
         await _player.setAudioSource(
-          ConcatenatingAudioSource(children: sources, useLazyPreparation: true),
-          initialIndex: 0,
+          AudioSource.uri(Uri.file(playbackPath), tag: selected.id),
           initialPosition: Duration.zero,
         );
         loaded = true;
@@ -818,8 +848,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       String action, RavenAudioSession session, int index) async {
     switch (action) {
       case 'play':
-        await _seekGlobal(AudioTimeline.offsetOf(_project.sessions, index));
-        await _player.play();
+        await _playRecording(index);
       case 'share':
         try {
           await AudioShareService()
@@ -997,14 +1026,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
         return;
       }
 
-      final previousPublicLocation = _project.publicCopyLocation;
-      if (previousPublicLocation != null) {
-        await AudioVisibilityService().remove(previousPublicLocation);
-        await _saveProject(_project.copyWith(clearPublicCopyLocation: true));
+      final previousPublicLocation = _project.publicFolderLocation;
+      final previousAudioCopy = _project.publicCopyLocation;
+      if (previousPublicLocation != null || previousAudioCopy != null) {
+        if (previousPublicLocation != null) {
+          await AudioVisibilityService().removeFolder(previousPublicLocation);
+        }
+        if (previousAudioCopy != null) {
+          await AudioVisibilityService().remove(previousAudioCopy);
+        }
+        await _saveProject(_project.copyWith(
+          clearPublicCopyLocation: true,
+          clearPublicFolderLocation: true,
+        ));
       }
       final oldMasterPath = _project.masterAudioPath;
       final sessions = List<RavenAudioSession>.of(_project.sessions)
         ..removeAt(index);
+      // Keep the player pointing at a recording that still exists.
+      final nextActive = sessions.isEmpty
+          ? 0
+          : (_activeIndex > index ? _activeIndex - 1 : _activeIndex)
+              .clamp(0, sessions.length - 1);
+      if (mounted) setState(() => _activeIndex = nextActive);
       await _saveProject(_project.copyWith(
         sessions: sessions,
         clearMasterAudioPath: true,
@@ -1038,26 +1082,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
           sessions.isNotEmpty &&
           !_project.isAudioProtected &&
           !_project.requiresAppPin) {
-        var sourcePath = _project.masterAudioPath;
-        if (sessions.length == 1) {
-          sourcePath = sessions.single.audioPath;
-        }
-        if (sourcePath != null) {
-          try {
-            final location = await AudioVisibilityService().publish(
-              source: File(sourcePath),
-              title: _project.title,
-              projectId: _project.id,
-            );
-            await _saveProject(_project.copyWith(publicCopyLocation: location));
-          } catch (error) {
-            if (!mounted) return;
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text(
-                  'Session deleted, but the public copy was not recreated: $error'),
-            ));
-            return;
-          }
+        try {
+          final folder = await widget.repository.ensureProjectFolder(_project);
+          final location = await AudioVisibilityService().publishFolder(
+            source: folder,
+            folderName: widget.repository.projectFolderName(_project),
+          );
+          await _saveProject(
+              _project.copyWith(publicFolderLocation: location));
+        } catch (error) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(
+                'Recording deleted, but the public folder was not recreated: $error'),
+          ));
+          return;
         }
       }
       if (mergeFailure != null && mounted) {
@@ -1075,76 +1114,102 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Widget _buildSessionsSection(ThemeData theme) {
+    final colorScheme = theme.colorScheme;
     return Card(
       child: ExpansionTile(
         initiallyExpanded: true,
         leading: Icon(Icons.multitrack_audio_rounded,
-            color: theme.colorScheme.primary),
+            color: colorScheme.primary),
         title: Text(tr(
           widget.preferences,
-          'Recording sessions (${_project.sessions.length})',
-          'Sessions d’enregistrement (${_project.sessions.length})',
+          'Recordings (${_project.sessions.length})',
+          'Enregistrements (${_project.sessions.length})',
         )),
         subtitle: Text(tr(
           widget.preferences,
-          'Each session stays available separately while the project plays as one.',
-          'Chaque session reste disponible séparément tandis que le projet est lu en continu.',
+          'Tap a recording to play only that recording. Use its menu to rename, share or delete it.',
+          'Touchez un enregistrement pour lire uniquement celui-ci. Utilisez son menu pour le renommer, le partager ou le supprimer.',
         )),
         children: _project.sessions.asMap().entries.map((entry) {
           final index = entry.key;
           final session = entry.value;
+          final isActive = index == _activeIndex;
           final title = session.name.isEmpty
-              ? tr(widget.preferences, 'Session ${index + 1}',
-                  'Session ${index + 1}')
+              ? tr(widget.preferences, 'Recording ${index + 1}',
+                  'Enregistrement ${index + 1}')
               : session.name;
-          return ListTile(
-            leading: CircleAvatar(child: Text('${index + 1}')),
-            title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
-            subtitle: Text(
-              '${_formatDuration(session.durationMs)} · ${session.format.toUpperCase()} · ${DateFormat('dd MMM yyyy, HH:mm', widget.preferences.isFrench ? 'fr' : 'en').format(session.createdAt)}',
-              maxLines: 2,
+          return Container(
+            margin: const EdgeInsets.fromLTRB(8, 2, 8, 6),
+            decoration: BoxDecoration(
+              color: isActive
+                  ? colorScheme.primaryContainer.withValues(alpha: 0.55)
+                  : colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+              borderRadius: BorderRadius.circular(14),
+              border: isActive
+                  ? Border.all(color: colorScheme.primary, width: 1.2)
+                  : null,
             ),
-            onTap: _loading
-                ? null
-                : () => _handleSessionAction('play', session, index),
-            trailing: PopupMenuButton<String>(
-              tooltip: tr(widget.preferences, 'Session actions',
-                  'Actions de la session'),
-              onSelected: (action) =>
-                  _handleSessionAction(action, session, index),
-              itemBuilder: (context) => <PopupMenuEntry<String>>[
-                PopupMenuItem(
-                  value: 'play',
-                  child: Text(tr(
-                      widget.preferences, 'Play session', 'Lire la session')),
-                ),
-                PopupMenuItem(
-                  value: 'share',
-                  child: Text(tr(widget.preferences, 'Share session',
-                      'Partager la session')),
-                ),
-                PopupMenuItem(
-                  value: 'details',
-                  child: Text(tr(widget.preferences, 'Details', 'Détails')),
-                ),
-                PopupMenuItem(
-                  value: 'rename',
-                  child: Text(tr(widget.preferences, 'Rename session',
-                      'Renommer la session')),
-                ),
-                PopupMenuItem(
-                  value: 'delete',
-                  child: Text(tr(
-                    widget.preferences,
-                    _project.sessions.length == 1
-                        ? 'Move recording to Trash'
-                        : 'Delete session',
-                    _project.sessions.length == 1
-                        ? 'Mettre dans la corbeille'
-                        : 'Supprimer la session',
-                  )),
-                ),
-              ],
+            child: ListTile(
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14)),
+              leading: CircleAvatar(
+                backgroundColor: isActive
+                    ? colorScheme.primary
+                    : colorScheme.surfaceContainerHighest,
+                foregroundColor: isActive
+                    ? colorScheme.onPrimary
+                    : colorScheme.onSurfaceVariant,
+                child: isActive
+                    ? const Icon(Icons.graphic_eq_rounded, size: 20)
+                    : Text('${index + 1}'),
+              ),
+              title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: Text(
+                '${_formatDuration(session.durationMs)} · ${session.format.toUpperCase()} · ${DateFormat('dd MMM yyyy, HH:mm', widget.preferences.isFrench ? 'fr' : 'en').format(session.createdAt)}',
+                maxLines: 2,
+              ),
+              onTap: _loading
+                  ? null
+                  : () => _handleSessionAction('play', session, index),
+              trailing: PopupMenuButton<String>(
+                tooltip: tr(widget.preferences, 'Recording actions',
+                    'Actions de l’enregistrement'),
+                onSelected: (action) =>
+                    _handleSessionAction(action, session, index),
+                itemBuilder: (context) => <PopupMenuEntry<String>>[
+                  PopupMenuItem(
+                    value: 'play',
+                    child: Text(tr(widget.preferences, 'Play this recording',
+                        'Lire cet enregistrement')),
+                  ),
+                  PopupMenuItem(
+                    value: 'share',
+                    child: Text(tr(widget.preferences, 'Share recording',
+                        'Partager l’enregistrement')),
+                  ),
+                  PopupMenuItem(
+                    value: 'details',
+                    child: Text(tr(widget.preferences, 'Details', 'Détails')),
+                  ),
+                  PopupMenuItem(
+                    value: 'rename',
+                    child: Text(tr(widget.preferences, 'Rename recording',
+                        'Renommer l’enregistrement')),
+                  ),
+                  PopupMenuItem(
+                    value: 'delete',
+                    child: Text(tr(
+                      widget.preferences,
+                      _project.sessions.length == 1
+                          ? 'Move recording to Trash'
+                          : 'Delete recording',
+                      _project.sessions.length == 1
+                          ? 'Mettre dans la corbeille'
+                          : 'Supprimer l’enregistrement',
+                    )),
+                  ),
+                ],
+              ),
             ),
           );
         }).toList(),
@@ -1366,18 +1431,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    final activeIndex = _player.currentIndex ?? 0;
+    // Bookmarks belong to the recording that is currently loaded, so the
+    // stored position is always local to that recording.
+    final activeSession = _session ?? _project.sessions.last;
     final globalPosition = existing?.positionMs ??
-        _globalPositionMs(activeIndex, _player.position);
-    // Resolve which recording part the position lives in on the single
-    // continuous timeline, whether playback uses the master or the sessions.
-    final timelineIndex = AudioTimeline.locate(
-            _project.sessions, globalPosition)
-        .index;
-    final activeSession = timelineIndex >= 0 &&
-            timelineIndex < _project.sessions.length
-        ? _project.sessions[timelineIndex]
-        : _project.sessions.last;
+        _globalPositionMs(_activeIndex, _player.position);
     final sessionNumber = _project.sessions.indexWhere(
             (s) => s.id == activeSession.id) +
         1;
@@ -1545,6 +1603,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _jumpToBookmark(RavenBookmark bookmark) async {
+    // A bookmark points at one recording; load that recording before seeking.
+    final index = _project.sessions
+        .indexWhere((session) => session.id == bookmark.sessionId);
+    if (index >= 0 && index != _activeIndex) {
+      setState(() => _activeIndex = index);
+      final loaded = await _loadSelectedSession();
+      if (!loaded || !mounted) return;
+    }
     await _seekGlobal(bookmark.positionMs);
     if (mounted) await _player.play();
   }
@@ -1792,8 +1858,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
               'Aucun audio enregistré à afficher dans les dossiers pour le moment.'))));
       return;
     }
-    final existingLocation = _project.publicCopyLocation;
-    final enabling = existingLocation == null;
+    final existingLocation = _project.publicFolderLocation;
+    final existingAudioCopy = _project.publicCopyLocation;
+    final enabling = existingLocation == null && existingAudioCopy == null;
     if (enabling && (_project.isAudioProtected || _project.requiresAppPin)) {
       final message = _project.isAudioProtected
           ? tr(
@@ -1813,20 +1880,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
       builder: (dialogContext) => AlertDialog(
         title: Text(tr(
             widget.preferences,
-            enabling
-                ? 'Show recording in device folders?'
-                : 'Hide recording from device folders?',
-            enabling
-                ? 'Afficher dans les dossiers de l’appareil ?'
-                : 'Masquer des dossiers de l’appareil ?')),
+            enabling ? 'Make project public?' : 'Make project private?',
+            enabling ? 'Rendre le projet public ?' : 'Rendre le projet privé ?')),
         content: Text(tr(
             widget.preferences,
             enabling
-                ? 'RAVEN will create a separate copy in Music/RAVEN (Android) or Downloads/RAVEN (Windows). Other apps and people with access to those folders may be able to see it. Your private RAVEN original remains in place. This is not available for encrypted or individually PIN-locked recordings.'
-                : 'RAVEN will remove the public copy it created. Your private original and project remain inside RAVEN. If you shared or copied the public file elsewhere, those other copies are not removed.',
+                ? 'RAVEN will copy this project’s folder (audio, notes and attachments) into Music/RAVEN (Android) or Downloads/RAVEN (Windows). Other apps and people with access to those folders may be able to see it. Your private RAVEN original remains in place. This is not available for encrypted or individually PIN-locked recordings.'
+                : 'RAVEN will remove the public folder it created. Your private original and project remain inside RAVEN. If you shared or copied the public files elsewhere, those other copies are not removed.',
             enabling
-                ? 'RAVEN créera une copie séparée dans Music/RAVEN (Android) ou Downloads/RAVEN (Windows). D’autres applications ou personnes ayant accès à ces dossiers pourront la voir. L’original privé reste dans RAVEN. Cette option n’est pas disponible pour les enregistrements chiffrés ou verrouillés par un PIN individuel.'
-                : 'RAVEN supprimera la copie publique créée par l’application. L’original privé et le projet resteront dans RAVEN. Les copies partagées ou copiées ailleurs ne seront pas supprimées.')),
+                ? 'RAVEN copiera le dossier de ce projet (audio, notes et pièces jointes) dans Music/RAVEN (Android) ou Downloads/RAVEN (Windows). D’autres applications ou personnes ayant accès à ces dossiers pourront le voir. L’original privé reste dans RAVEN. Cette option n’est pas disponible pour les enregistrements chiffrés ou verrouillés par un PIN individuel.'
+                : 'RAVEN supprimera le dossier public créé par l’application. L’original privé et le projet resteront dans RAVEN. Les fichiers partagés ou copiés ailleurs ne seront pas supprimés.')),
         actions: <Widget>[
           TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
@@ -1845,47 +1908,41 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final visibility = AudioVisibilityService();
     try {
       if (enabling) {
-        var sourcePath = _project.masterAudioPath;
-        if (sourcePath == null || !await File(sourcePath).exists()) {
-          final master = await AudioMergeService().mergeProject(
-            sessions: _project.sessions,
-            outputDirectory: Directory(
-                '${widget.repository.projectsDirectory.path}/${_project.id}/sessions'),
-            projectId: _project.id,
-            format: _project.sessions.last.format,
-            bitRate: widget.preferences.bitRate,
-            sampleRate: widget.preferences.sampleRate,
-          );
-          sourcePath = master.path;
-          await _saveProject(_project.copyWith(masterAudioPath: sourcePath));
-        }
-        final location = await visibility.publish(
-          source: File(sourcePath),
-          title: _project.title,
-          projectId: _project.id,
+        final folder = await widget.repository.ensureProjectFolder(_project);
+        final location = await visibility.publishFolder(
+          source: folder,
+          folderName: widget.repository.projectFolderName(_project),
         );
         try {
-          await _saveProject(_project.copyWith(publicCopyLocation: location));
+          await _saveProject(_project.copyWith(publicFolderLocation: location));
         } catch (_) {
           try {
-            await visibility.remove(location);
+            await visibility.removeFolder(location);
           } catch (_) {}
           rethrow;
         }
       } else {
-        await visibility.remove(existingLocation);
-        await _saveProject(_project.copyWith(clearPublicCopyLocation: true));
+        if (existingLocation != null) {
+          await visibility.removeFolder(existingLocation);
+        }
+        if (existingAudioCopy != null) {
+          await visibility.remove(existingAudioCopy);
+        }
+        await _saveProject(_project.copyWith(
+          clearPublicCopyLocation: true,
+          clearPublicFolderLocation: true,
+        ));
       }
       if (!mounted) return;
       messenger.showSnackBar(SnackBar(
           content: Text(tr(
               widget.preferences,
               enabling
-                  ? 'Public copy created. The private original is unchanged.'
-                  : 'Public copy removed. The private original is unchanged.',
+                  ? 'Project folder published. The private original is unchanged.'
+                  : 'Public folder removed. The private original is unchanged.',
               enabling
-                  ? 'Copie publique créée. L’original privé est inchangé.'
-                  : 'Copie publique supprimée. L’original privé est inchangé.'))));
+                  ? 'Dossier du projet publié. L’original privé est inchangé.'
+                  : 'Dossier public supprimé. L’original privé est inchangé.'))));
     } catch (error) {
       if (!mounted) return;
       messenger.showSnackBar(SnackBar(
@@ -1958,17 +2015,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   enabled: !_loading),
               _projectMenuItem(
                 'visibility',
-                _project.publicCopyLocation == null
-                    ? Icons.folder_outlined
-                    : Icons.folder_off_outlined,
+                _project.isPublic
+                    ? Icons.folder_off_outlined
+                    : Icons.folder_outlined,
                 tr(
                   widget.preferences,
-                  _project.publicCopyLocation == null
-                      ? 'Show in device folders'
-                      : 'Hide from device folders',
-                  _project.publicCopyLocation == null
-                      ? 'Afficher dans les dossiers'
-                      : 'Masquer des dossiers',
+                  _project.isPublic
+                      ? 'Make project private'
+                      : 'Make project public',
+                  _project.isPublic
+                      ? 'Rendre le projet privé'
+                      : 'Rendre le projet public',
                 ),
                 enabled: !_loading,
               ),
@@ -2056,13 +2113,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                             color: theme.colorScheme.primary),
                         title: Text(tr(
                           widget.preferences,
-                          'Add a session or merge audio',
-                          'Ajouter une session ou fusionner l’audio',
+                          'Add a recording to this project',
+                          'Ajouter un enregistrement à ce projet',
                         )),
                         subtitle: Text(tr(
                           widget.preferences,
-                          'The microphone button adds a new recording session to this project. Merging combines sessions for continuous playback; the original sessions remain available.',
-                          'Le bouton du microphone ajoute une session à ce projet. La fusion assemble les sessions pour une lecture continue ; les sessions originales restent disponibles.',
+                          'The microphone button records a new take into this project. Every recording stays separate: tap one below to play, rename, share or delete just that recording.',
+                          'Le bouton du microphone enregistre une nouvelle prise dans ce projet. Chaque enregistrement reste séparé : touchez-en un ci-dessous pour le lire, le renommer, le partager ou le supprimer.',
                         )),
                       ),
                     ),
@@ -2093,8 +2150,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                               child: Text(
                                 tr(
                                     widget.preferences,
-                                    '${_project.sessions.length} recording parts · played as one audio',
-                                    '${_project.sessions.length} parties d’enregistrement · lues comme un seul audio'),
+                                    'Playing recording ${_activeIndex + 1} of ${_project.sessions.length}',
+                                    'Lecture de l’enregistrement ${_activeIndex + 1} sur ${_project.sessions.length}'),
+                                textAlign: TextAlign.center,
                                 style: theme.textTheme.bodySmall?.copyWith(
                                     color: theme.colorScheme.onSurfaceVariant),
                               ),
@@ -2128,11 +2186,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           Text(
                               _project.sessions.isEmpty
                                   ? '—'
-                                  : _formatDuration(
-                                      AudioTimeline.totalDurationMs(
-                                          _project.sessions)),
+                                  : _formatDuration(_activeDurationMs),
                               style: theme.textTheme.titleLarge
                                   ?.copyWith(fontWeight: FontWeight.w800)),
+                          if (_session != null && _session!.name.isNotEmpty)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 4),
+                              child: Text(
+                                _session!.name,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                textAlign: TextAlign.center,
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant),
+                              ),
+                            ),
                           const SizedBox(height: 20),
                           if (_loading)
                             const Padding(
@@ -2144,64 +2212,49 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                 style: theme.textTheme.bodyMedium
                                     ?.copyWith(color: theme.colorScheme.error))
                           else ...<Widget>[
-                            StreamBuilder<int?>(
-                              stream: _player.currentIndexStream,
-                              builder: (context, indexSnapshot) {
-                                final index = indexSnapshot.data ??
-                                    _player.currentIndex ??
-                                    0;
-                                return StreamBuilder<Duration>(
-                                  stream: _player.positionStream,
-                                  builder: (context, positionSnapshot) {
-                                    final position = Duration(
-                                        milliseconds: _globalPositionMs(
-                                            index,
-                                            positionSnapshot.data ??
-                                                Duration.zero));
-                                    final duration = Duration(
-                                        milliseconds:
-                                            AudioTimeline.totalDurationMs(
-                                                _project.sessions));
-                                    final maxMs = duration.inMilliseconds > 0
-                                        ? duration.inMilliseconds.toDouble()
-                                        : 1.0;
-                                    return Column(
+                            StreamBuilder<Duration>(
+                              stream: _player.positionStream,
+                              builder: (context, positionSnapshot) {
+                                final position = positionSnapshot.data ??
+                                    Duration.zero;
+                                final duration = Duration(
+                                    milliseconds: _activeDurationMs);
+                                final maxMs = duration.inMilliseconds > 0
+                                    ? duration.inMilliseconds.toDouble()
+                                    : 1.0;
+                                return Column(
+                                  children: <Widget>[
+                                    Slider(
+                                      min: 0,
+                                      max: maxMs,
+                                      value: position.inMilliseconds
+                                          .toDouble()
+                                          .clamp(0, maxMs)
+                                          .toDouble(),
+                                      onChanged: (value) =>
+                                          _seekGlobal(value.round()),
+                                    ),
+                                    Row(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.spaceBetween,
                                       children: <Widget>[
-                                        Slider(
-                                          min: 0,
-                                          max: maxMs,
-                                          value: position.inMilliseconds
-                                              .toDouble()
-                                              .clamp(0, maxMs)
-                                              .toDouble(),
-                                          onChanged: (value) =>
-                                              _seekGlobal(value.round()),
-                                        ),
-                                        Row(
-                                          mainAxisAlignment:
-                                              MainAxisAlignment.spaceBetween,
-                                          children: <Widget>[
-                                            Text(
-                                                _formatDuration(
-                                                    position.inMilliseconds),
-                                                style: theme
-                                                    .textTheme.labelSmall
-                                                    ?.copyWith(
-                                                        color: theme.colorScheme
-                                                            .onSurfaceVariant)),
-                                            Text(
-                                                _formatDuration(
-                                                    duration.inMilliseconds),
-                                                style: theme
-                                                    .textTheme.labelSmall
-                                                    ?.copyWith(
-                                                        color: theme.colorScheme
-                                                            .onSurfaceVariant)),
-                                          ],
-                                        ),
+                                        Text(
+                                            _formatDuration(
+                                                position.inMilliseconds),
+                                            style: theme.textTheme.labelSmall
+                                                ?.copyWith(
+                                                    color: theme.colorScheme
+                                                        .onSurfaceVariant)),
+                                        Text(
+                                            _formatDuration(
+                                                duration.inMilliseconds),
+                                            style: theme.textTheme.labelSmall
+                                                ?.copyWith(
+                                                    color: theme.colorScheme
+                                                        .onSurfaceVariant)),
                                       ],
-                                    );
-                                  },
+                                    ),
+                                  ],
                                 );
                               },
                             ),
@@ -2595,7 +2648,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Widget _buildBookmarksSection(ThemeData theme) {
     final bookmarks = List<RavenBookmark>.of(_project.bookmarks)
       ..sort((a, b) => a.positionMs.compareTo(b.positionMs));
-    final totalMs = AudioTimeline.totalDurationMs(_project.sessions);
+    final totalMs = _activeDurationMs;
     final colorScheme = theme.colorScheme;
 
     String partLabel(RavenBookmark bookmark) {

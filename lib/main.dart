@@ -21,7 +21,7 @@ import 'services/audio_encryption_service.dart';
 import 'services/audio_visibility_service.dart';
 import 'services/audio_share_service.dart';
 import 'services/audio_protection_service.dart';
-import 'services/audio_merge_service.dart';
+
 import 'services/project_repository.dart';
 import 'services/project_archive_service.dart';
 import 'widgets/audio_password_dialog.dart';
@@ -389,23 +389,35 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     widget.onProjectsChanged();
   }
 
+  /// Makes a project public or private. A public project is copied as a whole
+  /// folder (audio, notes, attachments) into the device's RAVEN folder so it can
+  /// be browsed with any file manager; the private original stays in RAVEN.
   Future<String?> _setProjectVisibility(
     RavenProject project, {
     required bool visible,
     bool refresh = true,
   }) async {
-    final location = project.publicCopyLocation;
+    final visibility = AudioVisibilityService();
+    final folderLocation = project.publicFolderLocation;
+    final audioLocation = project.publicCopyLocation;
     if (!visible) {
-      if (location != null) {
-        await AudioVisibilityService().remove(location);
-        await widget.repository
-            .update(project.copyWith(clearPublicCopyLocation: true));
+      if (folderLocation != null) {
+        await visibility.removeFolder(folderLocation);
+      }
+      if (audioLocation != null) {
+        await visibility.remove(audioLocation);
+      }
+      if (folderLocation != null || audioLocation != null) {
+        await widget.repository.update(project.copyWith(
+          clearPublicCopyLocation: true,
+          clearPublicFolderLocation: true,
+        ));
       }
       if (refresh) await _refreshProjects();
       return null;
     }
 
-    if (location != null) return location;
+    if (folderLocation != null) return folderLocation;
     if (project.isAudioProtected || project.requiresAppPin) {
       throw StateError(
           'Protected or PIN-locked recordings cannot be made public.');
@@ -414,42 +426,18 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
       throw StateError('This recording does not contain any audio.');
     }
 
-    var recording = project;
-    var sourcePath = recording.masterAudioPath;
-    if (sourcePath == null || !await File(sourcePath).exists()) {
-      if (recording.sessions.length == 1) {
-        sourcePath = recording.sessions.single.audioPath;
-      } else {
-        final master = await AudioMergeService().mergeProject(
-          sessions: recording.sessions,
-          outputDirectory: Directory(
-              '${widget.repository.projectsDirectory.path}/${recording.id}/sessions'),
-          projectId: recording.id,
-          format: widget.preferences.recordingFormat,
-          bitRate: widget.preferences.bitRate,
-          sampleRate: widget.preferences.sampleRate,
-        );
-        sourcePath = master.path;
-        recording = recording.copyWith(masterAudioPath: sourcePath);
-        await widget.repository.update(recording);
-      }
-    }
-    final source = File(sourcePath);
-    if (!await source.exists()) {
-      throw FileSystemException(
-          'The recording audio file is missing.', source.path);
-    }
-    final publicLocation = await AudioVisibilityService().publish(
-      source: source,
-      title: recording.title,
-      projectId: recording.id,
+    // Make sure the on-device project folder exists before publishing it.
+    final folder = await widget.repository.ensureProjectFolder(project);
+    final publicLocation = await visibility.publishFolder(
+      source: folder,
+      folderName: widget.repository.projectFolderName(project),
     );
     try {
-      await widget.repository
-          .update(recording.copyWith(publicCopyLocation: publicLocation));
+      await widget.repository.update(
+          project.copyWith(publicFolderLocation: publicLocation));
     } catch (_) {
       try {
-        await AudioVisibilityService().remove(publicLocation);
+        await visibility.removeFolder(publicLocation);
       } catch (_) {}
       rethrow;
     }
@@ -523,6 +511,21 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
   }) async {
     final project = recording.copyWith(isStandalone: false);
     await widget.repository.update(project);
+    // A project owns a real folder on the device with audio, notes,
+    // attachments, exports and metadata sub-folders.
+    try {
+      await widget.repository.ensureProjectFolder(project);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(tr(
+            widget.preferences,
+            'The project was created, but its folder could not be prepared: $error',
+            'Le projet a été créé, mais son dossier n’a pas pu être préparé : $error',
+          )),
+        ));
+      }
+    }
     await _refreshProjects();
     if (!mounted) return;
     final route = MaterialPageRoute<void>(
@@ -625,6 +628,13 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
       final projectDirectory =
           await widget.repository.createProjectDirectory(projectId);
       stagedDirectory = projectDirectory.path;
+      await widget.repository.ensureProjectFolder(RavenProject(
+        id: projectId,
+        title: title,
+        createdAt: DateTime.now(),
+        updatedAt: DateTime.now(),
+        sessions: const <RavenAudioSession>[],
+      ));
       final sessionDirectory = Directory('${projectDirectory.path}/sessions');
       await sessionDirectory.create(recursive: true);
       final safeFileTitle = title.replaceAll(RegExp(r'\s+'), '_');
