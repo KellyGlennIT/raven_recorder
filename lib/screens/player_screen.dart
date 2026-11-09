@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:async';
 import 'dart:io';
 
@@ -23,6 +22,7 @@ import '../services/audio_merge_service.dart';
 import '../services/audio_visibility_service.dart';
 import '../services/audio_share_service.dart';
 import '../services/audio_protection_service.dart';
+import '../services/document_export_service.dart';
 import '../widgets/audio_password_dialog.dart';
 import 'recorder_screen.dart';
 
@@ -156,7 +156,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (salt == null) return null;
     while (mounted) {
       final password = await showAudioPasswordDialog(
-        context,
+        context, // ignore: use_build_context_synchronously
         preferences: widget.preferences,
         createPassword: false,
       );
@@ -742,25 +742,46 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  /// Writes the notes as a real UTF-8 `.txt` file that Notepad, Word or any
+  /// text editor can open, then offers the share sheet as a second option.
   Future<void> _exportNotesTxt() async {
     final messenger = ScaffoldMessenger.of(context);
-    try {
-      await _saveProject(_project.copyWith(notes: _notesController.text));
-      final directory = Directory(
-          '${widget.repository.projectsDirectory.path}/${_project.id}/notes');
-      await directory.create(recursive: true);
-      final safeTitle = _project.title
-          .trim()
-          .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_');
-      final file = File(
-          '${directory.path}/${safeTitle.isEmpty ? 'project' : safeTitle}.txt');
-      await file.writeAsString(_notesController.text,
-          encoding: utf8, flush: true);
-      await AudioShareService().shareFile(file);
-      if (!mounted) return;
+    final notes = _notesController.text;
+    if (notes.trim().isEmpty) {
       messenger.showSnackBar(SnackBar(
-        content: Text(tr(widget.preferences, 'Notes saved as a .txt file',
-            'Notes enregistrées dans un fichier .txt')),
+        content: Text(tr(
+            widget.preferences,
+            'There are no notes to save yet. Write something first.',
+            'Aucune note à enregistrer. Écrivez d’abord quelque chose.')),
+      ));
+      return;
+    }
+    try {
+      await _saveProject(_project.copyWith(notes: notes));
+      final fileName = DocumentExportService.safeFileName(
+          '${_project.title.trim()} notes');
+
+      // The .txt lives inside the project folder, next to the audio, so it is
+      // part of the project and travels with project exports.
+      final projectDirectory = Directory(
+          '${widget.repository.projectsDirectory.path}/${_project.id}');
+      final notesDirectory = Directory('${projectDirectory.path}/notes');
+      await notesDirectory.create(recursive: true);
+      final notesFile = File('${notesDirectory.path}/$fileName.txt');
+      await notesFile.writeAsBytes(
+          DocumentExportService.utf8WithBom(notes), flush: true);
+      if (!mounted) return;
+
+      messenger.showSnackBar(SnackBar(
+        content: Text(tr(
+          widget.preferences,
+          'Notes saved as “$fileName.txt” inside this project’s folder.',
+          'Notes enregistrées dans « $fileName.txt » dans le dossier de ce projet.',
+        )),
+        action: SnackBarAction(
+          label: tr(widget.preferences, 'Share', 'Partager'),
+          onPressed: () => AudioShareService().shareFile(notesFile),
+        ),
       ));
     } catch (error) {
       if (!mounted) return;
@@ -1363,11 +1384,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     final wasPlaying = _player.playing;
     if (wasPlaying) await _player.pause();
+    if (!mounted) return;
 
     final controller = TextEditingController(
       text: existing?.label ??
-          tr(widget.preferences, 'Bookmark', 'Repère') +
-              ' ${_project.bookmarks.length + 1}',
+          '${tr(widget.preferences, 'Bookmark', 'Repère')} ${_project.bookmarks.length + 1}',
     );
     controller.selection = TextSelection(
         baseOffset: 0, extentOffset: controller.text.length);
@@ -1975,8 +1996,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
               _projectMenuItem(
                   'notes_txt',
                   Icons.description_outlined,
-                  tr(widget.preferences, 'Save and share notes as .txt',
-                      'Enregistrer et partager les notes en .txt')),
+                  tr(widget.preferences, 'Save notes as .txt file',
+                      'Enregistrer les notes en fichier .txt')),
               _projectMenuItem(
                   'rename',
                   Icons.edit_outlined,
@@ -2189,8 +2210,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                               stream: _player.playerStateStream,
                               builder: (context, snapshot) {
                                 final playing = snapshot.data?.playing ?? false;
-                                return Row(
-                                  mainAxisAlignment: MainAxisAlignment.center,
+                                // Compact phones cannot fit five controls in
+                                // one row; wrap them instead of overflowing.
+                                return Wrap(
+                                  alignment: WrapAlignment.center,
+                                  crossAxisAlignment: WrapCrossAlignment.center,
+                                  spacing: 6,
+                                  runSpacing: 4,
                                   children: <Widget>[
                                     IconButton(
                                       tooltip: tr(
@@ -2201,21 +2227,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                       icon: const Icon(Icons.replay_rounded),
                                       iconSize: 27,
                                     ),
-                                    const SizedBox(width: 10),
                                     IconButton.filledTonal(
                                       tooltip: tr(
                                           widget.preferences,
                                           'Bookmark this exact moment',
                                           'Repérer ce moment exact'),
-                                      onPressed:
-                                          _loading || _error != null
-                                              ? null
-                                              : () => _addBookmark(),
+                                      onPressed: _loading || _error != null
+                                          ? null
+                                          : () => _addBookmark(),
                                       icon: const Icon(
                                           Icons.bookmark_add_rounded),
                                       iconSize: 24,
                                     ),
-                                    const SizedBox(width: 10),
                                     SizedBox(
                                       width: 66,
                                       height: 66,
@@ -2239,7 +2262,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                             size: 34),
                                       ),
                                     ),
-                                    const SizedBox(width: 10),
                                     IconButton(
                                       tooltip: tr(
                                           widget.preferences,
@@ -2250,7 +2272,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                           Icons.bookmarks_outlined),
                                       iconSize: 25,
                                     ),
-                                    const SizedBox(width: 4),
                                     PopupMenuButton<double>(
                                       tooltip: tr(
                                           widget.preferences,
@@ -2329,14 +2350,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       ),
                     ],
                     const SizedBox(height: 22),
-                    Row(
+                    // Title on its own line, actions below: keeps the header
+                    // readable on narrow phones instead of overflowing.
+                    Text(
+                        tr(widget.preferences, 'Project notes',
+                            'Notes du projet'),
+                        style: theme.textTheme.titleLarge
+                            ?.copyWith(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 4),
+                    Wrap(
+                      alignment: WrapAlignment.end,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      spacing: 4,
                       children: <Widget>[
-                        Expanded(
-                            child: Text(
-                                tr(widget.preferences, 'Project notes',
-                                    'Notes du projet'),
-                                style: theme.textTheme.titleLarge
-                                    ?.copyWith(fontWeight: FontWeight.w800))),
                         PopupMenuButton<String>(
                           tooltip: tr(widget.preferences, 'AI tools for notes',
                               'Outils IA pour les notes'),
@@ -2370,6 +2396,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                               : const Icon(Icons.save_outlined, size: 18),
                           label: Text(tr(
                               widget.preferences, 'Save notes', 'Enregistrer')),
+                        ),
+                        TextButton.icon(
+                          onPressed: _exportNotesTxt,
+                          icon: const Icon(Icons.description_outlined,
+                              size: 18),
+                          label: Text(tr(widget.preferences, 'Save .txt',
+                              'Enregistrer .txt')),
                         ),
                       ],
                     ),

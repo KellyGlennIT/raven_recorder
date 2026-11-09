@@ -123,6 +123,46 @@ class MainActivity : FlutterActivity() {
                             result.error("PUBLISH_FAILED", error.message ?: "Could not publish audio.", null)
                         }
                     }
+                    "publishDocument" -> {
+                        // Saves a plain-text file (e.g. project notes) into the
+                        // public Documents/RAVEN folder so it can be opened by
+                        // Notepad, Word, Google Docs or any text editor.
+                        val sourcePath = call.argument<String>("sourcePath")
+                        val fileName = call.argument<String>("fileName")
+                        val mimeType = call.argument<String>("mimeType") ?: "text/plain"
+                        if (sourcePath.isNullOrBlank() || fileName.isNullOrBlank()) {
+                            result.error("BAD_ARGUMENTS", "Missing source path or file name.", null)
+                            return@setMethodCallHandler
+                        }
+
+                        var uri: Uri? = null
+                        try {
+                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                                throw IllegalStateException("Saving to Documents requires Android 10 or newer.")
+                            }
+                            val source = File(sourcePath)
+                            if (!source.isFile) throw IllegalStateException("Source file does not exist.")
+                            val values = ContentValues().apply {
+                                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/RAVEN")
+                                put(MediaStore.MediaColumns.IS_PENDING, 1)
+                            }
+                            uri = contentResolver.insert(MediaStore.Files.getContentUri("external"), values)
+                                ?: throw IllegalStateException("Could not create a public document entry.")
+                            val output = contentResolver.openOutputStream(uri!!)
+                                ?: throw IllegalStateException("Could not open the public document destination.")
+                            output.use { stream -> FileInputStream(source).use { input -> input.copyTo(stream) } }
+                            val ready = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                            contentResolver.update(uri!!, ready, null, null)
+                            result.success(uri.toString())
+                        } catch (error: Exception) {
+                            if (uri != null) {
+                                try { contentResolver.delete(uri!!, null, null) } catch (_: Exception) { }
+                            }
+                            result.error("PUBLISH_FAILED", error.message ?: "Could not save the document.", null)
+                        }
+                    }
                     "deletePublishedAudio" -> {
                         val rawUri = call.argument<String>("uri")
                         if (rawUri.isNullOrBlank() || !rawUri.startsWith("content://")) {
