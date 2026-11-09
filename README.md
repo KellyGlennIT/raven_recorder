@@ -2,7 +2,25 @@
 
 RAVEN is a Flutter-first audio workspace for recording, organising, reviewing and annotating audio. It is designed for musicians, teachers, preachers, interviewers and everyday users who need a dependable recorder without needing to understand file management.
 
-> **Implementation status:** this repository is a working development baseline, not a certified release. Flutter/Dart were not installed in the preparation environment, so `flutter analyze`, `flutter test`, and desktop/device builds could not be executed here. The dependency-free structural check is useful for missing files/imports only; it is not a compiler. Run `scripts/verify_windows.bat` on a Windows development PC. It generates the Windows desktop runner if it is absent, then runs dependency resolution, analysis, tests, Android debug APK build and Windows desktop build. A Windows build also needs Visual Studio with the Desktop development with C++ workload. Treat any reported diagnostic as work to resolve before release.
+> **Implementation status:** this repository is a working development baseline, not a certified release. `dart analyze lib` currently reports **0 errors** (a handful of style infos remain). Android debug APK builds have been exercised on a Windows development PC; Windows desktop builds still need Visual Studio with the **Desktop development with C++** workload. Treat any reported diagnostic as work to resolve before release.
+
+### Quick build commands
+
+```powershell
+# Android debug APK (arm64 only, fastest)
+flutter build apk --debug --target-platform android-arm64 --android-skip-build-dependency-validation
+
+# Android release APK (minified + resource-shrunk, arm64 + armv7)
+flutter build apk --release --android-skip-build-dependency-validation
+
+# Android App Bundle for Play Store
+flutter build appbundle --release --android-skip-build-dependency-validation
+
+# Windows desktop
+flutter build windows --release
+```
+
+`--android-skip-build-dependency-validation` suppresses Flutter's *"Gradle/AGP/Kotlin version will soon be dropped"* warnings. It only silences the version check — it does not change the build. Upgrade Gradle (≥ 9.1.0), AGP (≥ 9.0.1) and Kotlin (≥ 2.3.20) when convenient, then drop the flag.
 
 ## Product principles
 
@@ -15,13 +33,16 @@ RAVEN is a Flutter-first audio workspace for recording, organising, reviewing an
 
 ## Current capabilities in this codebase
 
-- Responsive Flutter interface with Home, Library and Settings navigation.
+- Responsive Flutter interface with Home, Library and Settings navigation. The Home screen shows the number of library items and the number of categories, plus recent recordings. The Library sidebar has a branded header, pill-style filters with live per-category counts, and a shortcut to manage categories.
 - **Standalone recordings:** one tap starts a private standalone take immediately, without creating a project. A standalone recording can be resumed, renamed, encrypted, shared and later promoted to a full project from its menu, at which point it gains notes, attachments and multi-session support.
 - One-tap capture workflow, pause/resume, save/discard, duration display and waveform-level visualization. On Android, an active recording is kept alive by a microphone-type foreground service with a visible notification offering Pause/Resume and Stop actions. The Player screen microphone action can continue an existing project by appending a new session while preserving the stable project ID, title, notes, bookmarks and earlier audio paths. Protected projects must be decrypted before another session is appended.
 - M4A/AAC, MP3, WAV and FLAC format choices (actual encoder support depends on the target platform/plugin; MP3 encoding uses the FFmpeg `libmp3lame` encoder).
 - Adjustable sample rate and bitrate plus optional platform voice processing requests.
 - Project library with search, rename, favourites, Trash/restore and permanent delete. Renaming changes the title stored against the stable project ID; it does not move or rename audio/session files, notes, bookmarks or the continuous master.
-- Audio playback, seeking across a single continuous project timeline, playback-speed control, editable project notes, timeline bookmarks and plain-text `.txt` notes sharing. Project sessions remain individually playable, shareable, renameable and manageable from their own action menus. Continued recordings are automatically merged into a single master file after Stop, while original segments remain available for recovery. Library import accepts supported audio files (M4A, MP3, WAV and FLAC) as resumable standalone recordings, as well as portable RAVEN project bundles.
+- Audio playback, seeking across a single continuous project timeline, playback-speed control, editable project notes and timeline bookmarks. Project sessions remain individually playable, shareable, renameable and manageable from their own action menus. Continued recordings are merged into a single master file after Stop **on desktop**; on Android the sessions are played as one continuous timeline instead (see *Master audio and FFmpeg*). Library import accepts supported audio files (M4A, MP3, WAV and FLAC) as resumable standalone recordings, as well as portable RAVEN project bundles.
+- **Timeline bookmarks:** add a bookmark from the app bar, from the player controls, or from the bookmarks card. The dialog shows the exact timestamp and which recording part it belongs to, pauses playback while open, and resumes afterwards. Bookmarks are sorted by time, can be renamed or deleted, jump-and-play on tap, and are drawn as markers on a mini timeline strip. Each bookmark stores its `sessionId`, so a multi-session project always knows which part a bookmark belongs to; orphaned bookmarks are pruned when a part is deleted.
+- **Notes as real `.txt` files:** *Save .txt* writes a UTF-8 (with BOM) text file into the project folder at `projects/<id>/notes/<title> notes.txt`, so it opens correctly in Notepad, Word, Google Docs or any text editor and is included in project exports. A private copy is always written; the share sheet is offered from the confirmation snackbar.
+- **Attachments:** files and images can be attached to a project, previewed, shared, and removed individually or in bulk with select-all multi-select.
 - English/French UI strings and a first-run guided tour with explanations of recording, library, settings and privacy. The tour can be replayed from Settings.
 - Secure-storage vault and provider REST clients for OpenRouter, OpenAI API and Gemini API; users can configure models, test connections and manage keys. Notes AI actions require confirmation and never send audio in the current implementation.
 - Optional app-wide PIN gate stored using platform secure storage with a salted PBKDF2-HMAC-SHA256 verifier. Individual recordings can require the same RAVEN PIN before opening. This is an app-access lock, not file encryption. Per-recording public-copy control can create/remove a managed copy in Android Music/RAVEN (Android 10+) or Windows Downloads/RAVEN while preserving the private original.
@@ -46,12 +67,12 @@ RAVEN is a Flutter-first audio workspace for recording, organising, reviewing an
 - `lib/services/ai_key_vault.dart` — OS secure-storage access for user-provided credentials.
 - `lib/services/app_preferences.dart` — non-secret preferences (language, theme, quality options, app-lock toggle and tour completion).
 - `lib/services/app_lock_service.dart` — PIN verifier derivation and verification using secure storage; no plaintext PIN is persisted.
-- `lib/services/category_service.dart` — category listing, safe renaming and category reassignment/deletion without touching audio directories.
 - `lib/services/attachment_service.dart` — sanitized attachment picking, project attachment listing and deletion.
+- `lib/services/document_export_service.dart` — UTF-8-with-BOM encoding and safe `.txt` file naming for project notes.
 - `lib/services/project_archive_service.dart` — safe ZIP bundle export/import with path-traversal guards, staged extraction and ID remapping.
 - `lib/services/audio_visibility_service.dart` — optional public-copy publishing to Android MediaStore or Windows Downloads with verify/cleanup.
 - `lib/services/audio_timeline.dart` — deterministic mapping between internal sessions and the single user-facing playback timeline.
-- `lib/services/audio_merge_service.dart` — FFmpeg-backed, validated master-audio creation from retained source sessions.
+- `lib/services/audio_merge_service.dart` — FFmpeg-backed, validated master-audio creation from retained source sessions (desktop only; see *Master audio and FFmpeg*).
 - `lib/services/ai_provider_service.dart` — opt-in REST integration for OpenRouter, OpenAI API, and Gemini API, with bounded prompts, timeouts, and provider error handling.
 - `test/` — model, serialization, audio-timeline mapping, app-lock, archive-safety, AI-provider and WAV-recovery tests.
 
@@ -69,7 +90,7 @@ The repository root is under the platform's application-support directory in a `
 ├── projects/
 │   └── <stable-project-uuid>/
 │       ├── sessions/         # source audio or encrypted audio sessions
-│       ├── notes/            # reserved for note attachments/exports
+│       ├── notes/            # exported .txt notes (UTF-8 with BOM)
 │       ├── attachments/      # reserved for imported files/images
 │       ├── exports/          # reserved for project exports
 │       └── metadata/         # reserved for project metadata/history
@@ -100,9 +121,9 @@ AI is opt-in and uses the user's own provider account. RAVEN does not include a 
 
 Supported providers in this build:
 
-- **OpenRouter** — one OpenAI-compatible endpoint for a broad model catalogue. Create a key at https://openrouter.ai/keys, choose the exact model ID shown in its catalogue, and set a key spending limit. The initial model uses OpenRouter’s free-model router where available; availability and free-tier limits are controlled by OpenRouter, and many other models require credits.
+- **OpenRouter** — one OpenAI-compatible endpoint for a broad model catalogue. Create a key at https://openrouter.ai/keys, choose the exact model ID shown in its catalogue, and set a key spending limit. The default model is `meta-llama/llama-3.3-70b-instruct:free`; availability and free-tier limits are controlled by OpenRouter, and many other models require credits.
 - **OpenAI API** — create a key at https://platform.openai.com/api-keys. A ChatGPT subscription is separate from API billing; check usage and billing before using it.
-- **Google Gemini API** — create/manage a key at https://aistudio.google.com/app/apikey and check project quotas and billing. The default model is `gemini-3.8-flash` (current stable model reference as of October 29, 2026); model names are editable and should be checked against Google's current model catalogue: https://ai.google.dev/gemini-api/docs/models.
+- **Google Gemini API** — create/manage a key at https://aistudio.google.com/app/apikey and check project quotas and billing. The default model is `gemini-2.0-flash`; model names are editable and should be checked against Google's current model catalogue: https://ai.google.dev/gemini-api/docs/models.
 
 Settings lets the user choose the provider, enter a model identifier, save the key, test the connection, and delete a saved key. The test makes a real small API request, so provider usage policies and possible charges apply. Model names, availability, limits, and prices change; treat the model field as editable rather than promising that one default stays valid forever.
 
@@ -122,7 +143,17 @@ Provider requests use HTTPS, a 45-second timeout, a 60,000-character prompt limi
 
 ## Continue recording and automatic master merge
 
-Open an existing project and tap the microphone action. RAVEN appends a new internal source session to the same stable project ID and title. After Stop, it first saves the source session to the project index, then uses the maintained `ffmpeg_kit_flutter_new_audio` package to create a single continuous master file. The merge re-encodes to the project's current output format (AAC/M4A, MP3 via `libmp3lame`, PCM/WAV, or FLAC) so sessions with different recording settings can be normalized. A pending file is validated before being renamed into place. Original session files are retained as recovery sources; they are not deleted after a successful merge. Playback prefers the master file and falls back to the continuous session playlist if the master is missing or merge fails. The global seek bar and bookmarks remain tied to the combined timeline. The master is removed when project audio is encrypted so it cannot remain as an unencrypted copy; after decryption, RAVEN attempts to rebuild it.
+Open an existing project and tap the microphone action. RAVEN appends a new internal source session to the same stable project ID and title. After Stop, it first saves the source session to the project index, then (on desktop) uses the maintained `ffmpeg_kit_flutter_new_audio` package to create a single continuous master file. The merge re-encodes to the project's current output format (AAC/M4A, MP3 via `libmp3lame`, PCM/WAV, or FLAC) so sessions with different recording settings can be normalized. A pending file is validated before being renamed into place. Original session files are retained as recovery sources; they are not deleted after a successful merge. Playback prefers the master file and falls back to the continuous session playlist if the master is missing or merge fails. The global seek bar and bookmarks remain tied to the combined timeline. The master is removed when project audio is encrypted so it cannot remain as an unencrypted copy; after decryption, RAVEN attempts to rebuild it.
+
+### Master audio and FFmpeg (Android APK size)
+
+`ffmpeg_kit_flutter_new_audio` ships **no prebuilt Android binary** in this project's configuration, but its Gradle module still pulls `ffmpeg-kit-audio` AARs for arm64/armv7/x86_64 — roughly 20–30 MB of native libraries that would never be used. To keep the APK small:
+
+- `android/app/build.gradle.kts` excludes the `com.antonkarpenko:ffmpeg-kit-audio` module from every `implementation`/`api` configuration.
+- `AudioMergeService.isSupported` returns `false` on Android, so the merge is skipped and playback uses the continuous session playlist (the same fallback path used when a master is missing or corrupt).
+- The same file also limits ABIs to `arm64-v8a` and `armeabi-v7a`, enables R8 minification and resource shrinking for release builds, and strips duplicate `META-INF` license/notice files.
+
+If you later need on-device merging on Android, remove the Gradle `exclude` block and add a package that actually bundles an Android FFmpeg binary; expect the APK to grow substantially.
 
 The FFmpeg audio package is LGPL-3.0. Follow its redistribution terms and ship the `licenses/ffmpeg_kit_flutter_new_audio/` notices generated beside the Windows executable when distributing a Windows build. Check the package's current platform matrix and license bundle before each release.
 
@@ -149,7 +180,20 @@ flutter run -d windows
 Build an Android debug APK with Android SDK/platform tools configured:
 
 ```powershell
-flutter build apk --debug
+flutter build apk --debug --android-skip-build-dependency-validation
+```
+
+Release builds (minified, resource-shrunk, arm64 + armv7):
+
+```powershell
+flutter build apk --release --android-skip-build-dependency-validation
+flutter build appbundle --release --android-skip-build-dependency-validation
+```
+
+To build for a single ABI (smaller and faster):
+
+```powershell
+flutter build apk --release --target-platform android-arm64 --android-skip-build-dependency-validation
 ```
 
 If a dependency does not support the selected platform/version, record the exact diagnostic, check that package's supported-platform matrix and pin a compatible version rather than suppressing the diagnostic. Run `flutter pub outdated` when dependency resolution fails, but upgrade packages deliberately and re-test.
@@ -157,6 +201,18 @@ If a dependency does not support the selected platform/version, record the exact
 ## Android setup notes
 
 The Android app scaffold and plugin configuration are in `android/`. Recording notifications require notification permission on Android versions that request it. Android also requires the microphone foreground-service type for continuing a recording while RAVEN is backgrounded.
+
+### APK size and build configuration
+
+- **ABIs:** `arm64-v8a` and `armeabi-v7a` only. Add `x86_64` back in `android/app/build.gradle.kts` if you need an x86 emulator.
+- **Release shrinking:** `isMinifyEnabled` and `isShrinkResources` are on, with rules in `android/app/proguard-rules.pro`.
+- **FFmpeg:** excluded from the Android variant (see *Master audio and FFmpeg*).
+- **Version warnings:** Flutter warns that Gradle 8.14.3, AGP 8.11.1 and Kotlin 2.2.20 will soon be unsupported. Build with `--android-skip-build-dependency-validation` until you upgrade them.
+- **SDK XML warning:** *"This version only understands SDK XML versions up to 3 but an SDK XML file of version 4 was encountered"* means Android Studio and the command-line tools are from different releases. It is harmless; update the command-line tools to match Android Studio to silence it.
+
+### Saving notes as `.txt` on Android
+
+Notes are written to the project folder (`projects/<id>/notes/`) and are therefore private to the app. To open them outside RAVEN, use the **Share** action in the confirmation snackbar, or export the project bundle. The `publishDocument` method channel in `MainActivity.kt` can copy a text file into the public `Documents/RAVEN` folder on Android 10+ if you want a user-visible copy; it is not called by default so notes stay inside the project.
 
 ## Recording notifications on Android
 
@@ -171,7 +227,7 @@ While a recording is active, a microphone-type foreground service shows a visibl
 5. Android app records, pauses, resumes, saves, and recovers correctly on a real device.
 6. Rename/favourite/category/trash/restore do not break session paths.
 7. Encrypt/decrypt a small test file, compare the restored bytes with the original, reject a modified ciphertext, and test failure/restart scenarios before using important recordings.
-8. Check editable `.txt` notes sharing, French UI, first-run tour and tour replay.
+8. Check editable `.txt` notes export (file appears in `projects/<id>/notes/`, opens in Notepad with correct accents), bookmark add/rename/delete/jump, French UI, first-run tour and tour replay.
 9. Test long recordings, low storage, denied permissions, missing files, interrupted writes and app process termination; confirm the interrupted draft appears in the Library, its WAV header is repaired on open, and it can be saved or discarded.
 10. Test project bundle export/import with long audio, attachments, special characters, missing source files and interrupted import; verify the imported project receives a new ID and stays private.
 
