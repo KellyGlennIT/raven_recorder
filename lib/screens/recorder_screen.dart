@@ -220,17 +220,27 @@ class _RecorderScreenState extends State<RecorderScreen> {
             isStandalone: !shouldCreateProject,
             isDraft: true,
           );
-      Directory projectDirectory;
-      try {
-        projectDirectory =
-            await widget.repository.ensureProjectFolder(folderPreview);
-      } catch (_) {
-        projectDirectory = Directory(
-            '${widget.repository.projectsDirectory.path}/${widget.repository.projectFolderName(folderPreview)}');
-        await projectDirectory.create(recursive: true);
+
+      // Standalone recordings store their audio flat in recordingsDirectory —
+      // no per-recording folder is ever created on disk.
+      final Directory sessionDirectory;
+      if (!shouldCreateProject) {
+        sessionDirectory = widget.repository.recordingsDirectory;
+        await sessionDirectory.create(recursive: true);
+      } else {
+        // Full project: create the named folder tree.
+        Directory projectDirectory;
+        try {
+          projectDirectory =
+              await widget.repository.ensureProjectFolder(folderPreview);
+        } catch (_) {
+          projectDirectory = Directory(
+              '${widget.repository.projectsDirectory.path}/${widget.repository.projectFolderName(folderPreview)}');
+          await projectDirectory.create(recursive: true);
+        }
+        sessionDirectory = Directory('${projectDirectory.path}/sessions');
+        await sessionDirectory.create(recursive: true);
       }
-      final sessionDirectory = Directory('${projectDirectory.path}/sessions');
-      await sessionDirectory.create(recursive: true);
 
       final safeTitle = draftTitle
           .trim()
@@ -670,8 +680,16 @@ class _RecorderScreenState extends State<RecorderScreen> {
     String newWavPath,
     _MergeProgress progress,
   ) async {
-    final folder = await widget.repository.ensureProjectFolder(project);
-    final sessionDir = Directory('${folder.path}/sessions');
+    // Standalone recordings have no named project folder — their audio lives
+    // flat in the shared sessions store. Use the parent directory of the
+    // existing audio file so temp/merged files land in the same location.
+    final Directory sessionDir;
+    if (project.isStandalone) {
+      sessionDir = File(target.audioPath).parent;
+    } else {
+      final folder = await widget.repository.ensureProjectFolder(project);
+      sessionDir = Directory('${folder.path}/sessions');
+    }
     await sessionDir.create(recursive: true);
 
     final targetFormat = target.format.toLowerCase();
