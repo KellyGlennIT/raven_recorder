@@ -17,3 +17,11 @@
 # and lock-screen/headset media controls in release builds.
 -keep class com.ryanheise.audioservice.** { *; }
 -keep class com.ryanheise.audiosession.** { *; }
+
+# FFmpegKit rules for release builds (isMinifyEnabled = true).
+# Without these, R8 obfuscates/strips JNI methods, causing native crashes on Android.
+-keep class com.antonkarpenko.ffmpegkit.** { *; }
+-dontwarn com.antonkarpenko.ffmpegkit.**
+-keep class com.arthenica.ffmpegkit.** { *; }
+-dontwarn com.arthenica.ffmpegkit.**
+

@@ -243,7 +243,16 @@ class AudioTrimService {
           'Run "flutter clean" and rebuild.');
     }
     final code = await session.getReturnCode();
-    return code != null && ReturnCode.isSuccess(code);
+    if (code != null && ReturnCode.isSuccess(code)) return true;
+    if (command.contains('-c:a libmp3lame')) {
+      final fallback = command.replaceFirst('-c:a libmp3lame', '-c:a mp3');
+      try {
+        final fallbackSession = await FFmpegKit.execute(fallback);
+        final fallbackCode = await fallbackSession.getReturnCode();
+        return fallbackCode != null && ReturnCode.isSuccess(fallbackCode);
+      } catch (_) {}
+    }
+    return false;
   }
 
   String _codecArgs(String ext, int bitRate) {

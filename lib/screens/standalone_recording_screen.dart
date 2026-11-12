@@ -27,8 +27,9 @@ class StandaloneRecordingScreen extends StatefulWidget {
     required this.onSaveAmplified,
     this.onTrim,
     this.onTogglePin,
+    this.onOpenDetails,
     this.autoPlay = false,
-    super.key, required Null Function() onOpenDetails,
+    super.key,
   });
 
   final RavenProject project;
@@ -42,6 +43,7 @@ class StandaloneRecordingScreen extends StatefulWidget {
   final Future<void> Function()? onTogglePin;
   final Future<bool> Function(RavenProject updated) onSaveAmplified;
   final Future<void> Function()? onTrim;
+  final VoidCallback? onOpenDetails;
   final bool autoPlay;
 
   @override
@@ -337,8 +339,13 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
           '-af "volume=${level.toStringAsFixed(2)},alimiter=limit=0.95:attack=5:release=50" '
           '$codec "$newPath"';
 
-      final ffSession = await FFmpegKit.execute(command);
-      final code = await ffSession.getReturnCode();
+      var ffSession = await FFmpegKit.execute(command);
+      var code = await ffSession.getReturnCode();
+      if (!ReturnCode.isSuccess(code) && command.contains('-c:a libmp3lame')) {
+        final fallbackCommand = command.replaceFirst('-c:a libmp3lame', '-c:a mp3');
+        ffSession = await FFmpegKit.execute(fallbackCommand);
+        code = await ffSession.getReturnCode();
+      }
       if (!ReturnCode.isSuccess(code)) {
         final logs = await ffSession.getOutput();
         try {

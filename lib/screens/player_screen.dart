@@ -867,6 +867,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         repository: widget.repository,
         preferences: widget.preferences,
         existingProject: _project,
+        createProject: true,
         onSaved: () {},
       ),
     ));
@@ -903,6 +904,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         preferences: widget.preferences,
         existingProject: _project,
         resumeSessionId: session.id,
+        createProject: true,
         onSaved: () {},
       ),
     ));

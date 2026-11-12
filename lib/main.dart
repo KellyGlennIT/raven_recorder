@@ -490,21 +490,77 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
   }
 
   Future<void> _applyPublicVisibilityToAll({required bool visible}) async {
+    if (visible) {
+      final allowed = await _ensureAllFilesAccess();
+      if (!allowed) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(tr(
+              widget.preferences,
+              'All files access is required to move recordings into Music/RAVEN. Please allow it in Settings.',
+              'L’accès à tous les fichiers est requis pour déplacer les enregistrements vers Music/RAVEN. Veuillez l’autoriser dans les paramètres.',
+            )),
+          ));
+        }
+        return;
+      }
+    }
+
     final failures = <String>[];
+    var updatedCount = 0;
+    var skippedProtected = 0;
+
     for (final project in widget.repository.projects) {
+      if (project.isTrashed) continue;
+      if (project.isAudioProtected || project.requiresAppPin) {
+        if (visible) skippedProtected++;
+        continue;
+      }
+      if (project.hasPublicFolder == visible) continue;
       try {
         await _applyVisibilitySilently(project, visible: visible);
+        updatedCount++;
       } catch (error) {
         failures.add('${project.title}: $error');
       }
     }
+
     await _refreshProjects();
-    if (failures.isNotEmpty && mounted) {
+    if (!mounted) return;
+
+    if (failures.isNotEmpty) {
       final moreCount = failures.length - 1;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text(
           '${visible ? 'Could not make public' : 'Could not make private'}: ${failures.first}${moreCount > 0 ? ' (+$moreCount more)' : ''}',
         ),
+      ));
+    } else if (updatedCount > 0) {
+      final message = visible
+          ? tr(
+              widget.preferences,
+              'Made $updatedCount recording(s) public in Music/RAVEN.',
+              '$updatedCount enregistrement(s) rendu(s) public(s) dans Music/RAVEN.')
+          : tr(
+              widget.preferences,
+              'Moved $updatedCount recording(s) to private storage.',
+              '$updatedCount enregistrement(s) déplacé(s) vers le stockage privé.');
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(skippedProtected > 0
+            ? '$message (${tr(widget.preferences, 'Skipped $skippedProtected protected recording(s)', '$skippedProtected enregistrement(s) protégé(s) ignoré(s)')})'
+            : message),
+      ));
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(tr(
+          widget.preferences,
+          visible
+              ? 'All eligible recordings are already public.'
+              : 'All recordings are already private.',
+          visible
+              ? 'Tous les enregistrements éligibles sont déjà publics.'
+              : 'Tous les enregistrements sont déjà privés.',
+        )),
       ));
     }
   }
@@ -522,7 +578,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
             repository: widget.repository,
             preferences: widget.preferences,
             onSaved: _refreshProjects,
-            createProject: false,
+            createProject: widget.preferences.newRecordingsCreateProject,
           ),
         ),
       );
@@ -1647,6 +1703,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         onSettingsChanged: widget.onSettingsChanged,
         onShowTour: _showGuidedTour,
         onApplyPublicVisibility: _applyPublicVisibilityToAll,
+        onRequestStoragePermission: _ensureAllFilesAccess,
         onTrashRetentionChanged: _purgeExpiredTrash,
       ),
     ];

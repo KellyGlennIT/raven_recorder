@@ -13,6 +13,7 @@ class SettingsScreen extends StatelessWidget {
     required this.onShowTour,
     required this.onApplyPublicVisibility,
     required this.onTrashRetentionChanged,
+    this.onRequestStoragePermission,
     super.key,
   });
 
@@ -21,6 +22,7 @@ class SettingsScreen extends StatelessWidget {
   final VoidCallback onShowTour;
   final Future<void> Function({required bool visible}) onApplyPublicVisibility;
   final VoidCallback onTrashRetentionChanged;
+  final Future<bool> Function()? onRequestStoragePermission;
 
   @override
   Widget build(BuildContext context) {
@@ -278,6 +280,22 @@ class SettingsScreen extends StatelessWidget {
                             onSettingsChanged();
                           },
                         ),
+                        const Divider(height: 1),
+                        SwitchListTile.adaptive(
+                          secondary: const Icon(Icons.folder_special_outlined),
+                          title: Text(tr(preferences, 'Create project for new recordings',
+                              'Créer un projet pour les nouveaux enregistrements')),
+                          subtitle: Text(tr(
+                              preferences,
+                              'When disabled, recordings start as simple standalone audio. When enabled, every recording starts as a multi-take project workspace.',
+                              'Désactivé : enregistrement simple autonome. Activé : espace projet multi-prises dès le départ.')),
+                          value: preferences.newRecordingsCreateProject,
+                          onChanged: (value) async {
+                            preferences.newRecordingsCreateProject = value;
+                            await preferences.save();
+                            onSettingsChanged();
+                          },
+                        ),
                       ],
                     ),
                   ),
@@ -334,6 +352,23 @@ class SettingsScreen extends StatelessWidget {
                               'Les nouveaux enregistrements sont déplacés dans le dossier musical RAVEN de l’appareil pour que d’autres applications puissent les lire. Aucune copie n’est créée ; repassez un enregistrement en privé pour le replacer dans le stockage de l’application.')),
                           value: preferences.defaultPublicAudioVisible,
                           onChanged: (value) async {
+                            if (value && onRequestStoragePermission != null) {
+                              final granted =
+                                  await onRequestStoragePermission!();
+                              if (!granted) {
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context)
+                                      .showSnackBar(SnackBar(
+                                    content: Text(tr(
+                                      preferences,
+                                      'All files access is required to store audio in Music/RAVEN.',
+                                      'L’accès à tous les fichiers est requis pour stocker l’audio dans Music/RAVEN.',
+                                    )),
+                                  ));
+                                }
+                                return;
+                              }
+                            }
                             preferences.defaultPublicAudioVisible = value;
                             await preferences.save();
                             onSettingsChanged();
@@ -341,15 +376,15 @@ class SettingsScreen extends StatelessWidget {
                         ),
                         const Divider(height: 1),
                         ListTile(
-                          leading: const Icon(Icons.sync_rounded),
+                          leading: const Icon(Icons.public_rounded),
                           title: Text(tr(
                               preferences,
-                              'Apply visibility to all recordings',
-                              'Appliquer la visibilité à tous les enregistrements')),
+                              'Make all recordings public',
+                              'Rendre tous les enregistrements publics')),
                           subtitle: Text(tr(
                               preferences,
-                              'Make every recording private or visible in device folders at once.',
-                              'Rendre tous les enregistrements privés ou visibles dans les dossiers de l’appareil d’un coup.')),
+                              'Move all unencrypted recordings into Music/RAVEN so other apps can play them.',
+                              'Déplacer tous les enregistrements non chiffrés vers Music/RAVEN pour que d’autres applications puissent les lire.')),
                           trailing: const Icon(Icons.chevron_right_rounded),
                           onTap: () async {
                             final confirmed = await showDialog<bool>(
@@ -357,12 +392,12 @@ class SettingsScreen extends StatelessWidget {
                               builder: (dialogContext) => AlertDialog(
                                 title: Text(tr(
                                     preferences,
-                                    'Update visibility for all recordings?',
-                                    'Mettre à jour la visibilité pour tous les enregistrements ?')),
+                                    'Make all recordings public?',
+                                    'Rendre tous les enregistrements publics ?')),
                                 content: Text(tr(
                                     preferences,
-                                    'This will make every recording private or public based on your default visibility setting.',
-                                    'Cela rendra tous les enregistrements privés ou visibles selon le réglage par défaut.')),
+                                    'RAVEN will move every non-protected recording into your device’s Music/RAVEN folder.',
+                                    'RAVEN déplacera tous les enregistrements non protégés vers le dossier Music/RAVEN de l’appareil.')),
                                 actions: <Widget>[
                                   TextButton(
                                       onPressed: () =>
@@ -372,15 +407,57 @@ class SettingsScreen extends StatelessWidget {
                                   FilledButton(
                                       onPressed: () =>
                                           Navigator.pop(dialogContext, true),
-                                      child: Text(tr(
-                                          preferences, 'Apply', 'Appliquer'))),
+                                      child: Text(tr(preferences, 'Make public',
+                                          'Rendre public'))),
                                 ],
                               ),
                             );
                             if (confirmed == true) {
-                              await onApplyPublicVisibility(
-                                  visible:
-                                      preferences.defaultPublicAudioVisible);
+                              await onApplyPublicVisibility(visible: true);
+                              onSettingsChanged();
+                            }
+                          },
+                        ),
+                        const Divider(height: 1),
+                        ListTile(
+                          leading: const Icon(Icons.public_off_rounded),
+                          title: Text(tr(
+                              preferences,
+                              'Make all recordings private',
+                              'Rendre tous les enregistrements privés')),
+                          subtitle: Text(tr(
+                              preferences,
+                              'Move all recordings back into RAVEN’s private storage.',
+                              'Replacer tous les enregistrements dans le stockage privé de RAVEN.')),
+                          trailing: const Icon(Icons.chevron_right_rounded),
+                          onTap: () async {
+                            final confirmed = await showDialog<bool>(
+                              context: context,
+                              builder: (dialogContext) => AlertDialog(
+                                title: Text(tr(
+                                    preferences,
+                                    'Make all recordings private?',
+                                    'Rendre tous les enregistrements privés ?')),
+                                content: Text(tr(
+                                    preferences,
+                                    'RAVEN will move all recordings back into private app storage.',
+                                    'RAVEN replacera tous les enregistrements dans le stockage privé de l’application.')),
+                                actions: <Widget>[
+                                  TextButton(
+                                      onPressed: () =>
+                                          Navigator.pop(dialogContext, false),
+                                      child: Text(tr(
+                                          preferences, 'Cancel', 'Annuler'))),
+                                  FilledButton(
+                                      onPressed: () =>
+                                          Navigator.pop(dialogContext, true),
+                                      child: Text(tr(preferences,
+                                          'Make private', 'Rendre privé'))),
+                                ],
+                              ),
+                            );
+                            if (confirmed == true) {
+                              await onApplyPublicVisibility(visible: false);
                               onSettingsChanged();
                             }
                           },

@@ -4,8 +4,10 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
 
 import '../services/audio_trim_service.dart';
+import '../services/playback_service.dart';
 
 /// Result returned to the caller after a successful trim.
 class TrimEditorResult {
@@ -59,7 +61,7 @@ class TrimEditor extends StatefulWidget {
 }
 
 class _TrimEditorState extends State<TrimEditor> {
-  late final AudioPlayer _player;
+  AudioPlayer get _player => PlaybackService().player;
 
   // Selection in fractions of the timeline [0..1].
   double _selStart = 0.0;
@@ -78,13 +80,17 @@ class _TrimEditorState extends State<TrimEditor> {
   @override
   void initState() {
     super.initState();
-    _player = AudioPlayer();
+    try {
+      _player.stop();
+    } catch (_) {}
   }
 
   @override
   void dispose() {
     _posSub?.cancel();
-    _player.dispose();
+    try {
+      _player.stop();
+    } catch (_) {}
     super.dispose();
   }
 
@@ -134,13 +140,25 @@ class _TrimEditorState extends State<TrimEditor> {
     try {
       _posSub?.cancel();
       await _player.stop();
-      await _player.setAudioSource(AudioSource.uri(Uri.file(widget.source.path)));
+      final tag = MediaItem(
+        id: 'trim-preview-${widget.source.path.hashCode}',
+        title: '${widget.title} · ${label('Preview', 'Préécoute')}',
+        album: 'RAVEN',
+      );
+      await _player.setAudioSource(
+        AudioSource.uri(Uri.file(widget.source.path), tag: tag),
+      );
       await _player.seek(Duration(milliseconds: _startMs));
       unawaited(_player.play());
-      _previewing = true;
+      if (mounted) {
+        setState(() {
+          _previewing = true;
+          _previewPos = Duration(milliseconds: _startMs);
+        });
+      }
       _posSub = _player.positionStream.listen((pos) {
         final ms = pos.inMilliseconds;
-        if (ms >= _endMs) {
+        if (ms >= _endMs || ms < _startMs - 500) {
           _player.stop();
           _posSub?.cancel();
           if (mounted) {
@@ -153,11 +171,11 @@ class _TrimEditorState extends State<TrimEditor> {
         }
         if (mounted) setState(() => _previewPos = pos);
       });
-      if (mounted) setState(() {});
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('${label('Preview failed', 'Échec de la préécoute')}: $error'),
+        content:
+            Text('${label('Preview failed', 'Échec de la préécoute')}: $error'),
       ));
     }
   }

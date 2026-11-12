@@ -22,7 +22,7 @@ class RecorderScreen extends StatefulWidget {
     required this.onSaved,
     this.existingProject,
     this.resumeSessionId,
-    this.createProject = true,
+    this.createProject = false,
     super.key,
   });
 
@@ -199,8 +199,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
           widget.preferences.sampleRate;
 
       final projectId = existingProject?.id ?? widget.repository.newId();
-      final shouldCreateProject =
-          existingProject != null || widget.createProject;
+      final shouldCreateProject = existingProject != null
+          ? !existingProject.isStandalone
+          : widget.createProject;
       final newSessionId = const Uuid().v4();
       final createdAt = DateTime.now();
       final titleStamp =
@@ -427,7 +428,10 @@ class _RecorderScreenState extends State<RecorderScreen> {
   (AudioEncoder, String) _pickCaptureEncoder(String targetFormat) {
     return switch (targetFormat) {
       'wav' => (AudioEncoder.wav, 'wav'),
-      'flac' => (AudioEncoder.flac, 'flac'),
+      // Native FLAC capture is unsupported by MediaRecorder on most Android devices
+      // and causes immediate crash/exception. We safely capture lossless PCM WAV
+      // and transcode to FLAC losslessly in the background.
+      'flac' => (AudioEncoder.wav, 'wav'),
       'mp3' => (AudioEncoder.wav, 'wav'),
       'm4a' || 'aac' => (AudioEncoder.aacLc, 'm4a'),
       _ => (AudioEncoder.aacLc, 'm4a'),

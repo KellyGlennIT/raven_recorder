@@ -11,7 +11,7 @@ class AppPreferences {
     this.hasCompletedOnboarding = false,
     this.appLockEnabled = false,
     this.defaultPublicAudioVisible = false,
-    this.newRecordingsCreateProject = true,
+    this.newRecordingsCreateProject = false,
     this.trashRetentionDays = 30,
     this.aiProvider = 'openrouter',
     this.aiModel = 'openrouter/free',
@@ -82,7 +82,7 @@ class AppPreferences {
       defaultPublicAudioVisible:
           prefs.getBool('raven.defaultPublicAudioVisible') ?? false,
       newRecordingsCreateProject:
-          prefs.getBool('raven.newRecordingsCreateProject') ?? true,
+          prefs.getBool('raven.newRecordingsCreateProject') ?? false,
       trashRetentionDays: supportedTrashRetentionDays
               .contains(prefs.getInt('raven.trashRetentionDays'))
           ? prefs.getInt('raven.trashRetentionDays')!

@@ -146,40 +146,58 @@ class AudioMergeService {
     if (await pending.exists()) await pending.delete();
 
     try {
-      final codecArgs = switch (extension) {
-        'wav' => '-c:a pcm_s16le',
-        'flac' => '-c:a flac',
-        'mp3' => '-c:a libmp3lame -b:a ${_safeBitRate(bitRate)}',
-        _ => '-c:a aac -b:a ${_safeBitRate(bitRate)} -movflags +faststart',
+      final codecCandidates = switch (extension) {
+        'wav' => <String>['-c:a pcm_s16le'],
+        'flac' => <String>['-c:a flac'],
+        'mp3' => <String>[
+            '-c:a libmp3lame -b:a ${_safeBitRate(bitRate)}',
+            '-c:a mp3 -b:a ${_safeBitRate(bitRate)}',
+          ],
+        _ => <String>[
+            '-c:a aac -b:a ${_safeBitRate(bitRate)} -movflags +faststart'
+          ],
       };
       final rate = sampleRate.clamp(16000, 48000);
-      final command =
-          '-hide_banner -nostdin -y -i "${input.path}" '
-          '-vn -ar $rate -ac 1 $codecArgs "${pending.path}"';
 
-      final FFmpegSession session;
-      try {
-        session = await FFmpegKit.execute(command);
-      } catch (e) {
-        // Native library failed to load. Almost always means the Gradle
-        // exclusion for ffmpeg-kit-audio is still active in the build.
-        throw StateError(
-            'FFmpeg native library did not load ($e). '
-            'Run "flutter clean" and rebuild. Also verify '
-            'android/app/build.gradle.kts does NOT contain an "exclude" '
-            'block for "com.antonkarpenko:ffmpeg-kit-audio".');
+      FFmpegSession? session;
+      ReturnCode? returnCode;
+      String? lastLogs;
+
+      for (final codecArgs in codecCandidates) {
+        final command =
+            '-hide_banner -nostdin -y -i "${input.path}" '
+            '-vn -ar $rate -ac 1 $codecArgs "${pending.path}"';
+
+        try {
+          session = await FFmpegKit.execute(command);
+        } catch (e) {
+          throw StateError(
+              'FFmpeg native library did not load ($e). '
+              'Run "flutter clean" and rebuild. Also verify '
+              'android/app/build.gradle.kts does NOT contain an "exclude" '
+              'block for "com.antonkarpenko:ffmpeg-kit-audio".');
+        }
+
+        returnCode = await session.getReturnCode();
+        if (ReturnCode.isSuccess(returnCode) &&
+            await pending.exists() &&
+            await pending.length() >= 64) {
+          break;
+        }
+        lastLogs = await session.getOutput();
+        if (await pending.exists()) {
+          try {
+            await pending.delete();
+          } catch (_) {}
+        }
       }
 
-      final returnCode = await session.getReturnCode();
-      if (!ReturnCode.isSuccess(returnCode)) {
-        final logs = await session.getOutput();
+      if (!ReturnCode.isSuccess(returnCode) ||
+          !await pending.exists() ||
+          await pending.length() < 64) {
         throw StateError(
-            'FFmpeg conversion failed (code ${returnCode?.getValue() ?? 'unknown'}). '
-            '${_trimLog(logs ?? '')}');
-      }
-      if (!await pending.exists() || await pending.length() < 64) {
-        throw StateError(
-            'FFmpeg reported success but the output is missing or empty.');
+            'FFmpeg conversion to $extension failed (code ${returnCode?.getValue() ?? 'unknown'}). '
+            '${_trimLog(lastLogs ?? '')}');
       }
       final destination = File(outputPath);
       if (await destination.exists()) await destination.delete();

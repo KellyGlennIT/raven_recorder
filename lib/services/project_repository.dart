@@ -138,31 +138,36 @@ class ProjectRepository {
   /// folder is created under the public RAVEN root; otherwise under the private
   /// RAVEN root. Every project owns a stable folder named after its title with
   /// the ID appended so two projects with the same title never collide.
+  /// Standalone recordings only create the necessary sessions folder without
+  /// cluttering storage with unused project subdirectories.
   Future<Directory> ensureProjectFolder(RavenProject project) async {
     final folder = await _resolveProjectFolder(project);
-    await _createEmptyProjectTree(folder);
+    await _createEmptyProjectTree(folder, isStandalone: project.isStandalone);
     return folder;
   }
 
-  /// Human-readable, filesystem-safe folder name for a project.
+  /// Human-readable, filesystem-safe folder name for a project or recording.
   String projectFolderName(RavenProject project) {
     final base = _safeFolderName(project.title);
     final shortId = project.id.length > 8
         ? project.id.substring(0, 8)
         : project.id;
-    return '${base.isEmpty ? 'Project' : base}-$shortId';
+    final defaultPrefix = project.isStandalone ? 'Recording' : 'Project';
+    return '${base.isEmpty ? defaultPrefix : base}-$shortId';
   }
 
-  Future<void> _createEmptyProjectTree(Directory folder) async {
+  Future<void> _createEmptyProjectTree(Directory folder, {bool isStandalone = false}) async {
     await folder.create(recursive: true);
-    for (final child in <String>[
-      'sessions',
-      'notes',
-      'attachments',
-      'exports',
-      'metadata'
-    ]) {
-      await Directory('${folder.path}/$child').create(recursive: true);
+    await Directory('${folder.path}/sessions').create(recursive: true);
+    if (!isStandalone) {
+      for (final child in <String>[
+        'notes',
+        'attachments',
+        'exports',
+        'metadata'
+      ]) {
+        await Directory('${folder.path}/$child').create(recursive: true);
+      }
     }
   }
 
