@@ -285,6 +285,129 @@ class ProjectRepository {
   }
 
   // ---------------------------------------------------------------------------
+  // Rename on disk
+  // ---------------------------------------------------------------------------
+
+  /// Renames a project everywhere: the in-memory/index record AND the physical
+  /// folder on the device. The folder `<Title>-<id8>` is moved (or copied)
+  /// under its new name and every [RavenAudioSession.audioPath] plus
+  /// [RavenProject.masterAudioPath] / [RavenProject.publicFolderLocation] that
+  /// lived inside it are rewritten to the new location.
+  ///
+  /// The returned project is the one the caller must persist via [update];
+  /// this method itself only moves files and does not touch the index, so a
+  /// failure here never corrupts the record.
+  Future<RavenProject> renameProject(RavenProject project, String newTitle) async {
+    final trimmed = newTitle.trim();
+    if (trimmed.isEmpty) {
+      throw ArgumentError('The project title must not be empty.');
+    }
+    if (trimmed == project.title) return project;
+
+    final oldFolder = await _resolveProjectFolder(project);
+    final renamedRecord = project.copyWith(title: trimmed);
+
+    // When the folder does not exist yet there is nothing to move; ensureProject
+    // will materialise it later under the NEW name.
+    if (!await oldFolder.exists()) return renamedRecord;
+
+    final sameFolder = project.hasPublicFolder;
+    final Directory newFolder;
+    if (sameFolder) {
+      // Public folder keeps its location; only the leaf name changes.
+      final parent = oldFolder.parent;
+      newFolder = Directory('${parent.path}/${projectFolderName(renamedRecord)}');
+    } else {
+      newFolder = Directory(
+          '${projectsDirectory.path}/${projectFolderName(renamedRecord)}');
+    }
+
+    if (oldFolder.path == newFolder.path) return renamedRecord;
+    if (await newFolder.exists()) {
+      // A stale folder with the new name already exists; merge into it instead
+      // of failing, so the user is never blocked from renaming.
+      await _moveDirectory(oldFolder, newFolder);
+    } else {
+      try {
+        await oldFolder.rename(newFolder.path);
+      } on FileSystemException {
+        // Cross-device or locked file systems: fall back to copy-then-delete.
+        await _moveDirectory(oldFolder, newFolder);
+      }
+    }
+
+    final oldPath = oldFolder.path;
+    String rewrite(String path) =>
+        path.startsWith(oldPath)
+            ? newFolder.path + path.substring(oldPath.length)
+            : path;
+
+    return renamedRecord.copyWith(
+      sessions: renamedRecord.sessions
+          .map((session) => session.copyWith(audioPath: rewrite(session.audioPath)))
+          .toList(),
+      masterAudioPath: renamedRecord.masterAudioPath == null
+          ? null
+          : rewrite(renamedRecord.masterAudioPath!),
+      publicFolderLocation:
+          sameFolder ? newFolder.path : renamedRecord.publicFolderLocation,
+    );
+  }
+
+  /// Renames the audio file of [session] on disk to match its new take name.
+  ///
+  /// The physical file becomes `<Sanitized take name>-<sessionId>.<ext>` inside
+  /// the same folder, and the session's `audioPath` is rewritten to the new
+  /// location. Renaming fails soft: if the file is missing, has been replaced,
+  /// or cannot be moved, the original path is kept and the record returned
+  /// unchanged (the display rename still succeeds).
+  Future<RavenProject> renameSessionFile(
+    RavenProject project,
+    RavenAudioSession session,
+    String newName,
+  ) async {
+    final trimmed = newName.trim();
+    if (trimmed.isEmpty) return project;
+
+    final index = project.sessions.indexWhere((s) => s.id == session.id);
+    if (index < 0) return project;
+
+    final source = File(session.audioPath);
+    if (!await source.exists()) return project;
+
+    final sanitized = _safeFolderName(trimmed);
+    if (sanitized.isEmpty) return project;
+    var extension = session.audioPath.contains('.')
+        ? session.audioPath.split('.').last.toLowerCase()
+        : session.format.toLowerCase();
+    if (extension.isEmpty || extension.length > 10) extension = 'm4a';
+
+    final target = File(
+        '${source.parent.path}/$sanitized-${session.id}.$extension');
+    if (target.path == source.path) return project;
+
+    try {
+      if (await target.exists()) {
+        // Same recording renamed to the same name twice — overwrite safely.
+        final sameLength = await target.length() == await source.length();
+        if (!sameLength) {
+          await target.delete();
+        } else {
+          await source.delete();
+          return project;
+        }
+      }
+      final renamed = await source.rename(target.path);
+      final sessions = List<RavenAudioSession>.of(project.sessions);
+      sessions[index] = session.copyWith(audioPath: renamed.path);
+      return project.copyWith(sessions: sessions);
+    } on FileSystemException {
+      // Leave the file where it is; the display name still updates.
+      return project;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Index load / save
   // ---------------------------------------------------------------------------
 

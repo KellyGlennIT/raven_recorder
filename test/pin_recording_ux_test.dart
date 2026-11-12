@@ -103,6 +103,7 @@ void main() {
             pinToggled = true;
           },
           autoPlay: false,
+          onSaveAmplified: (RavenProject updated) async => true,
         ),
       ),
     );

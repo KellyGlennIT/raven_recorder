@@ -44,6 +44,7 @@ class RavenAudioSession {
     this.name = '',
     this.sampleRate = 44100,
     this.recoverablePcm16 = false,
+    this.bitRate = 128000,
   });
 
   final String id;
@@ -55,6 +56,14 @@ class RavenAudioSession {
   final int sampleRate;
   final bool recoverablePcm16;
 
+  /// Encoding bitrate in bits-per-second of the recording as it currently
+  /// exists on disk. Set at creation from the user's settings, then preserved
+  /// through every subsequent re-encode (merge-on-resume, amplify-save) so a
+  /// later re-encode never artificially upgrades or downgrades the tier the
+  /// user originally chose. Meaningful only for lossy formats (M4A, MP3);
+  /// WAV and FLAC encode at fixed quality and ignore this value.
+  final int bitRate;
+
   RavenAudioSession copyWith({
     String? audioPath,
     DateTime? createdAt,
@@ -63,6 +72,7 @@ class RavenAudioSession {
     String? name,
     int? sampleRate,
     bool? recoverablePcm16,
+    int? bitRate,
   }) {
     return RavenAudioSession(
       id: id,
@@ -73,6 +83,7 @@ class RavenAudioSession {
       name: name ?? this.name,
       sampleRate: sampleRate ?? this.sampleRate,
       recoverablePcm16: recoverablePcm16 ?? this.recoverablePcm16,
+      bitRate: bitRate ?? this.bitRate,
     );
   }
 
@@ -85,6 +96,7 @@ class RavenAudioSession {
         'name': name,
         'sampleRate': sampleRate,
         'recoverablePcm16': recoverablePcm16,
+        'bitRate': bitRate,
       };
 
   factory RavenAudioSession.fromJson(Map<String, Object?> json) {
@@ -97,6 +109,7 @@ class RavenAudioSession {
       name: json['name'] as String? ?? '',
       sampleRate: (json['sampleRate'] as num?)?.toInt() ?? 44100,
       recoverablePcm16: json['recoverablePcm16'] as bool? ?? false,
+      bitRate: (json['bitRate'] as num?)?.toInt() ?? 128000,
     );
   }
 }
@@ -142,74 +155,38 @@ class RavenProject {
   final List<String> tags;
   final List<RavenBookmark> bookmarks;
 
-  /// Metadata flag only. Playback gating must be enforced by the security service.
   final bool isAudioProtected;
-
-  /// Random PBKDF2 salt for password-protected audio; never contains a password.
   final String? audioProtectionSalt;
-
-  /// Requires the configured RAVEN app PIN before opening this project.
   final bool requiresAppPin;
-
-  /// AI outputs are stored separately from original notes/transcripts.
   final Map<String, String> aiGeneratedContent;
-
-  /// Optional, automatically generated continuous master file. Session files remain as recovery sources.
   final String? masterAudioPath;
-
-  /// URI or path for a single-file RAVEN-managed user-visible copy
-  /// (Show/Hide public-copy control), separate from the private original.
-  /// This is a *per-file* copy, not the whole project folder.
   final String? publicCopyLocation;
-
-  /// URI or path of the public copy of the whole project folder (audio, notes,
-  /// attachments). Null while the project folder is private.
-  ///
-  /// The public/private **folder toggle** in the UI operates exclusively on
-  /// this field. Toggling public moves the project's folder into a
-  /// user-visible public root; toggling private moves it back into
-  /// app-private storage.
   final String? publicFolderLocation;
 
-  /// True when *any* public representation of this project exists.
-  /// Backwards-compatible umbrella used by existing UI/badges.
   bool get isPublic =>
       publicFolderLocation != null || publicCopyLocation != null;
 
-  /// True when the whole project folder is user-visible (Files app).
-  /// This is what the public/private toggle flips.
   bool get hasPublicFolder => publicFolderLocation != null;
 
-  /// True when a single-file managed public copy exists (Show/Hide).
   bool get hasPublicCopy => publicCopyLocation != null;
 
   String? get latestAudioPath =>
       masterAudioPath ?? (sessions.isEmpty ? null : sessions.last.audioPath);
 
-  /// The most recent audio session, or null when the project has no sessions.
-  /// Used by resume, merge and player logic to know the format/sample rate
-  /// of the existing recording before appending.
   RavenAudioSession? get lastSession =>
       sessions.isEmpty ? null : sessions.last;
 
-  /// True when more than one internal session is present.
-  /// The resume-merge flow should reduce this to 1 (WAV append) or treat the
-  /// master file as the single user-facing recording (compressed formats).
   bool get hasMultipleSessions => sessions.length > 1;
 
-  /// True when this project can accept another recording via resume.
-  /// Single source of truth — the Library tile, the popup menu and the
-  /// repository should all agree by reading this getter.
   bool get canResume => !isDraft && !isTrashed && !isAudioProtected;
 
-  /// Format of the most recent recording, or the default 'm4a' for new
-  /// projects with no sessions yet. Used by the repository to decide between
-  /// lossless PCM16 append (WAV) and FFmpeg re-encode (M4A/MP3/FLAC).
   String get currentFormat => sessions.isEmpty ? 'm4a' : sessions.last.format;
 
-  /// Sample rate of the most recent recording, or the default 44100 Hz.
   int get currentSampleRate =>
       sessions.isEmpty ? 44100 : sessions.last.sampleRate;
+
+  int get currentBitRate =>
+      sessions.isEmpty ? 128000 : sessions.last.bitRate;
 
   int get durationMs =>
       sessions.fold<int>(0, (sum, session) => sum + session.durationMs);

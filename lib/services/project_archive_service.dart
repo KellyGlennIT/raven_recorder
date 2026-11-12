@@ -18,8 +18,9 @@ bool isSafeRelativeArchivePath(String path) {
   final portable = path.replaceAll('\\', '/');
   // Check original segments before normalization: normalizing `a/../b` first
   // would hide the traversal attempt while later joins may use the raw path.
-  if (portable.startsWith('/') || p.isAbsolute(path) || portable.contains(':'))
+  if (portable.startsWith('/') || p.isAbsolute(path) || portable.contains(':')) {
     return false;
+  }
   final segments = portable.split('/');
   if (portable.endsWith('/')) segments.removeLast();
   if (segments.isEmpty ||
@@ -47,8 +48,12 @@ class ProjectArchiveService {
       throw StateError(
           'This project contains audio encrypted with a device-local key. Decrypt the audio before exporting a portable project bundle.');
     }
-    final projectDirectory =
-        Directory(p.join(_repository.projectsDirectory.path, project.id));
+    // Resolve the folder exactly like the rest of the app does: a project's
+    // files live in `<projects>/<title>-<shortId>/` (or in its public folder),
+    // NOT in `<projects>/<id>/`. Assuming the raw ID here made every export
+    // fail with "Project files are missing" — including audio imported as a
+    // standalone recording.
+    final projectDirectory = await _repository.ensureProjectFolder(project);
     if (!await projectDirectory.exists()) {
       throw FileSystemException(
           'Project files are missing.', projectDirectory.path);
@@ -195,8 +200,9 @@ class ProjectArchiveService {
   /// Validates a bundle and extracts it into a private staging directory.
   /// It deliberately does not overwrite an existing project automatically.
   Future<StagedProjectImport> stageImport(File bundle) async {
-    if (!await bundle.exists())
+    if (!await bundle.exists()) {
       throw FileSystemException('Bundle not found.', bundle.path);
+    }
     final bytes = await bundle.readAsBytes();
     final archive = ZipDecoder().decodeBytes(bytes, verify: true);
     if (archive.files.length > _maxEntries) {
@@ -207,10 +213,13 @@ class ProjectArchiveService {
       if (!_isSafeRelativePath(entry.name)) {
         throw FormatException('Unsafe path in project bundle: ${entry.name}');
       }
-      if (entry.name == _manifestName && entry.isFile) manifestEntry = entry;
+      if (entry.name == _manifestName && entry.isFile) {
+        manifestEntry = entry;
+      }
     }
-    if (manifestEntry == null)
+    if (manifestEntry == null) {
       throw const FormatException('This is not a RAVEN project bundle.');
+    }
     final manifestText = utf8.decode(manifestEntry.content as List<int>);
     final decoded = jsonDecode(manifestText);
     if (decoded is! Map ||
@@ -228,8 +237,9 @@ class ProjectArchiveService {
       for (final entry in archive.files) {
         if (!entry.isFile || !entry.name.startsWith('project_files/')) continue;
         final relative = entry.name.substring('project_files/'.length);
-        if (!_isSafeRelativePath(relative))
+        if (!_isSafeRelativePath(relative)) {
           throw FormatException('Unsafe project file path: $relative');
+        }
         final destination = File(p.join(stagingRoot.path, relative));
         await destination.parent.create(recursive: true);
         await destination.writeAsBytes(entry.content as List<int>, flush: true);
@@ -239,6 +249,52 @@ class ProjectArchiveService {
       if (await stagingRoot.exists()) await stagingRoot.delete(recursive: true);
       rethrow;
     }
+  }
+
+  /// Looks inside an archive that is *not* itself a RAVEN bundle for a nested
+  /// RAVEN bundle — the shape produced when a user zips a whole project folder
+  /// or a folder containing several exported `.zip` files. The first nested
+  /// bundle found is written to a temporary file and returned; the caller owns
+  /// and must delete it. Returns null when no nested bundle exists.
+  Future<File?> extractNestedBundle(File archiveFile) async {
+    if (!await archiveFile.exists()) return null;
+    final Archive archive;
+    try {
+      archive = ZipDecoder()
+          .decodeBytes(await archiveFile.readAsBytes(), verify: true);
+    } catch (_) {
+      return null;
+    }
+    if (archive.files.length > _maxEntries) return null;
+
+    ArchiveFile? manifest;
+    String? nestedZipName;
+    ArchiveFile? nestedZip;
+    for (final entry in archive.files) {
+      if (!entry.isFile || !_isSafeRelativePath(entry.name)) continue;
+      final name = p.basename(entry.name).toLowerCase();
+      if (name == _manifestName && manifest == null) {
+        manifest = entry;
+      } else if (name.endsWith('.zip') && nestedZip == null) {
+        nestedZip = entry;
+        nestedZipName = entry.name;
+      }
+    }
+    if (manifest != null) return null; // Already a bundle; caller handles it.
+    if (nestedZip == null) return null;
+    final content = nestedZip.content as List<int>;
+    if (content.length < 4) return null;
+    final temporary = File(p.join((await getTemporaryDirectory()).path,
+        'raven-nested-${DateTime.now().microsecondsSinceEpoch}.zip'));
+    await temporary.writeAsBytes(content, flush: true);
+    // Guard against recursion loops: the extracted file must actually look
+    // like a zip and must not be the same size as this attempt.
+    if (await temporary.length() != content.length ||
+        nestedZipName == null) {
+      await temporary.delete();
+      return null;
+    }
+    return temporary;
   }
 
   bool _isSafeRelativePath(String path) => isSafeRelativeArchivePath(path);

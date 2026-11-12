@@ -158,10 +158,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // Bulk operations
-  // ---------------------------------------------------------------------------
-
   Future<void> _runBulk({
     required List<RavenProject> projects,
     required Future<void> Function(RavenProject) action,
@@ -341,8 +337,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (active.isEmpty) return;
     final targets = makePublic
         ? active
-            .where((p) =>
-                !p.isPublic && !p.isAudioProtected && !p.requiresAppPin)
+            .where((p) => !p.isPublic && !p.isAudioProtected && !p.requiresAppPin)
             .toList()
         : active.where((p) => p.isPublic).toList();
     if (targets.isEmpty) return;
@@ -381,10 +376,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ));
     }
   }
-
-  // ---------------------------------------------------------------------------
-  // Header builders
-  // ---------------------------------------------------------------------------
 
   Widget _buildNormalHeader({
     required ThemeData theme,
@@ -437,14 +428,28 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 itemBuilder: (context) => <PopupMenuEntry<String>>[
                   PopupMenuItem<String>(
                     value: 'audio',
-                    child: Text(tr(widget.preferences, 'Import audio file',
-                        'Importer un fichier audio')),
+                    child: ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.audiotrack_rounded),
+                      title: Text(tr(widget.preferences, 'Import audio files',
+                          'Importer des fichiers audio')),
+                      subtitle: Text(tr(widget.preferences,
+                          'One or more recordings (m4a, mp3, wav, flac…)',
+                          'Un ou plusieurs enregistrements (m4a, mp3, wav, flac…)')),
+                    ),
                   ),
                   PopupMenuItem<String>(
                     value: 'project',
-                    child: Text(tr(widget.preferences,
-                        'Import RAVEN project bundle',
-                        'Importer un projet RAVEN')),
+                    child: ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.folder_zip_outlined),
+                      title: Text(tr(widget.preferences,
+                          'Import RAVEN projects',
+                          'Importer des projets RAVEN')),
+                      subtitle: Text(tr(widget.preferences,
+                          'One or more .zip bundles',
+                          'Un ou plusieurs fichiers .zip')),
+                    ),
                   ),
                 ],
                 icon: const Icon(Icons.file_upload_outlined),
@@ -654,10 +659,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Build
-  // ---------------------------------------------------------------------------
-
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -865,10 +866,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return _selectedCategory ??
         tr(widget.preferences, 'All recordings', 'Tous les enregistrements');
   }
-
-  // ---------------------------------------------------------------------------
-  // Single-project operations (unchanged)
-  // ---------------------------------------------------------------------------
 
   Future<void> _showDetails(BuildContext context, RavenProject project) async {
     final messenger = ScaffoldMessenger.of(context);
@@ -1737,11 +1734,19 @@ class ProjectTile extends StatelessWidget {
             child: Text(tr(
               preferences,
               project.isPublic
-                  ? 'Make project private'
-                  : 'Make project public',
+                  ? (project.isStandalone
+                      ? 'Make recording private'
+                      : 'Make project private')
+                  : (project.isStandalone
+                      ? 'Make recording public'
+                      : 'Make project public'),
               project.isPublic
-                  ? 'Rendre le projet privé'
-                  : 'Rendre le projet public',
+                  ? (project.isStandalone
+                      ? 'Rendre l’enregistrement privé'
+                      : 'Rendre le projet privé')
+                  : (project.isStandalone
+                      ? 'Rendre l’enregistrement public'
+                      : 'Rendre le projet public'),
             )),
           ),
         if (onToggleProtection != null)

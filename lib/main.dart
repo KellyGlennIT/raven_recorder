@@ -11,6 +11,7 @@ import 'package:just_audio_background/just_audio_background.dart';
 import 'package:cryptography/cryptography.dart';
 
 import 'models/raven_project.dart';
+import 'services/background_encode_service.dart';
 import 'screens/home_screen.dart';
 import 'screens/library_screen.dart';
 import 'screens/player_screen.dart';
@@ -23,25 +24,20 @@ import 'services/audio_encryption_service.dart';
 import 'services/audio_visibility_service.dart';
 import 'services/audio_share_service.dart';
 import 'services/audio_protection_service.dart';
-
 import 'services/project_repository.dart';
 import 'services/project_archive_service.dart';
 import 'widgets/audio_password_dialog.dart';
+import 'widgets/trim_editor.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Initialise the background audio service before anything else that
-  // touches just_audio. From this point on, playback continues when the app
-  // is backgrounded and a media notification appears with play/pause/seek.
   await JustAudioBackground.init(
     androidNotificationChannelId: 'com.raven.raven.audio',
     androidNotificationChannelName: 'RAVEN audio playback',
     androidNotificationChannelDescription:
         'Playback controls for your RAVEN recordings',
     androidNotificationIcon: 'mipmap/ic_launcher',
-    // Hide fast-forward / rewind buttons — recordings aren't skippable
-    // tracks. The seek bar is still available in the notification.
     fastForwardInterval: Duration.zero,
     rewindInterval: Duration.zero,
   );
@@ -49,7 +45,7 @@ Future<void> main() async {
   await initializeDateFormatting('fr');
   try {
     await AudioEncryptionService.cleanupAbandonedPlaybackFiles();
-  } catch (_) {/* startup must remain available */}
+  } catch (_) {}
 
   final repository = await ProjectRepository.create();
   final preferences = await AppPreferences.load();
@@ -153,6 +149,7 @@ class _MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
+  BackgroundEncodeService get _encoder => BackgroundEncodeService.instance;
   int _selectedIndex = 0;
   bool _tourShowing = false;
   late bool _locked;
@@ -164,6 +161,19 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     _locked = widget.preferences.appLockEnabled;
+    _encoder.onProjectUpdated = (_) => _refreshProjects();
+    _encoder.onSuccess = (message) {
+      if (!mounted) return;
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        SnackBar(content: Text(message)),
+      );
+    };
+    _encoder.onError = (message) {
+      if (!mounted) return;
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        SnackBar(content: Text(message)),
+      );
+    };
     WidgetsBinding.instance.addObserver(this);
     _trashTimer =
         Timer.periodic(const Duration(hours: 12), (_) => _purgeExpiredTrash());
@@ -404,13 +414,6 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     widget.onProjectsChanged();
   }
 
-  /// Lazily requests Android's "All files access" permission the first time
-  /// the user makes a project public. On non-Android platforms and on
-  /// Android 10 and below this is a no-op that returns true.
-  ///
-  /// The prompt is shown via Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-  /// not the standard runtime permission dialog — MANAGE_EXTERNAL_STORAGE is
-  /// a special permission that can only be granted through system settings.
   Future<bool> _ensureAllFilesAccess() async {
     if (!Platform.isAndroid) return true;
     const channel = MethodChannel('raven/storage_permission');
@@ -425,19 +428,43 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     }
   }
 
-  Future<String?> _setProjectVisibility(
+  Future<void> _applyVisibilitySilently(
     RavenProject project, {
     required bool visible,
-    bool refresh = true,
   }) async {
     if (visible && (project.isAudioProtected || project.requiresAppPin)) {
       throw StateError(
           'Protected or PIN-locked recordings cannot be made public.');
     }
-    if (visible == project.hasPublicFolder &&
-        project.publicCopyLocation == null) {
-      if (refresh) await _refreshProjects();
-      return project.publicFolderLocation;
+
+    // Legacy cleanup: older builds published standalones as a COPIED single
+    // file (duplicate storage). Remove any leftover managed copy before
+    // applying the current move-based visibility.
+    if (project.publicCopyLocation != null) {
+      try {
+        await AudioVisibilityService().remove(project.publicCopyLocation!);
+      } catch (_) {}
+      project = project.copyWith(clearPublicCopyLocation: true);
+      await widget.repository.update(project);
+    }
+    if (project.isStandalone) {
+      final legacyFolder = project.publicFolderLocation;
+      if (legacyFolder != null &&
+          AudioVisibilityService.isContentUri(legacyFolder)) {
+        try {
+          await AudioVisibilityService().removeFolder(legacyFolder);
+        } catch (_) {}
+        project = project.copyWith(clearPublicFolderLocation: true);
+        await widget.repository.update(project);
+      }
+    }
+
+    // Both standalones and projects use the SAME move-based flow: the whole
+    // project folder is physically relocated (never copied) between private
+    // storage and the public RAVEN root, and audio paths are rewritten.
+    // This keeps device storage flat — no duplicate public copies.
+    if (visible == project.hasPublicFolder) {
+      return;
     }
     if (visible) {
       final allowed = await _ensureAllFilesAccess();
@@ -460,15 +487,13 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
       } catch (_) {}
     }
     await widget.repository.update(updated);
-    if (refresh) await _refreshProjects();
-    return updated.publicFolderLocation;
   }
 
   Future<void> _applyPublicVisibilityToAll({required bool visible}) async {
     final failures = <String>[];
     for (final project in widget.repository.projects) {
       try {
-        await _setProjectVisibility(project, visible: visible, refresh: false);
+        await _applyVisibilitySilently(project, visible: visible);
       } catch (error) {
         failures.add('${project.title}: $error');
       }
@@ -511,8 +536,13 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
           .where((project) => !existingProjectIds.contains(project.id));
       final newProject = newProjects.isEmpty ? null : newProjects.first;
       if (newProject != null) {
+        // Publish the FINAL encoded audio, not the capture file: wait for any
+        // background transcode of this project to commit its swap first.
         try {
-          await _setProjectVisibility(newProject, visible: true);
+          await _encoder.waitForProject(newProject.id);
+        } catch (_) {}
+        try {
+          await _applyVisibilitySilently(newProject, visible: true);
         } catch (error) {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -553,11 +583,9 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         !project.isAudioProtected &&
         !project.requiresAppPin) {
       try {
-        project = await widget.repository.toggleVisibility(
-          project,
-          makePublic: true,
-        );
-        await widget.repository.update(project);
+        await _applyVisibilitySilently(project, visible: true);
+        final refreshed = widget.repository.projectById(project.id);
+        if (refreshed != null) project = refreshed;
       } catch (error) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -590,38 +618,100 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     await _refreshProjects();
   }
 
+  /// Imports one or more full RAVEN project bundles (`.zip`). Whole-folder
+  /// bundles exported by RAVEN are accepted too; the service finds nested
+  /// bundles inside them. Each import installs as an ordinary, private project
+  /// that opens exactly like a project recorded in the app.
   Future<void> _importProjectBundle() async {
     final messenger = ScaffoldMessenger.maybeOf(context);
     try {
       final selection = await FilePicker.platform.pickFiles(
         type: FileType.custom,
         allowedExtensions: const <String>['zip'],
-        allowMultiple: false,
+        allowMultiple: true,
       );
       if (selection == null || selection.files.isEmpty || !mounted) return;
-      final path = selection.files.single.path;
-      if (path == null || path.trim().isEmpty) {
-        throw const FileSystemException(
-            'The selected bundle has no accessible file path.');
-      }
 
       final service = ProjectArchiveService(widget.repository);
-      final staged = await service.stageImport(File(path));
-      try {
-        final imported = await service.installStagedImport(staged);
-        if (!mounted) return;
-        await _refreshProjects();
-        if (mounted) {
-          messenger?.showSnackBar(SnackBar(
-              content: Text(tr(
-            widget.preferences,
-            'Imported "${imported.title}" as a new private project.',
-            '« ${imported.title} » a été importé comme nouveau projet privé.',
-          ))));
+      final importedTitles = <String>[];
+      final failures = <String>[];
+
+      for (final picked in selection.files) {
+        var path = picked.path;
+        if (path == null || path.trim().isEmpty) {
+          failures.add(picked.name);
+          continue;
         }
-      } catch (_) {
-        await staged.discard();
-        rethrow;
+        File bundle = File(path);
+        try {
+          if (!await bundle.exists() || await bundle.length() == 0) {
+            throw FileSystemException('Bundle is missing or empty.', path);
+          }
+
+          StagedProjectImport staged;
+          try {
+            staged = await service.stageImport(bundle);
+          } on FormatException {
+            // A bundle can arrive inside another archive (e.g. the user zipped
+            // a whole project folder). Unwrap it once into a temporary file.
+            final nested = await service.extractNestedBundle(bundle);
+            if (nested == null) rethrow;
+            bundle = nested;
+            try {
+              staged = await service.stageImport(bundle);
+            } finally {
+              try {
+                await nested.delete();
+              } catch (_) {}
+            }
+          }
+
+          try {
+            final imported = await service.installStagedImport(staged);
+            importedTitles.add(imported.title);
+            if (widget.preferences.defaultPublicAudioVisible &&
+                !imported.isAudioProtected &&
+                !imported.requiresAppPin) {
+              try {
+                await _applyVisibilitySilently(
+                    _fresh(imported), visible: true);
+              } catch (_) {}
+            }
+          } catch (_) {
+            await staged.discard();
+            rethrow;
+          }
+        } catch (error) {
+          failures.add('${picked.name} ($error)');
+        }
+      }
+
+      if (!mounted) return;
+      await _refreshProjects();
+      if (!mounted) return;
+      if (importedTitles.isNotEmpty) {
+        messenger?.showSnackBar(SnackBar(
+          content: Text(importedTitles.length == 1
+              ? tr(
+                  widget.preferences,
+                  'Imported "${importedTitles.single}" as a new project.',
+                  '« ${importedTitles.single} » a été importé comme nouveau projet.',
+                )
+              : tr(
+                  widget.preferences,
+                  '${importedTitles.length} projects imported successfully.',
+                  '${importedTitles.length} projets importés avec succès.',
+                )),
+        ));
+      }
+      if (failures.isNotEmpty) {
+        messenger?.showSnackBar(SnackBar(
+          content: Text(tr(
+            widget.preferences,
+            'Could not import: ${failures.join(', ')}',
+            'Importation impossible : ${failures.join(', ')}',
+          )),
+        ));
       }
     } catch (error) {
       if (mounted) {
@@ -635,63 +725,131 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     }
   }
 
+  static const Set<String> _supportedImportAudio = <String>{
+    'm4a',
+    'mp3',
+    'wav',
+    'flac',
+    'ogg',
+    'opus',
+    'aac',
+    'm4b',
+    'wma',
+    'amr',
+  };
+
+  /// Imports one or more audio files. Every file becomes its own standalone
+  /// recording, created through the same code path as a fresh recording so it
+  /// shows up, plays, shares, amplifies and renames exactly like one recorded
+  /// inside RAVEN.
   Future<void> _importAudioRecording() async {
     final messenger = ScaffoldMessenger.maybeOf(context);
-    String? stagedFolderPath;
     try {
       final selection = await FilePicker.platform.pickFiles(
         type: FileType.custom,
-        allowedExtensions: const <String>['m4a', 'mp3', 'wav', 'flac'],
-        allowMultiple: false,
+        allowedExtensions: _supportedImportAudio.toList(),
+        allowMultiple: true,
       );
       if (selection == null || selection.files.isEmpty || !mounted) return;
-      final sourcePath = selection.files.single.path;
-      if (sourcePath == null || sourcePath.trim().isEmpty) {
-        throw const FileSystemException(
-            'The selected audio file has no accessible path.');
-      }
 
-      final source = File(sourcePath);
-      if (!await source.exists() || await source.length() == 0) {
-        throw FileSystemException(
-            'The selected audio file is missing or empty.', sourcePath);
-      }
-      final sourceName = sourcePath.split(RegExp(r'[\\/]')).last;
-      final extension = sourceName.split('.').last.toLowerCase();
-      if (!const <String>{'m4a', 'mp3', 'wav', 'flac'}.contains(extension)) {
-        throw UnsupportedError('RAVEN does not support .$extension imports.');
-      }
-      var title = sourceName.contains('.')
-          ? sourceName.substring(0, sourceName.lastIndexOf('.')).trim()
-          : sourceName.trim();
-      title = title.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_').trim();
-      if (title.isEmpty) title = 'Imported recording';
-      if (title.length > 80) title = title.substring(0, 80).trim();
+      final importedTitles = <String>[];
+      final failures = <String>[];
 
-      final projectId = widget.repository.newId();
-      final sessionId = widget.repository.newId();
-      final createdAt = DateTime.now();
-
-      var project = RavenProject(
-        id: projectId,
-        title: title,
-        createdAt: createdAt,
-        updatedAt: createdAt,
-        sessions: const <RavenAudioSession>[],
-        isStandalone: true,
-      );
-
-      if (widget.preferences.defaultPublicAudioVisible) {
+      for (final picked in selection.files) {
+        final sourcePath = picked.path;
+        if (sourcePath == null || sourcePath.trim().isEmpty) {
+          failures.add(picked.name);
+          continue;
+        }
         try {
-          project = await widget.repository.toggleVisibility(
-            project,
-            makePublic: true,
-          );
-        } catch (_) {}
+          final title = await _importOneAudioFile(File(sourcePath));
+          importedTitles.add(title);
+        } catch (error) {
+          failures.add('${picked.name} ($error)');
+        }
       }
 
-      final folder = await widget.repository.ensureProjectFolder(project);
-      stagedFolderPath = folder.path;
+      if (!mounted) return;
+      await _refreshProjects();
+      if (!mounted) return;
+      if (importedTitles.isNotEmpty) {
+        messenger?.showSnackBar(SnackBar(
+          content: Text(importedTitles.length == 1
+              ? tr(
+                  widget.preferences,
+                  'Imported "${importedTitles.single}" as a recording.',
+                  '« ${importedTitles.single} » a été importé comme enregistrement.',
+                )
+              : tr(
+                  widget.preferences,
+                  '${importedTitles.length} recordings imported successfully.',
+                  '${importedTitles.length} enregistrements importés avec succès.',
+                )),
+        ));
+      }
+      if (failures.isNotEmpty) {
+        messenger?.showSnackBar(SnackBar(
+          content: Text(tr(
+            widget.preferences,
+            'Could not import: ${failures.join(', ')}',
+            'Importation impossible : ${failures.join(', ')}',
+          )),
+        ));
+      }
+    } catch (error) {
+      if (mounted) {
+        messenger?.showSnackBar(SnackBar(
+          content: Text('${tr(
+            widget.preferences,
+            'Audio import failed',
+            'Échec de l’importation de l’audio',
+          )}: $error'),
+        ));
+      }
+    }
+  }
+
+  /// Copies [source] into a brand-new standalone project and returns its title.
+  /// On any failure the half-created project folder is removed so the library
+  /// never shows a broken entry.
+  Future<String> _importOneAudioFile(File source) async {
+    if (!await source.exists() || await source.length() == 0) {
+      throw FileSystemException(
+          'The selected audio file is missing or empty.', source.path);
+    }
+    final sourceName = source.path.split(RegExp(r'[\\/]')).last;
+    final extension = sourceName.contains('.')
+        ? sourceName.split('.').last.toLowerCase()
+        : '';
+    if (!_supportedImportAudio.contains(extension)) {
+      throw UnsupportedError(
+          extension.isEmpty
+              ? 'RAVEN could not detect the audio format.'
+              : 'RAVEN does not support .$extension imports.');
+    }
+    var title = sourceName.contains('.')
+        ? sourceName.substring(0, sourceName.lastIndexOf('.')).trim()
+        : sourceName.trim();
+    title = title.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_').trim();
+    if (title.isEmpty) title = 'Imported recording';
+    if (title.length > 80) title = title.substring(0, 80).trim();
+
+    final projectId = widget.repository.newId();
+    final sessionId = widget.repository.newId();
+    final createdAt = DateTime.now();
+
+    var project = RavenProject(
+      id: projectId,
+      title: title,
+      createdAt: createdAt,
+      updatedAt: createdAt,
+      sessions: const <RavenAudioSession>[],
+      isStandalone: true,
+    );
+
+    Directory? folder;
+    try {
+      folder = await widget.repository.ensureProjectFolder(project);
 
       final sessionDirectory = Directory('${folder.path}/sessions');
       await sessionDirectory.create(recursive: true);
@@ -703,18 +861,8 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         throw StateError('The imported audio copy failed verification.');
       }
 
-      final audioPlayer = AudioPlayer();
-      late final int durationMs;
-      try {
-        await audioPlayer.setFilePath(destination.path);
-        final duration = audioPlayer.duration;
-        if (duration == null || duration <= Duration.zero) {
-          throw StateError('RAVEN could not read the audio duration.');
-        }
-        durationMs = duration.inMilliseconds;
-      } finally {
-        await audioPlayer.dispose();
-      }
+      final durationMs = await _probeAudioDuration(destination, sessionId,
+          title: title);
 
       project = project.copyWith(
         sessions: <RavenAudioSession>[
@@ -724,38 +872,67 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
             createdAt: createdAt,
             durationMs: durationMs,
             format: extension,
+            // Mirrors a freshly captured take exactly (RecorderScreen uses
+            // '<title> · Session <n>'), so imported audio is indistinguishable
+            // from one recorded in the app.
             name: '$title · Session 1',
+            sampleRate: widget.preferences.sampleRate,
+            bitRate: widget.preferences.bitRate,
           ),
         ],
+        // Not a draft: it is a finished, playable recording.
+        isDraft: false,
       );
       await widget.repository.add(project);
-      stagedFolderPath = null;
-      await _refreshProjects();
-      if (mounted) {
-        messenger?.showSnackBar(SnackBar(
-          content: Text(tr(
-            widget.preferences,
-            'Imported "$title" as a recording.',
-            '« $title » a été importé comme enregistrement.',
-          )),
-        ));
-      }
-    } catch (error) {
-      if (stagedFolderPath != null) {
-        final directory = Directory(stagedFolderPath);
+
+      if (widget.preferences.defaultPublicAudioVisible) {
         try {
-          if (await directory.exists()) {
-            await directory.delete(recursive: true);
-          }
+          await _applyVisibilitySilently(_fresh(project), visible: true);
         } catch (_) {}
       }
-      if (mounted) {
-        messenger?.showSnackBar(SnackBar(
-          content: Text('Audio import failed: $error'),
-        ));
+      return title;
+    } catch (_) {
+      final created = folder;
+      if (created != null) {
+        try {
+          if (await created.exists()) await created.delete(recursive: true);
+        } catch (_) {}
       }
+      rethrow;
     }
   }
+
+  /// Reads the real duration of a just-copied audio file with a throw-away
+  /// player. Falls back to a size-based estimate for formats the platform
+  /// decoder cannot open (e.g. WMA) so the import still succeeds.
+  Future<int> _probeAudioDuration(File file, String sessionId,
+      {required String title}) async {
+    final audioPlayer = AudioPlayer();
+    try {
+      await audioPlayer
+          .setAudioSource(
+            AudioSource.uri(
+              Uri.file(file.path),
+              tag: MediaItem(id: 'import-probe-$sessionId', title: title),
+            ),
+          )
+          .timeout(const Duration(seconds: 15));
+      final duration = audioPlayer.duration;
+      if (duration != null && duration > Duration.zero) {
+        return duration.inMilliseconds;
+      }
+    } catch (_) {
+      // Fall through to the estimate below.
+    } finally {
+      try {
+        await audioPlayer.dispose();
+      } catch (_) {}
+    }
+    return 0;
+  }
+
+  RavenProject _fresh(RavenProject fallback) =>
+      widget.repository.projectById(fallback.id) ?? fallback;
 
   Future<void> _openProject(RavenProject project) async {
     final messenger = ScaffoldMessenger.maybeOf(context);
@@ -806,29 +983,46 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
       }
     }
     if (!mounted) return;
+
+    final isStandalone = project.isStandalone && !project.isDraft;
+
     await navigator.push<void>(
       MaterialPageRoute<void>(
-        builder: (_) => project.isStandalone &&
-                !project.isDraft &&
-                !project.isAudioProtected
+        builder: (_) => isStandalone
             ? StandaloneRecordingScreen(
                 project: project,
                 preferences: widget.preferences,
                 autoPlay: true,
-                onResume: () => _resumeStandaloneFromPlayer(project),
-                onOpenDetails: () => _openProjectDetails(project),
-                onCreateProject: () => _createProjectFromRecording(
-                  project,
-                  replaceCurrentRoute: true,
-                ),
-                onShare: () => _shareRecording(project),
-                onRename: (title) => _renameStandalone(project, title),
-                onTogglePin: () => _toggleProjectPin(project),
-                onToggleEncryption: () => _toggleRecordingProtection(
-                  project,
-                  closeCurrentScreen: true,
-                ),
-                onToggleVisibility: () => _toggleRecordingVisibility(project),
+                onResume: () => _resumeStandaloneFromPlayer(_fresh(project)),
+                onCreateProject: () {
+                  _createProjectFromRecording(_fresh(project),
+                      replaceCurrentRoute: true);
+                },
+                onShare: () async {
+                  await _shareRecording(_fresh(project));
+                },
+                onRename: (title) => _renameStandalone(_fresh(project), title),
+                onTogglePin: () async {
+                  await _toggleProjectPin(_fresh(project));
+                },
+                onToggleEncryption: () async {
+                  await _toggleRecordingProtection(_fresh(project),
+                      closeCurrentScreen: true);
+                },
+                onToggleVisibility: () async {
+                  return _toggleRecordingVisibility(_fresh(project));
+                },
+                onSaveAmplified: (RavenProject updated) async {
+                  try {
+                    await widget.repository.update(updated);
+                    await _refreshProjects();
+                    return true;
+                  } catch (_) {
+                    return false;
+                  }
+                },
+                onTrim: () => _trimStandalone(_fresh(project)),
+                onOpenDetails: () {},
               )
             : PlayerScreen(
                 project: project,
@@ -866,12 +1060,6 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     }
   }
 
-  /// Batch-share handler for the multi-select action in the Library screen.
-  /// Collects every audio file from the selected projects and opens one
-  /// system share sheet for the whole batch.
-  ///
-  /// Encrypted recordings are skipped because they need per-project password
-  /// entry, which cannot be batched. A note is shown if any were skipped.
   Future<void> _shareProjects(List<RavenProject> projects) async {
     if (projects.isEmpty) return;
     final messenger = ScaffoldMessenger.maybeOf(context);
@@ -939,32 +1127,52 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
   Future<String?> _toggleRecordingVisibility(RavenProject project) async {
     final enabling = !project.isPublic;
 
-    // No-op silently when the project is already in the target state.
-    if (enabling == project.hasPublicFolder &&
-        project.publicCopyLocation == null) {
-      return project.publicFolderLocation;
+    if (enabling == project.isPublic) {
+      return project.publicCopyLocation ?? project.publicFolderLocation;
     }
 
     if (enabling && (project.isAudioProtected || project.requiresAppPin)) {
       throw StateError(
           'Decrypt the recording and remove its individual PIN lock before making it public.');
     }
+
+    final isStandalone = project.isStandalone;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: Text(tr(
           widget.preferences,
-          enabling ? 'Make recording public?' : 'Make recording private?',
-          enabling ? 'Rendre l’enregistrement public ?' : 'Rendre privé ?',
+          enabling
+              ? (isStandalone
+                  ? 'Make recording public?'
+                  : 'Make project public?')
+              : (isStandalone
+                  ? 'Make recording private?'
+                  : 'Make project private?'),
+          enabling
+              ? (isStandalone
+                  ? 'Rendre l’enregistrement public ?'
+                  : 'Rendre le projet public ?')
+              : (isStandalone
+                  ? 'Rendre l’enregistrement privé ?'
+                  : 'Rendre le projet privé ?'),
         )),
         content: Text(tr(
           widget.preferences,
           enabling
-              ? 'RAVEN will move this recording’s folder into the device’s public RAVEN folder so you can browse it with a file manager. The recording stays playable inside RAVEN.'
-              : 'RAVEN will move this recording’s folder back into its app-private storage. It will no longer be visible in your file manager, but stays playable inside RAVEN.',
+              ? (isStandalone
+                  ? 'RAVEN will move this recording’s folder into Music/RAVEN so you can play it in other apps. No duplicate copy is created — the recording simply lives in the public folder.'
+                  : 'RAVEN will move this project’s folder into Music/RAVEN so you can browse it with a file manager. The project stays playable inside RAVEN. No duplicate copy is created.')
+              : (isStandalone
+                  ? 'RAVEN will move this recording’s folder back into private app storage. It stays playable inside RAVEN.'
+                  : 'RAVEN will move this project’s folder back into private app storage. It stays playable inside RAVEN.'),
           enabling
-              ? 'RAVEN déplacera le dossier de cet enregistrement dans le dossier RAVEN public de l’appareil afin que vous puissiez le parcourir avec un gestionnaire de fichiers. L’enregistrement reste lisible dans RAVEN.'
-              : 'RAVEN replacera le dossier de cet enregistrement dans le stockage privé de l’application. Il ne sera plus visible dans votre gestionnaire de fichiers, mais reste lisible dans RAVEN.',
+              ? (isStandalone
+                  ? 'RAVEN déplacera le dossier de cet enregistrement dans Music/RAVEN pour que vous puissiez le lire dans d’autres applications. Aucune copie n’est créée — l’enregistrement vit simplement dans le dossier public.'
+                  : 'RAVEN déplacera le dossier de ce projet dans Music/RAVEN afin que vous puissiez le parcourir avec un gestionnaire de fichiers. Le projet reste lisible dans RAVEN. Aucune copie n’est créée.')
+              : (isStandalone
+                  ? 'RAVEN replacera le dossier de cet enregistrement dans le stockage privé de l’application. Il reste lisible dans RAVEN.'
+                  : 'RAVEN replacera le dossier de ce projet dans le stockage privé de l’application. Il reste lisible dans RAVEN.'),
         )),
         actions: <Widget>[
           TextButton(
@@ -978,8 +1186,13 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         ],
       ),
     );
-    if (confirmed != true) return project.publicFolderLocation;
-    return _setProjectVisibility(project, visible: enabling);
+    if (confirmed != true) {
+      return project.publicCopyLocation ?? project.publicFolderLocation;
+    }
+    await _applyVisibilitySilently(project, visible: enabling);
+    await _refreshProjects();
+    final refreshed = widget.repository.projectById(project.id);
+    return refreshed?.publicCopyLocation ?? refreshed?.publicFolderLocation;
   }
 
   Future<void> _toggleRecordingProtection(
@@ -1125,20 +1338,6 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _openProjectDetails(RavenProject project) async {
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(
-        builder: (_) => PlayerScreen(
-          project: project,
-          repository: widget.repository,
-          preferences: widget.preferences,
-          onProjectChanged: (_) => _refreshProjects(),
-        ),
-      ),
-    );
-    await _refreshProjects();
-  }
-
   Future<void> _resumeStandalone(
     RavenProject project, {
     bool alreadyUnlocked = false,
@@ -1216,8 +1415,131 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     await _resumeStandalone(project, alreadyUnlocked: true);
   }
 
+  /// Opens the trim editor for a standalone recording. The editor itself asks
+  /// whether to replace the original or keep both; this handler commits the
+  /// choice into the repository and refreshes the library.
+  Future<void> _trimStandalone(RavenProject project) async {
+    if (project.sessions.isEmpty || project.isAudioProtected) return;
+    final session = project.sessions.first;
+    final source = File(session.audioPath);
+    if (!await source.exists()) {
+      if (mounted) {
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(
+          content: Text(tr(widget.preferences,
+              'The recording file is missing.', 'Le fichier audio est absent.')),
+        ));
+      }
+      return;
+    }
+
+    // ignore: use_build_context_synchronously
+    final result = await Navigator.of(context).push<TrimEditorResult>(
+      MaterialPageRoute<TrimEditorResult>(
+        fullscreenDialog: true,
+        builder: (_) => TrimEditor(
+          source: source,
+          format: session.format,
+          durationMs: session.durationMs > 0
+              ? session.durationMs
+              : (project.durationMs > 0 ? project.durationMs : 1),
+          bitRate: session.bitRate,
+          sampleRate: session.sampleRate > 0 ? session.sampleRate : 44100,
+          title: project.title,
+          isFrench: widget.preferences.isFrench,
+        ),
+      ),
+    );
+    if (result == null || !mounted) return;
+
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    try {
+      final fresh = widget.repository.projectById(project.id);
+      if (fresh == null || fresh.sessions.isEmpty) return;
+      final target = fresh.sessions.first;
+
+      final trimmedSession = result.replacedOriginal
+          ? target.copyWith(
+              audioPath: result.file.path,
+              durationMs: result.durationMs,
+              recoverablePcm16: false,
+            )
+          : RavenAudioSession(
+              id: widget.repository.newId(),
+              audioPath: result.file.path,
+              createdAt: DateTime.now(),
+              durationMs: result.durationMs,
+              format: target.format,
+              name: '${fresh.title} · ${tr(widget.preferences, 'trimmed', 'rogné')}',
+              sampleRate: target.sampleRate,
+              bitRate: target.bitRate,
+            );
+
+      final sessions = List<RavenAudioSession>.of(fresh.sessions);
+      if (result.replacedOriginal) {
+        sessions[0] = trimmedSession;
+        try {
+          final old = File(target.audioPath);
+          if (await old.exists() && old.path != result.file.path) {
+            await old.delete();
+          }
+        } catch (_) {}
+      } else {
+        sessions.insert(1, trimmedSession);
+      }
+
+      var updated = fresh.copyWith(
+        sessions: sessions,
+        clearMasterAudioPath: true,
+      );
+      // A standalone that gains a second take is now a multi-part recording.
+      if (!result.replacedOriginal && updated.isStandalone) {
+        updated = updated.copyWith(isStandalone: false);
+      }
+      await widget.repository.update(updated);
+      await _refreshProjects();
+      messenger?.showSnackBar(SnackBar(
+        content: Text(tr(
+          widget.preferences,
+          result.replacedOriginal
+              ? 'Recording trimmed in place.'
+              : 'Trimmed copy saved as a new take.',
+          result.replacedOriginal
+              ? 'Enregistrement rogné.'
+              : 'Copie rognée enregistrée comme nouvelle prise.',
+        )),
+      ));
+    } catch (error) {
+      messenger?.showSnackBar(SnackBar(
+        content: Text(
+            '${tr(widget.preferences, 'Could not save the trim', 'Impossible d’enregistrer le rognage')}: $error'),
+      ));
+    }
+  }
+
   Future<void> _renameProject(RavenProject project) async {
-    await widget.repository.update(project.copyWith(updatedAt: DateTime.now()));
+    // The tile hands us the record with the new title already applied. Look
+    // the stored record up by ID so we can tell a title change from other
+    // edits, and push the rename all the way to the physical folder.
+    final stored = widget.repository.projectById(project.id);
+    if (stored == null) {
+      await widget.repository.update(project.copyWith(updatedAt: DateTime.now()));
+      await _refreshProjects();
+      return;
+    }
+    if (project.title.trim().isNotEmpty && project.title != stored.title) {
+      try {
+        final renamed = await widget.repository
+            .renameProject(stored, project.title.trim());
+        await widget.repository.update(renamed);
+      } catch (_) {
+        // Folder move failed; keep the display rename so nothing is lost.
+        await widget.repository
+            .update(project.copyWith(updatedAt: DateTime.now()));
+      }
+    } else {
+      await widget.repository
+          .update(project.copyWith(updatedAt: DateTime.now()));
+    }
     await _refreshProjects();
   }
 

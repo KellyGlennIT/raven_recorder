@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:intl/intl.dart';
 import 'package:just_audio/just_audio.dart';
@@ -24,6 +26,7 @@ import '../services/audio_protection_service.dart';
 import '../services/document_export_service.dart';
 import '../services/playback_service.dart';
 import '../widgets/audio_password_dialog.dart';
+import '../widgets/trim_editor.dart';
 import 'recorder_screen.dart';
 
 class PlayerScreen extends StatefulWidget {
@@ -63,6 +66,23 @@ class _PlayerScreenState extends State<PlayerScreen>
   List<File> _attachments = const <File>[];
 
   int _activeIndex = 0;
+
+  // --- Amplify -------------------------------------------------------------
+  // Mirrors the standalone recording player: render a boosted copy of the
+  // ACTIVE take with FFmpeg, play it in place, and let the user commit it as
+  // that take's audio. Nothing touches the original file until "Save".
+  bool _boostProcessing = false;
+  bool _savingAmplified = false;
+  double _volumeBoost = 1.0;
+  String? _boostedPath;
+  String? _boostedSessionId;
+
+  bool get _canAmplify =>
+      !_loading &&
+      _error == null &&
+      !_project.isTrashed &&
+      !_project.isAudioProtected &&
+      _session != null;
 
   @override
   void initState() {
@@ -120,6 +140,9 @@ class _PlayerScreenState extends State<PlayerScreen>
     _notesController.removeListener(_onNotesChanged);
     _notesController.dispose();
     _tabController.dispose();
+    // Boosted audio lives only in the temp cache and is never committed unless
+    // the user taps Save, so it is always safe to drop on the way out.
+    unawaited(_deleteBoostedFile());
     // NOTE: do NOT dispose `_player` here — it's global and used for
     // background playback. `AudioEncryptionService.cleanupAbandonedPlaybackFiles()`
     // on next launch cleans any leftover temp decrypted files.
@@ -1011,8 +1034,110 @@ class _PlayerScreenState extends State<PlayerScreen>
         await _showSessionDetails(session, index);
       case 'rename':
         await _renameSession(session, index);
+      case 'trim':
+        await _trimSession(session, index);
       case 'delete':
         await _deleteSession(session, index);
+    }
+  }
+
+  /// Opens the trim editor for one take. The editor asks the user whether to
+  /// replace the take's audio or keep both; either way the project record is
+  /// updated here with the real new duration and path.
+  Future<void> _trimSession(
+      RavenAudioSession session, int index) async {
+    if (_loading || _project.isAudioProtected) return;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final navigator = Navigator.of(context);
+    final source = File(session.audioPath);
+    if (!await source.exists()) {
+      messenger?.showSnackBar(SnackBar(
+        content: Text(tr(widget.preferences,
+            'The recording file is missing.', 'Le fichier audio est absent.')),
+      ));
+      return;
+    }
+    try {
+      await _player.stop();
+    } catch (_) {}
+    if (!mounted) return;
+
+    final result = await navigator.push<TrimEditorResult>(
+      MaterialPageRoute<TrimEditorResult>(
+        fullscreenDialog: true,
+        builder: (_) => TrimEditor(
+          source: source,
+          format: session.format,
+          durationMs: session.durationMs > 0
+              ? session.durationMs
+              : _activeDurationMs,
+          bitRate: session.bitRate,
+          sampleRate: session.sampleRate > 0 ? session.sampleRate : 44100,
+          title: session.name.isEmpty
+              ? tr(widget.preferences, 'Take ${index + 1}',
+                  'Prise ${index + 1}')
+              : session.name,
+          isFrench: widget.preferences.isFrench,
+        ),
+      ),
+    );
+    if (result == null || !mounted) return;
+
+    try {
+      // copyWith has no `id`, so a new take gets a fresh session object.
+      final trimmedSession = result.replacedOriginal
+          ? session.copyWith(
+              audioPath: result.file.path,
+              durationMs: result.durationMs,
+              // Format never changes: the trim preserves the source container.
+              recoverablePcm16: false,
+            )
+          : RavenAudioSession(
+              id: const Uuid().v4(),
+              audioPath: result.file.path,
+              createdAt: DateTime.now(),
+              durationMs: result.durationMs,
+              format: session.format,
+              name:
+                  '${session.name.isEmpty ? tr(widget.preferences, 'Take ${index + 1}', 'Prise ${index + 1}') : session.name} · ${tr(widget.preferences, 'trimmed', 'rogné')}',
+              sampleRate: session.sampleRate,
+              bitRate: session.bitRate,
+            );
+
+      final sessions = List<RavenAudioSession>.of(_project.sessions);
+      if (result.replacedOriginal) {
+        sessions[index] = trimmedSession;
+        try {
+          final old = File(session.audioPath);
+          if (await old.exists() && old.path != result.file.path) {
+            await old.delete();
+          }
+        } catch (_) {}
+      } else {
+        // Keep the original untouched and add the trimmed copy as a new take.
+        sessions.insert(index + 1, trimmedSession);
+      }
+
+      await _saveProject(_project.copyWith(
+        sessions: sessions,
+        clearMasterAudioPath: true,
+      ));
+      messenger?.showSnackBar(SnackBar(
+        content: Text(tr(
+          widget.preferences,
+          result.replacedOriginal
+              ? 'Recording trimmed in place.'
+              : 'Trimmed copy saved as a new take.',
+          result.replacedOriginal
+              ? 'Enregistrement rogné.'
+              : 'Copie rognée enregistrée comme nouvelle prise.',
+        )),
+      ));
+    } catch (error) {
+      messenger?.showSnackBar(SnackBar(
+        content: Text(
+            '${tr(widget.preferences, 'Could not save the trim', 'Impossible d’enregistrer le rognage')}: $error'),
+      ));
     }
   }
 
@@ -1107,15 +1232,35 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
     controller.dispose();
     if (name == null || name.trim().isEmpty || !mounted) return;
-    final sessions = List<RavenAudioSession>.of(_project.sessions);
-    sessions[index] = session.copyWith(name: name.trim());
+    final trimmed = name.trim();
+    final messenger = ScaffoldMessenger.of(context);
     try {
+      var project = _project;
+      // Rename the physical audio file on disk first (fails soft if the file
+      // is missing or locked), then update the record with the new name + path.
+      if (trimmed != session.name.trim()) {
+        project = await widget.repository
+            .renameSessionFile(_project, session, trimmed);
+      }
+      final sessions = List<RavenAudioSession>.of(project.sessions);
+      sessions[index] = session.copyWith(
+        name: trimmed,
+        audioPath: project.sessions.firstWhere((s) => s.id == session.id).audioPath,
+      );
       final validIds = sessions.map((s) => s.id).toSet();
-      final bookmarks = _project.bookmarks
+      final bookmarks = project.bookmarks
           .where((b) => b.sessionId.isEmpty || validIds.contains(b.sessionId))
           .toList();
       await _saveProject(
-          _project.copyWith(sessions: sessions, bookmarks: bookmarks));
+          project.copyWith(sessions: sessions, bookmarks: bookmarks));
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text(tr(
+          widget.preferences,
+          'Take renamed, including its audio file on disk.',
+          'Prise renommée, y compris son fichier audio sur le disque.',
+        )),
+      ));
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -1431,6 +1576,18 @@ class _PlayerScreenState extends State<PlayerScreen>
                           ),
                         ),
                         PopupMenuItem(
+                          value: 'trim',
+                          enabled: !_project.isAudioProtected,
+                          child: Row(
+                            children: <Widget>[
+                              const Icon(Icons.content_cut_rounded, size: 18),
+                              const SizedBox(width: 10),
+                              Text(tr(widget.preferences, 'Trim audio',
+                                  'Rogner l’audio')),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem(
                           value: 'details',
                           child: Row(
                             children: <Widget>[
@@ -1688,10 +1845,39 @@ class _PlayerScreenState extends State<PlayerScreen>
       ),
     );
     controller.dispose();
-    if (newTitle != null &&
-        newTitle.trim().isNotEmpty &&
-        newTitle.trim() != _project.title) {
-      await _saveProject(_project.copyWith(title: newTitle.trim()));
+    if (newTitle == null || newTitle.trim().isEmpty) return;
+    final trimmed = newTitle.trim();
+    if (trimmed == _project.title) return;
+
+    setState(() => _loading = true);
+    // ignore: use_build_context_synchronously
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await _player.stop();
+      // Rename the physical folder + rewrite audio/master paths; the returned
+      // record already points at the new locations.
+      final updated =
+          await widget.repository.renameProject(_project, trimmed);
+      await _saveProject(updated);
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text(tr(
+          widget.preferences,
+          'Project renamed on this device, including its folder and audio files.',
+          'Projet renommé sur cet appareil, y compris son dossier et ses fichiers audio.',
+        )),
+      ));
+    } catch (error) {
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text(
+            '${tr(widget.preferences, 'Could not rename project', 'Impossible de renommer le projet')}: $error'),
+      ));
+    } finally {
+      if (mounted) {
+        setState(() => _loading = false);
+        await _loadSelectedSession();
+      }
     }
   }
 
@@ -2160,6 +2346,451 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (!mounted) return;
     setState(() => _project = updated);
     widget.onProjectChanged(updated);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Amplify (project player)
+  // ---------------------------------------------------------------------------
+
+  /// Container extension matching [session]'s format; used for boost output.
+  String _boostExt(String format) => switch (format.toLowerCase()) {
+        'wav' => 'wav',
+        'flac' => 'flac',
+        'mp3' => 'mp3',
+        _ => 'm4a',
+      };
+
+  /// Codec arguments for the FFmpeg amplify pass at the take's own bitrate, so
+  /// committing an amplified take never changes its quality tier.
+  String _boostCodec(String ext, int bitRate) {
+    final clamped = bitRate.clamp(64000, 320000);
+    return switch (ext) {
+      'wav' => '-c:a pcm_s16le',
+      'flac' => '-c:a flac',
+      'mp3' => '-c:a libmp3lame -b:a $clamped',
+      _ => '-c:a aac -b:a $clamped -movflags +faststart',
+    };
+  }
+
+  Future<void> _deleteBoostedFile() async {
+    final path = _boostedPath;
+    _boostedPath = null;
+    _boostedSessionId = null;
+    if (path == null) return;
+    try {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // Temp cache cleanup is best-effort.
+    }
+  }
+
+  /// Renders a volume-boosted copy of the ACTIVE take into the temp cache and
+  /// plays it. Level 1.0 restores the original, unmodified audio.
+  Future<void> _applyBoost(double level) async {
+    if (_boostProcessing || _savingAmplified) return;
+    final session = _session;
+    if (session == null) return;
+    if (level == _volumeBoost && _boostedSessionId == session.id) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _boostProcessing = true);
+    final wasPlaying = _player.playing;
+    final position = _player.position;
+    final previousBoost = _boostedPath;
+
+    try {
+      await _player.pause();
+
+      if (level <= 1.0) {
+        await _loadSessionForPlayback(session, boosted: false);
+        if (previousBoost != null) {
+          try {
+            final file = File(previousBoost);
+            if (await file.exists()) await file.delete();
+          } catch (_) {}
+        }
+        _boostedPath = null;
+        _boostedSessionId = null;
+        if (position > Duration.zero) {
+          try {
+            await _player.seek(position);
+          } catch (_) {}
+        }
+        if (wasPlaying) unawaited(_player.play());
+        if (mounted) {
+          setState(() {
+            _volumeBoost = 1.0;
+            _boostProcessing = false;
+          });
+        }
+        return;
+      }
+
+      final source = File(session.audioPath);
+      if (!await source.exists()) {
+        throw FileSystemException('The take audio file is missing', source.path);
+      }
+
+      final cache = await getTemporaryDirectory();
+      final ext = _boostExt(session.format);
+      final stamp = DateTime.now().millisecondsSinceEpoch;
+      final outputPath =
+          '${cache.path}/raven-boost-${_project.id}-${session.id}-$stamp.$ext';
+      final outputFile = File(outputPath);
+      if (await outputFile.exists()) {
+        try {
+          await outputFile.delete();
+        } catch (_) {}
+      }
+
+      final codec = _boostCodec(ext, session.bitRate);
+      final sampleRate = session.sampleRate > 0 ? session.sampleRate : 44100;
+      final command = '-hide_banner -nostdin -y '
+          '-i "${source.path}" '
+          '-ar $sampleRate '
+          '-af "volume=${level.toStringAsFixed(2)},alimiter=limit=0.95:attack=5:release=50" '
+          '$codec "$outputPath"';
+
+      final ffSession = await FFmpegKit.execute(command);
+      final returnCode = await ffSession.getReturnCode();
+      final succeeded =
+          returnCode != null && ReturnCode.isSuccess(returnCode);
+      if (!succeeded) {
+        final logs = await ffSession.getOutput();
+        try {
+          if (await outputFile.exists()) await outputFile.delete();
+        } catch (_) {}
+        throw StateError(
+            'FFmpeg failed: ${logs ?? returnCode?.getValue() ?? 'unknown'}');
+      }
+      if (!await outputFile.exists() || await outputFile.length() < 64) {
+        try {
+          if (await outputFile.exists()) await outputFile.delete();
+        } catch (_) {}
+        throw StateError('Amplify produced empty output');
+      }
+
+      await _loadSessionForPlayback(session, boosted: true, path: outputPath);
+      _boostedPath = outputPath;
+      _boostedSessionId = session.id;
+
+      if (previousBoost != null) {
+        try {
+          final file = File(previousBoost);
+          if (await file.exists()) await file.delete();
+        } catch (_) {}
+      }
+      if (position > Duration.zero) {
+        try {
+          await _player.seek(position);
+        } catch (_) {}
+      }
+      if (wasPlaying) unawaited(_player.play());
+      if (mounted) {
+        setState(() {
+          _volumeBoost = level;
+          _boostProcessing = false;
+        });
+      }
+    } catch (error) {
+      // Restore the untouched original so a failed boost never leaves the
+      // player pointing at a temp file that is about to be deleted.
+      try {
+        await _loadSessionForPlayback(session, boosted: false);
+      } catch (_) {}
+      await _deleteBoostedFile();
+      if (previousBoost != null && previousBoost != _boostedPath) {
+        try {
+          final file = File(previousBoost);
+          if (await file.exists()) await file.delete();
+        } catch (_) {}
+      }
+      if (mounted) {
+        setState(() {
+          _volumeBoost = 1.0;
+          _boostProcessing = false;
+        });
+        messenger.showSnackBar(SnackBar(
+          content: Text(tr(
+            widget.preferences,
+            'Could not amplify audio: $error',
+            'Impossible d’amplifier l’audio : $error',
+          )),
+        ));
+      }
+    }
+  }
+
+  /// Loads [session] into the shared player, optionally from an explicit
+  /// [path] (a temp amplified copy) instead of its committed audio file.
+  Future<void> _loadSessionForPlayback(RavenAudioSession session,
+      {required bool boosted, String? path}) async {
+    final playbackPath = path ?? session.audioPath;
+    final file = File(playbackPath);
+    if (!await file.exists()) {
+      throw FileSystemException('The take audio file is missing', playbackPath);
+    }
+    final mediaItem = await _mediaItemFor(
+      session,
+      overrideTitle: boosted
+          ? '${session.name.isEmpty ? _project.title : session.name} · amplified'
+          : null,
+    );
+    await _player
+        .setAudioSource(
+          AudioSource.uri(Uri.file(playbackPath), tag: mediaItem),
+          initialPosition: Duration.zero,
+        )
+        .timeout(const Duration(seconds: 15));
+  }
+
+  /// Commits the amplified render as the active take's audio. The original file
+  /// is deleted only after the project record is durably updated.
+  Future<void> _saveAmplifiedTake() async {
+    if (_savingAmplified || _boostProcessing) return;
+    final boostedPath = _boostedPath;
+    final session = _session;
+    if (boostedPath == null || session == null) return;
+    if (_boostedSessionId != session.id) return;
+    if (_project.isAudioProtected) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _savingAmplified = true);
+
+    final index = _activeIndex.clamp(0, _project.sessions.length - 1);
+    final oldPath = session.audioPath;
+    final ext = _boostExt(session.format);
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    File? committed;
+    var updatedProject = _project;
+
+    try {
+      await _player.pause();
+
+      final boostFile = File(boostedPath);
+      if (!await boostFile.exists()) {
+        throw StateError('The amplified audio is no longer available.');
+      }
+
+      // Write the result beside the take so it lives in the project folder.
+      final originalFile = File(oldPath);
+      final parent = originalFile.parent;
+      await parent.create(recursive: true);
+      final target = File('${parent.path}/amplified-$stamp.$ext');
+      await boostFile.copy(target.path);
+      committed = target;
+      if (!await target.exists() || await target.length() < 64) {
+        throw StateError('The amplified audio copy failed verification.');
+      }
+
+      var durationMs = session.durationMs;
+      if (durationMs <= 0) {
+        try {
+          final probe = AudioPlayer();
+          try {
+            await probe.setAudioSource(AudioSource.uri(Uri.file(target.path)));
+            durationMs = probe.duration?.inMilliseconds ?? 0;
+          } finally {
+            await probe.dispose();
+          }
+        } catch (_) {
+          // Duration stays unknown; playback still reports the real length.
+        }
+      }
+
+      final updatedSession = session.copyWith(
+        audioPath: target.path,
+        durationMs: durationMs > 0 ? durationMs : session.durationMs,
+        format: ext,
+      );
+      final sessions = List<RavenAudioSession>.of(_project.sessions);
+      sessions[index] = updatedSession;
+      updatedProject = _project.copyWith(
+        sessions: sessions,
+        updatedAt: DateTime.now(),
+        // A committed re-encode invalidates any cached merged master.
+        clearMasterAudioPath: true,
+      );
+
+      await _saveProject(updatedProject);
+
+      _boostedPath = null;
+      _boostedSessionId = null;
+      _volumeBoost = 1.0;
+
+      try {
+        await _player.stop().timeout(const Duration(seconds: 2));
+      } catch (_) {}
+      await _loadSessionForPlayback(updatedSession, boosted: false);
+
+      // Old audio and the temp render are dead weight once the swap is committed.
+      try {
+        final old = File(oldPath);
+        if (old.path != target.path && await old.exists()) await old.delete();
+      } catch (_) {}
+      try {
+        if (await boostFile.exists()) await boostFile.delete();
+      } catch (_) {}
+
+      if (mounted) {
+        setState(() => _savingAmplified = false);
+        messenger.showSnackBar(SnackBar(
+          content: Text(tr(
+            widget.preferences,
+            'Amplified audio saved to this take.',
+            'Audio amplifié enregistré dans cette prise.',
+          )),
+        ));
+      }
+    } catch (error) {
+      // Only remove the new file if the project record never committed.
+      final created = committed;
+      if (created != null &&
+          !updatedProject.sessions.any((s) => s.audioPath == created.path)) {
+        try {
+          if (await created.exists()) await created.delete();
+        } catch (_) {}
+      }
+      if (mounted) {
+        setState(() => _savingAmplified = false);
+        messenger.showSnackBar(SnackBar(
+          content: Text(tr(
+            widget.preferences,
+            'Could not save amplified audio: $error',
+            'Impossible d’enregistrer l’audio amplifié : $error',
+          )),
+        ));
+      }
+    }
+  }
+
+  /// Opens the amplify sheet: a level slider, a live preview, and the save
+  /// action. Previewing swaps only the temp render; nothing is committed until
+  /// the user taps Save.
+  Future<void> _showAmplifySheet() async {
+    if (!_canAmplify) return;
+    final session = _session;
+    if (session == null) return;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, refresh) {
+          final theme = Theme.of(sheetContext);
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  Row(
+                    children: <Widget>[
+                      Icon(Icons.graphic_eq_rounded,
+                          color: theme.colorScheme.primary),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          tr(widget.preferences, 'Amplify take',
+                              'Amplifier la prise'),
+                          style: theme.textTheme.titleLarge
+                              ?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      if (_boostProcessing)
+                        const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    tr(
+                      widget.preferences,
+                      'Processes this take through a limiter so quiet audio gets louder without clipping. The file keeps the take\'s format and quality tier. Preview changes are temporary until you save.',
+                      'Traite cette prise via un limiteur : l’audio discret devient plus fort sans saturation. Le fichier garde le format et la qualité de la prise. La prévisualisation est temporaire jusqu’à l’enregistrement.',
+                    ),
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: <Widget>[
+                      Text(tr(widget.preferences, 'Original', 'Original'),
+                          style: theme.textTheme.labelMedium),
+                      Expanded(
+                        child: Slider(
+                          min: 1.0,
+                          max: 3.0,
+                          divisions: 8,
+                          value: _volumeBoost.clamp(1.0, 3.0),
+                          label: '${_volumeBoost.toStringAsFixed(2)}×',
+                          onChanged: _boostProcessing
+                              ? null
+                              : (value) => refresh(() {
+                                    setState(() => _volumeBoost = value);
+                                  }),
+                          onChangeEnd: _boostProcessing
+                              ? null
+                              : (value) async {
+                                  await _applyBoost(value);
+                                  if (sheetContext.mounted) refresh(() {});
+                                },
+                        ),
+                      ),
+                      Text('${_volumeBoost.toStringAsFixed(2)}×',
+                          style: theme.textTheme.labelMedium?.copyWith(
+                              fontWeight: FontWeight.w700)),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  FilledButton.icon(
+                    onPressed: (_volumeBoost > 1.0 &&
+                            _boostedPath != null &&
+                            !_boostProcessing &&
+                            !_savingAmplified)
+                        ? () async {
+                            Navigator.of(sheetContext).pop();
+                            await _saveAmplifiedTake();
+                          }
+                        : null,
+                    icon: _savingAmplified
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.save_alt_rounded),
+                    label: Text(tr(
+                      widget.preferences,
+                      'Save amplified audio to this take',
+                      'Enregistrer l’audio amplifié dans cette prise',
+                    )),
+                  ),
+                  const SizedBox(height: 6),
+                  TextButton(
+                    onPressed: _boostProcessing
+                        ? null
+                        : () async {
+                            await _applyBoost(1.0);
+                            if (sheetContext.mounted) refresh(() {});
+                          },
+                    child: Text(tr(widget.preferences, 'Reset to original',
+                        'Revenir à l’original')),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
   }
 
   Future<void> _toggleProjectPin() async {
@@ -2782,6 +3413,25 @@ class _PlayerScreenState extends State<PlayerScreen>
                         onPressed: () => _seekRelative(10),
                         icon: const Icon(Icons.forward_10_rounded),
                         iconSize: 26,
+                      ),
+                      IconButton.filledTonal(
+                        tooltip: tr(widget.preferences, 'Amplify audio',
+                            'Amplifier l’audio'),
+                        onPressed: _canAmplify ? _showAmplifySheet : null,
+                        icon: _boostProcessing
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 2),
+                              )
+                            : Icon(
+                                Icons.graphic_eq_rounded,
+                                color: _volumeBoost > 1.0
+                                    ? colorScheme.primary
+                                    : null,
+                              ),
+                        iconSize: 22,
                       ),
                       IconButton.filledTonal(
                         tooltip: tr(widget.preferences, 'Add bookmark',

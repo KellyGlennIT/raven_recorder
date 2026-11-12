@@ -330,8 +330,8 @@ class SettingsScreen extends StatelessWidget {
                               'Audio public par défaut')),
                           subtitle: Text(tr(
                               preferences,
-                              'New recordings can be visible in music folders unless you switch them back to private.',
-                              'Les nouveaux enregistrements peuvent apparaître dans les dossiers musicaux, sauf si vous les repassez en privé.')),
+                              'New recordings are moved into your device’s RAVEN music folder so other apps can play them. No duplicate copy is created; switch a recording back to private to move it into app storage again.',
+                              'Les nouveaux enregistrements sont déplacés dans le dossier musical RAVEN de l’appareil pour que d’autres applications puissent les lire. Aucune copie n’est créée ; repassez un enregistrement en privé pour le replacer dans le stockage de l’application.')),
                           value: preferences.defaultPublicAudioVisible,
                           onChanged: (value) async {
                             preferences.defaultPublicAudioVisible = value;

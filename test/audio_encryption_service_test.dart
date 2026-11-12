@@ -11,7 +11,7 @@ void main() {
     final encrypted = File('${directory.path}/source.wav.ravenenc');
     final decrypted = File('${directory.path}/decrypted.wav');
     final encryption = AudioEncryptionService();
-    final password = 'correct horse battery';
+    const password = 'correct horse battery';
     final salt = encryption.createProtectionSalt();
     final key = await encryption.derivePasswordKey(password, salt);
     final originalBytes = List<int>.generate(256, (index) => index);

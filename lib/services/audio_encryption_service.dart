@@ -80,8 +80,9 @@ class AudioEncryptionService {
           'RAVEN encryption key is missing. Protected audio cannot be decrypted.');
     }
     final bytes = base64Decode(encoded);
-    if (bytes.length != 32)
+    if (bytes.length != 32) {
       throw const FormatException('Invalid RAVEN encryption key.');
+    }
     return SecretKey(bytes);
   }
 
@@ -92,7 +93,9 @@ class AudioEncryptionService {
     if (!await temporaryDirectory.exists()) return;
     await for (final entity in temporaryDirectory.list(followLinks: false)) {
       if (entity is! File ||
-          !entity.uri.pathSegments.last.startsWith('raven-playback-')) continue;
+          !entity.uri.pathSegments.last.startsWith('raven-playback-')) {
+        continue;
+      }
       try {
         await entity.delete();
       } on FileSystemException {
@@ -106,8 +109,9 @@ class AudioEncryptionService {
     required File output,
     required SecretKey key,
   }) async {
-    if (!await input.exists())
+    if (!await input.exists()) {
       throw FileSystemException('Audio file does not exist.', input.path);
+    }
     if (input.absolute.path == output.absolute.path) {
       throw ArgumentError('Input and output must be different files.');
     }

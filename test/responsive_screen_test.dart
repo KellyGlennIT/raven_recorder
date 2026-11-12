@@ -104,6 +104,7 @@ void main() {
             encrypted = true;
           },
           onToggleVisibility: () async => null,
+          onSaveAmplified: (updated) async => true,
         ),
       ),
     );

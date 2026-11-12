@@ -8,11 +8,12 @@ import 'package:uuid/uuid.dart';
 
 import '../models/raven_project.dart';
 import '../services/app_preferences.dart';
+import '../services/background_encode_service.dart';
 import '../services/project_repository.dart';
 import '../services/audio_merge_service.dart';
+import '../services/audio_visibility_service.dart';
 import '../services/recording_notification_service.dart';
 import '../services/wav_recovery_service.dart';
-import '../services/playback_service.dart';
 
 class RecorderScreen extends StatefulWidget {
   const RecorderScreen({
@@ -28,15 +29,8 @@ class RecorderScreen extends StatefulWidget {
   final ProjectRepository repository;
   final AppPreferences preferences;
   final VoidCallback onSaved;
-
-  /// Project to record into. Null → new standalone project.
   final RavenProject? existingProject;
-
-  /// The session to extend. Null + existingProject → new session in project.
-  /// Null + null existingProject → first session of a new project.
-  /// This is the KEY to per-recording resume: ONLY this session is extended.
   final String? resumeSessionId;
-
   final bool createProject;
 
   @override
@@ -87,9 +81,70 @@ class _RecorderScreenState extends State<RecorderScreen> {
     _ticker?.cancel();
     _amplitudeSubscription?.cancel();
     _clock.stop();
-    RecordingNotificationService.setActionHandler(null);
-    _recorder.dispose();
+
+    if (_started && !_saving) {
+      _forceCleanupRecording();
+    } else {
+      RecordingNotificationService.setActionHandler(null);
+      try {
+        _recorder.dispose();
+      } catch (_) {}
+    }
     super.dispose();
+  }
+
+  Future<void> _forceCleanupRecording() async {
+    final repository = widget.repository;
+    final projectId = _projectId;
+    final sessionId = _sessionId;
+    final sampleRate = _captureSampleRate;
+    final isResume = _isResume;
+
+    try {
+      String? path;
+      try {
+        path = await _recorder.stop();
+      } catch (_) {}
+      try {
+        await _recordingNotification.stop();
+      } catch (_) {}
+
+      if (path != null && projectId != null && sessionId != null) {
+        if (isResume) {
+          try {
+            final f = File(path);
+            if (await f.exists()) await f.delete();
+          } catch (_) {}
+        } else {
+          try {
+            final duration = await WavRecoveryService().repairPcm16File(
+              File(path),
+              sampleRate: sampleRate,
+            );
+            final draft = repository.projectById(projectId);
+            if (draft != null && duration != null) {
+              final sessions = draft.sessions
+                  .map((s) => s.id == sessionId
+                      ? s.copyWith(
+                          audioPath: path,
+                          durationMs: duration,
+                          recoverablePcm16: true,
+                          sampleRate: sampleRate,
+                        )
+                      : s)
+                  .toList();
+              await repository.update(
+                  draft.copyWith(sessions: sessions, isDraft: true));
+            }
+          } catch (_) {}
+        }
+      }
+    } finally {
+      try {
+        _recorder.dispose();
+      } catch (_) {}
+      RecordingNotificationService.setActionHandler(null);
+    }
   }
 
   Future<void> _startRecording() async {
@@ -136,14 +191,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
         }
       }
 
-      // Capture format:
-      //   resume → WAV (required for merge)
-      //   fresh  → user's current setting (M4A/FLAC native; MP3 via WAV→MP3)
-      final captureTarget = _isResume
-          ? 'wav'
-          : widget.preferences.recordingFormat.toLowerCase();
-      final (captureEncoder, captureExt) =
-          _pickCaptureEncoder(captureTarget);
+      final captureTarget =
+          _isResume ? 'wav' : widget.preferences.recordingFormat.toLowerCase();
+      final (captureEncoder, captureExt) = _pickCaptureEncoder(captureTarget);
       final captureSampleRate = targetSession?.sampleRate ??
           existingProject?.currentSampleRate ??
           widget.preferences.sampleRate;
@@ -191,7 +241,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
               ? safeTitle.substring(0, 48)
               : safeTitle;
 
-      // Resume: temp capture file. Fresh: actual session file.
       final fileName = _isResume
           ? 'resume-take-${const Uuid().v4()}.$captureExt'
           : '$fileTitle-session-$sessionNumber-$newSessionId.$captureExt';
@@ -204,9 +253,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
       _captureFormat = captureExt;
       _captureSampleRate = captureSampleRate;
 
-      // Fresh recordings: persist a draft session so a crash is recoverable.
-      // Resume: DO NOT touch the project during capture — the target session
-      // stays intact until the merge commits at Stop.
       if (!_isResume) {
         final newSession = RavenAudioSession(
           id: newSessionId,
@@ -217,6 +263,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
           name: '$draftTitle · Session $sessionNumber',
           sampleRate: captureSampleRate,
           recoverablePcm16: captureExt == 'wav',
+          bitRate: widget.preferences.bitRate, // BITRATE: set on creation
         );
         final draft = existingProject == null
             ? RavenProject(
@@ -301,7 +348,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
           final stoppedPath = await _recorder.stop();
           final path = stoppedPath ?? _outputPath;
           if (path != null && !_isResume) {
-            // Fresh: recover draft.
             final draft = _projectId == null
                 ? null
                 : widget.repository.projectById(_projectId!);
@@ -353,7 +399,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
       if (id != null && !preservedPartial) {
         try {
           if (_isResume) {
-            // Resume: project untouched; just delete the temp capture.
             final partial = _outputPath == null ? null : File(_outputPath!);
             if (partial != null && await partial.exists()) {
               await partial.delete();
@@ -383,7 +428,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
     return switch (targetFormat) {
       'wav' => (AudioEncoder.wav, 'wav'),
       'flac' => (AudioEncoder.flac, 'flac'),
-      'mp3' => (AudioEncoder.wav, 'wav'), // no MP3 encoder in `record`
+      'mp3' => (AudioEncoder.wav, 'wav'),
       'm4a' || 'aac' => (AudioEncoder.aacLc, 'm4a'),
       _ => (AudioEncoder.aacLc, 'm4a'),
     };
@@ -415,12 +460,14 @@ class _RecorderScreenState extends State<RecorderScreen> {
         _clock.stop();
         if (mounted) setState(() => _paused = true);
       }
-      await _recordingNotification.update(
-        title: _recordingTitle ??
-            tr(widget.preferences, 'Recording', 'Enregistrement'),
-        elapsedMs: _clock.elapsedMilliseconds,
-        paused: _paused,
-      );
+      try {
+        await _recordingNotification.update(
+          title: _recordingTitle ??
+              tr(widget.preferences, 'Recording', 'Enregistrement'),
+          elapsedMs: _clock.elapsedMilliseconds,
+          paused: _paused,
+        );
+      } catch (_) {}
     } catch (error) {
       _showMessage(
           '${tr(widget.preferences, 'Recording control failed', 'Le contrôle de l’enregistrement a échoué')}: $error');
@@ -439,8 +486,12 @@ class _RecorderScreenState extends State<RecorderScreen> {
       _clock.stop();
       _ticker?.cancel();
       final returnedPath = await _recorder.stop();
-      await _recordingNotification.stop();
-      await _amplitudeSubscription?.cancel();
+      try {
+        await _recordingNotification.stop();
+      } catch (_) {}
+      try {
+        await _amplitudeSubscription?.cancel();
+      } catch (_) {}
       final path = returnedPath ?? _outputPath;
       if (path == null || !await File(path).exists()) {
         throw const FileSystemException('The recording file was not created.');
@@ -461,8 +512,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
       if (mounted) Navigator.of(context).pop();
     } catch (error) {
       _lastError = error;
-      // Resume failure: original recording is untouched, only the temp WAV
-      // is orphaned. Surface a clear message.
       if (_isResume) {
         try {
           final partial = _outputPath == null ? null : File(_outputPath!);
@@ -490,8 +539,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
     }
   }
 
-  /// Fresh recording → commit the new session; convert WAV→MP3 if needed;
-  /// publish if the default-public setting is on. No merge with other sessions.
   Future<void> _finalizeFresh(String projectId, String recordedPath) async {
     final draft = widget.repository.projectById(projectId);
     if (draft == null) {
@@ -503,20 +550,17 @@ class _RecorderScreenState extends State<RecorderScreen> {
     if (sessionId == null || captureFormat == null) {
       throw StateError('Missing recording identity.');
     }
-    final targetFormat = _normalizeFormat(
-        widget.preferences.recordingFormat.toLowerCase());
+    final targetFormat =
+        _normalizeFormat(widget.preferences.recordingFormat.toLowerCase());
 
-    // Commit the raw capture first.
-    final rawDuration = await _wavDurationMs(recordedPath);
+    final rawDuration = _clock.elapsedMilliseconds;
     var project = draft.copyWith(
       updatedAt: DateTime.now(),
       sessions: draft.sessions
           .map((session) => session.id == sessionId
               ? session.copyWith(
                   audioPath: recordedPath,
-                  durationMs: rawDuration > 0
-                      ? rawDuration
-                      : _clock.elapsedMilliseconds,
+                  durationMs: rawDuration,
                   format: captureFormat,
                   sampleRate: captureSampleRate,
                   recoverablePcm16: captureFormat == 'wav',
@@ -528,104 +572,89 @@ class _RecorderScreenState extends State<RecorderScreen> {
     );
     await widget.repository.update(project);
 
-    // Convert if capture format != user's chosen format (MP3 case).
     if (_normalizeFormat(captureFormat) != targetFormat) {
-      final progress = _MergeProgress();
-      try {
-        final result = await showDialog<RavenProject>(
-          context: context,
-          barrierDismissible: false,
-          builder: (_) => _MergeProgressDialog(
-            progress: progress,
-            preferences: widget.preferences,
-            work: () async {
-              final folder =
-                  await widget.repository.ensureProjectFolder(project);
-              final sessionsDir =
-                  Directory('${folder.path}/sessions');
-              await sessionsDir.create(recursive: true);
-              final ext = _extForFormat(targetFormat);
-              final targetPath =
-                  '${sessionsDir.path}/${widget.repository.projectFolderName(project)}-$sessionId.$ext';
-              progress.update(0.05,
-                  tr(widget.preferences, 'Preparing…', 'Préparation…'));
-              final converted = await AudioMergeService().convertToFormat(
-                input: File(recordedPath),
-                outputPath: targetPath,
-                format: ext,
-                bitRate: widget.preferences.bitRate,
-                sampleRate: captureSampleRate,
-                estimatedDuration:
-                    Duration(milliseconds: rawDuration),
-                onProgress: (p) => progress.update(
-                  0.05 + p * 0.9,
-                  tr(widget.preferences, 'Encoding $ext…',
-                      'Encodage $ext…'),
-                ),
-              );
-              // Converted file has the same duration as the source WAV.
-              final durationMs = rawDuration;
-              final updatedSession = project.sessions
-                  .firstWhere((s) => s.id == sessionId)
-                  .copyWith(
-                    audioPath: converted.path,
-                    durationMs: durationMs > 0 ? durationMs : rawDuration,
-                    format: ext,
-                    sampleRate: captureSampleRate,
-                    recoverablePcm16: ext == 'wav',
-                  );
-              final updated = project.copyWith(
-                sessions: project.sessions
-                    .map((s) => s.id == sessionId ? updatedSession : s)
-                    .toList(),
-              );
-              await widget.repository.update(updated);
-              try {
-                final oldFile = File(recordedPath);
-                if (await oldFile.exists()) await oldFile.delete();
-              } catch (_) {}
-              progress.update(1.0,
-                  tr(widget.preferences, 'Done', 'Terminé'));
-              return updated;
-            },
-          ),
-        );
-        if (result != null) project = result;
-      } finally {
-        progress.dispose();
-      }
-    }
-
-    // Publish if the default-public setting is on.
-    if (!project.isAudioProtected && !project.requiresAppPin) {
-      project = await _maybePublishAfterSave(project);
+      // Background encoding: the captured file is already committed and fully
+      // playable, so hand the transcode to the queue and return immediately.
+      // The service swaps the encoded file into the project when it finishes.
+      BackgroundEncodeService.instance.enqueueSessionConversion(
+        repository: widget.repository,
+        project: project,
+        sessionId: sessionId,
+        inputPath: recordedPath,
+        targetFormat: targetFormat,
+        bitRate: widget.preferences.bitRate,
+        sampleRate: captureSampleRate,
+      );
     }
   }
 
-  /// Resume: merge the new WAV take into **only** the target session.
-  /// Other sessions in the project remain untouched.
   Future<void> _finalizeResume(String projectId, String newWavPath) async {
-    final project = widget.repository.projectById(projectId);
-    if (project == null) {
+    final loaded = widget.repository.projectById(projectId);
+    if (loaded == null) {
       throw StateError('Project is missing.');
     }
+    var project = loaded;
+
+    final visibility = AudioVisibilityService();
+
+    // Legacy copies (older builds duplicated standalone audio into
+    // Music/RAVEN) are removed instead of refreshed — public visibility now
+    // MOVES the project folder, so a copied duplicate is pure waste.
+    if (project.isStandalone) {
+      var cleaned = false;
+      if (project.publicFolderLocation != null &&
+          AudioVisibilityService.isContentUri(project.publicFolderLocation!)) {
+        try {
+          await visibility.removeFolder(project.publicFolderLocation!);
+        } catch (_) {}
+        project = project.copyWith(clearPublicFolderLocation: true);
+        cleaned = true;
+      }
+      if (project.publicCopyLocation != null) {
+        try {
+          await visibility.remove(project.publicCopyLocation!);
+        } catch (_) {}
+        project = project.copyWith(clearPublicCopyLocation: true);
+        cleaned = true;
+      }
+      if (cleaned) await widget.repository.update(project);
+    }
+
     final targetId = widget.resumeSessionId;
     final target = project.sessions.firstWhere((s) => s.id == targetId);
+    final projectForMerge = project;
+
     final progress = _MergeProgress();
     try {
-      await showDialog<void>(
+      final result = await showDialog<RavenProject>(
+        // ignore: use_build_context_synchronously
         context: context,
         barrierDismissible: false,
         builder: (_) => _MergeProgressDialog(
           progress: progress,
           preferences: widget.preferences,
           work: () async {
-            final updated = await _mergeIntoSession(
-                project, target, newWavPath, progress);
+            // Never race a pending background encode of this project: the merge
+            // rewrites the same session record and deletes the old file, and an
+            // in-flight encode job holds/replaces the same paths.
+            await BackgroundEncodeService.instance.waitForProject(project.id);
+
+            var updated = await _mergeIntoSession(
+                projectForMerge, target, newWavPath, progress);
+
+            // No public copy is re-created here: visibility is now purely a
+            // folder MOVE managed by ProjectRepository.toggleVisibility, so
+            // the merged file already lives in the right place (the project
+            // folder never left its location — only the session file was
+            // rewritten in-place).
             return updated;
           },
         ),
       );
+      if (result == null) {
+        throw StateError(
+            'The merge did not complete. Your original recording is unchanged.');
+      }
     } finally {
       progress.dispose();
     }
@@ -642,11 +671,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
     await sessionDir.create(recursive: true);
 
     final targetFormat = target.format.toLowerCase();
-    // Clean up: temp new WAV + every intermediate we create.
     final tempFiles = <String>{newWavPath};
 
     try {
-      // A: ensure target is a WAV on disk (convert if not).
       String targetWavPath = target.audioPath;
       if (targetFormat != 'wav') {
         progress.update(
@@ -654,8 +681,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
           tr(widget.preferences, 'Preparing existing recording…',
               'Préparation de l’enregistrement existant…'),
         );
-        final wavPath =
-            '${sessionDir.path}/tmp-target-${const Uuid().v4()}.wav';
+        final wavPath = '${sessionDir.path}/tmp-target-${const Uuid().v4()}.wav';
         tempFiles.add(wavPath);
         await AudioMergeService().convertToFormat(
           input: File(target.audioPath),
@@ -672,11 +698,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
         targetWavPath = wavPath;
       }
 
-      // B: byte-append target WAV + new take WAV.
-      progress.update(
-        0.3,
-        tr(widget.preferences, 'Merging…', 'Fusion…'),
-      );
+      progress.update(0.3, tr(widget.preferences, 'Merging…', 'Fusion…'));
       final merged = await AudioMergeService().mergeWavSessions(
         sessions: <RavenAudioSession>[
           RavenAudioSession(
@@ -697,8 +719,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
           ),
         ],
         sessionsDirectory: sessionDir,
-        preferredFileName:
-            'tmp-merged-${const Uuid().v4()}.wav',
+        preferredFileName: 'tmp-merged-${const Uuid().v4()}.wav',
         onProgress: (p) => progress.update(
           0.3 + p * 0.15,
           tr(widget.preferences, 'Merging…', 'Fusion…'),
@@ -706,7 +727,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
       );
       tempFiles.add(merged.file.path);
 
-      // C: convert merged WAV back to the target's own format.
       progress.update(
         0.5,
         tr(widget.preferences, 'Encoding ${targetFormat.toUpperCase()}…',
@@ -722,7 +742,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
           input: merged.file,
           outputPath: finalPath,
           format: targetFormat,
-          bitRate: widget.preferences.bitRate,
+          bitRate: target.bitRate, // BITRATE: preserve original tier
           sampleRate: target.sampleRate,
           estimatedDuration: Duration(milliseconds: merged.durationMs),
           onProgress: (p) => progress.update(
@@ -733,11 +753,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
         );
       }
 
-      // D: commit — update ONLY the target session, leave others intact.
       progress.update(
-        0.95,
-        tr(widget.preferences, 'Finalizing…', 'Finalisation…'),
-      );
+          0.95, tr(widget.preferences, 'Finalizing…', 'Finalisation…'));
       final updatedSession = target.copyWith(
         audioPath: finalPath,
         durationMs: merged.durationMs,
@@ -749,66 +766,33 @@ class _RecorderScreenState extends State<RecorderScreen> {
         updatedAt: DateTime.now(),
       );
       await widget.repository.update(updatedProject);
-
-      // Commit succeeded — the final file is now referenced.
       tempFiles.remove(finalPath);
 
-      // Delete the target's old audio (best-effort).
       try {
         final oldFile = File(target.audioPath);
         if (await oldFile.exists()) await oldFile.delete();
-      } on FileSystemException {}
+      } on FileSystemException {
+        // Deleting the old file is best-effort; the merged file is authoritative.
+      }
 
-      progress.update(1.0,
-          tr(widget.preferences, 'Done', 'Terminé'));
+      progress.update(1.0, tr(widget.preferences, 'Done', 'Terminé'));
       return updatedProject;
     } finally {
       for (final p in tempFiles) {
         try {
           final f = File(p);
           if (await f.exists()) await f.delete();
-        } on FileSystemException {}
+        } on FileSystemException {
+          // Temp cleanup is best-effort.
+        }
       }
     }
-  }
-
-  Future<RavenProject> _maybePublishAfterSave(RavenProject project) async {
-    if (project.hasPublicFolder) return project;
-    if (project.isAudioProtected || project.requiresAppPin) return project;
-    if (!widget.preferences.defaultPublicAudioVisible) return project;
-    try {
-      final updated =
-          await widget.repository.toggleVisibility(project, makePublic: true);
-      await widget.repository.update(updated);
-      return updated;
-    } catch (error) {
-      _showMessage(tr(
-        widget.preferences,
-        'Recording saved privately. Could not publish: $error',
-        'Enregistrement sauvegardé en privé. Publication impossible : $error',
-      ));
-      return project;
-    }
-  }
-
-  /// Reads a WAV file's duration from its header without touching any
-  /// AudioPlayer (which would flicker the media notification). The recorder
-  /// always captures WAV for the raw take, so this is accurate.
-  Future<int> _wavDurationMs(String path) async {
-    return PlaybackService.readWavDurationMs(File(path));
   }
 
   String _normalizeFormat(String format) {
     final f = format.toLowerCase();
     return (f == 'aac') ? 'm4a' : f;
   }
-
-  String _extForFormat(String format) => switch (_normalizeFormat(format)) {
-        'wav' => 'wav',
-        'flac' => 'flac',
-        'mp3' => 'mp3',
-        _ => 'm4a',
-      };
 
   Future<void> _discardRecording({bool close = true}) async {
     if (_busy) return;
@@ -818,27 +802,41 @@ class _RecorderScreenState extends State<RecorderScreen> {
         try {
           await _recorder.stop();
         } catch (_) {}
-        await _recordingNotification.stop();
+        try {
+          await _recordingNotification.stop();
+        } catch (_) {}
       }
       _ticker?.cancel();
-      await _amplitudeSubscription?.cancel();
+      try {
+        await _amplitudeSubscription?.cancel();
+      } catch (_) {}
+
       if (_isResume) {
-        // Project untouched. Delete temp capture.
         final partial = _outputPath == null ? null : File(_outputPath!);
-        if (partial != null && await partial.exists()) await partial.delete();
+        try {
+          if (partial != null && await partial.exists()) {
+            await partial.delete();
+          }
+        } catch (_) {}
       } else {
         final id = _projectId;
         if (id != null) {
           if (widget.existingProject != null) {
-            await widget.repository.update(widget.existingProject!);
+            try {
+              await widget.repository.update(widget.existingProject!);
+            } catch (_) {}
             final partial = _outputPath == null ? null : File(_outputPath!);
-            if (partial != null && await partial.exists()) {
-              await partial.delete();
-            }
+            try {
+              if (partial != null && await partial.exists()) {
+                await partial.delete();
+              }
+            } catch (_) {}
           } else {
             final draft = widget.repository.projectById(id);
             if (draft != null) {
-              await widget.repository.deleteForever(draft);
+              try {
+                await widget.repository.deleteForever(draft);
+              } catch (_) {}
             }
           }
         }
@@ -919,7 +917,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
         if (didPop) return;
         final shouldClose = await _requestExit();
         if (!context.mounted) return;
-        if (shouldClose) Navigator.of(context).pop();
+        if (shouldClose) {
+          Navigator.of(context).pop();
+        }
       },
       child: Scaffold(
         appBar: AppBar(

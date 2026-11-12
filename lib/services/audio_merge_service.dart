@@ -1,63 +1,27 @@
-import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_session.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
 import 'package:flutter/foundation.dart';
 
 import '../models/raven_project.dart';
-import 'wav_recovery_service.dart';
 
-/// Handles merging and format conversion for RAVEN recordings.
-///
-/// **Two operations:**
-///
-/// 1. [mergeWavSessions] — pure-Dart PCM16 WAV byte concatenation. No FFmpeg.
-///    Works on every platform. Used as the physical merge step: resume
-///    appends the new WAV onto the existing WAV(s) into **one** file on disk.
-///
-/// 2. [convertToFormat] — FFmpeg re-encode between WAV / M4A / MP3 / FLAC.
-///    Requires FFmpeg to be bundled on the target platform. On Android this
-///    means the `ffmpeg_kit_flutter_new_audio` package must NOT be excluded
-///    from the Gradle build (see project README).
-///
-/// Typical resume pipeline:
-///   * convert any non-WAV session → WAV        ([convertToFormat])
-///   * merge every WAV session → one WAV        ([mergeWavSessions])
-///   * convert the merged WAV → project format  ([convertToFormat])
-///   * delete intermediates
-///
-/// Result: exactly one physical file on disk, in the project's format.
 class AudioMergeService {
-  /// True when the FFmpeg backend is available for format conversion.
-  ///
-  /// Pure-Dart WAV merging works regardless of this flag.
-  static bool get isSupported =>
-      !kIsWeb &&
-      (defaultTargetPlatform == TargetPlatform.windows ||
-          defaultTargetPlatform == TargetPlatform.macOS ||
-          defaultTargetPlatform == TargetPlatform.linux ||
-          defaultTargetPlatform == TargetPlatform.android);
+  static bool get isSupported => !kIsWeb;
 
   // ---------------------------------------------------------------------------
-  // 1. Pure-Dart WAV merge
+  // Pure-Dart WAV byte-merge (no FFmpeg)
   // ---------------------------------------------------------------------------
 
-  /// Losslessly concatenates every PCM16 WAV session in [sessions] into a
-  /// single WAV file inside [sessionsDirectory].
+  /// Losslessly concatenates every PCM16 WAV session into one WAV file.
   ///
-  /// **No FFmpeg, no platform restrictions.** Runs on Android, desktop, iOS.
+  /// Uses proper RIFF chunk parsing so it works with WAVEFORMATEX and
+  /// WAVE_FORMAT_EXTENSIBLE headers, not just the 44-byte standard layout.
   ///
-  /// **Preconditions** (any failure throws before touching the destination):
-  /// - Non-empty [sessions].
-  /// - Every session `format` ends with `'wav'`.
-  /// - Every file exists and is at least 44 bytes.
-  ///
-  /// **Safety**: writes to `<target>.merging.tmp`, repairs the RIFF/data
-  /// headers via [WavRecoveryService] (which returns the true total duration),
-  /// then atomically renames into place. Source files are **not** deleted;
-  /// the caller controls cleanup after the project record is committed.
-  ///
-  /// [onProgress] fires with 0.0 → 1.0 as bytes are read from the sources.
+  /// The merged file's header is written directly — no repairPcm16File call,
+  /// which would corrupt a freshly-merged header and produce silent playback.
   Future<({File file, int durationMs})> mergeWavSessions({
     required List<RavenAudioSession> sessions,
     required Directory sessionsDirectory,
@@ -80,64 +44,69 @@ class AudioMergeService {
     }
     await sessionsDirectory.create(recursive: true);
 
-    final firstSession = sessions.first;
-    final firstLeaf = firstSession.audioPath.split(RegExp(r'[\\/]')).last;
-    final targetLeaf = preferredFileName ??
-        (firstLeaf.toLowerCase().endsWith('.wav')
-            ? firstLeaf
-            : '${firstLeaf.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_')}.wav');
-    final targetPath = '${sessionsDirectory.path}/$targetLeaf';
-    final tempPath = '$targetPath.merging.tmp';
-
-    // Sum lengths up front so we can report merge progress accurately.
     var totalBytes = 0;
     for (final session in sessions) {
       totalBytes += await File(session.audioPath).length();
     }
 
     final builder = BytesBuilder(copy: false);
-    var processedBytes = 0;
+    var processed = 0;
+    Uint8List? firstHeader;
+    int? dataOffsetInHeader;
+    final sampleBytes = BytesBuilder(copy: false);
+
     for (var i = 0; i < sessions.length; i++) {
       final bytes = await File(sessions[i].audioPath).readAsBytes();
-      if (bytes.length < 44) {
+      final dataOffset = _wavDataOffset(bytes);
+      if (dataOffset < 0 || dataOffset >= bytes.length) {
         throw StateError(
-            'Session ${sessions[i].id} WAV header is truncated '
-            '(${bytes.length} bytes).');
+            'Session ${sessions[i].id} is not a valid WAV file '
+            '(data chunk not found).');
       }
       if (i == 0) {
-        builder.add(bytes);
-      } else {
-        builder.add(Uint8List.sublistView(bytes, 44));
+        firstHeader = Uint8List.fromList(bytes.sublist(0, dataOffset));
+        dataOffsetInHeader = dataOffset;
       }
-      processedBytes += bytes.length;
+      sampleBytes.add(Uint8List.sublistView(bytes, dataOffset));
+      processed += bytes.length;
       if (totalBytes > 0) {
         onProgress?.call(
-            (processedBytes / totalBytes).clamp(0.0, 1.0).toDouble());
+            (processed / totalBytes).clamp(0.0, 1.0).toDouble());
       }
     }
-    final mergedBytes = builder.toBytes();
 
-    final tempFile = File(tempPath);
-    await tempFile.writeAsBytes(mergedBytes, flush: true);
+    final firstHeaderBytes = firstHeader!;
+    final payload = sampleBytes.toBytes();
+    final totalLength = firstHeaderBytes.length + payload.length;
 
-    final durationMs = await WavRecoveryService().repairPcm16File(
-      tempFile,
-      sampleRate: firstSession.sampleRate,
-    );
-    if (durationMs == null) {
-      try {
-        await tempFile.delete();
-      } catch (_) {}
-      throw StateError('Merged WAV header could not be repaired.');
+    builder.add(firstHeaderBytes);
+    builder.add(payload);
+    final merged = builder.toBytes();
+
+    // Patch RIFF size (offset 4) and data-chunk size (dataOffset - 4).
+    _writeUint32LE(merged, 4, totalLength - 8);
+    _writeUint32LE(merged, dataOffsetInHeader! - 4, payload.length);
+
+    final durationMs =
+        _wavDurationFromHeaderAndData(firstHeaderBytes, payload.length);
+    if (durationMs <= 0) {
+      throw StateError('Merged WAV duration could not be computed.');
     }
 
+    final firstLeaf = sessions.first.audioPath.split(RegExp(r'[\\/]')).last;
+    final targetLeaf = preferredFileName ??
+        (firstLeaf.toLowerCase().endsWith('.wav')
+            ? firstLeaf
+            : '${firstLeaf.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_')}.wav');
+    final targetPath = '${sessionsDirectory.path}/$targetLeaf';
+    final tempPath = '$targetPath.merging.tmp';
+    final tempFile = File(tempPath);
+    await tempFile.writeAsBytes(merged, flush: true);
     final destination = File(targetPath);
     if (await destination.exists()) {
       try {
         await destination.delete();
-      } catch (_) {
-        // Rename below will throw and the caller falls back.
-      }
+      } catch (_) {}
     }
     await tempFile.rename(targetPath);
 
@@ -146,21 +115,15 @@ class AudioMergeService {
   }
 
   // ---------------------------------------------------------------------------
-  // 2. FFmpeg-backed format conversion
+  // FFmpeg-backed format conversion — direct call, no bridge
   // ---------------------------------------------------------------------------
 
-  /// Converts [input] into the chosen [format] (`'wav' | 'm4a' | 'mp3' | 'flac'`)
-  /// and writes the result to [outputPath].
+  /// Converts [input] into [format] (`'wav' | 'm4a' | 'mp3' | 'flac'`) and
+  /// writes the result to [outputPath].
   ///
-  /// Requires FFmpeg ([isSupported] must be true).
-  ///
-  /// **Safety**: writes to `<outputPath>.pending.<ext>` first, verifies the
-  /// output is non-empty, then atomically renames into place. The input file
-  /// is left untouched — the caller decides when to delete it.
-  ///
-  /// [onProgress] fires 0.0 → 1.0 from FFmpeg's statistics callback when
-  /// available. Falls back to a single jump at completion if statistics are
-  /// unavailable on the platform build.
+  /// Calls [FFmpegKit.execute] directly. The package bundles prebuilt native
+  /// libraries for Android, iOS, macOS, Windows, and Linux — no bridge, no
+  /// custom loader, no external setup required.
   Future<File> convertToFormat({
     required File input,
     required String outputPath,
@@ -191,21 +154,32 @@ class AudioMergeService {
       };
       final rate = sampleRate.clamp(16000, 48000);
       final command =
-          '-hide_banner -nostdin -y -i ${_quote(input.path)} -vn -ar $rate -ac 1 $codecArgs ${_quote(pending.path)}';
-      final session = await _ffmpeg.executeWithProgress(
-        command,
-        estimatedDuration ?? const Duration(hours: 2),
-        onProgress,
-      );
-      final code = await _ffmpeg.returnCode(session);
-      if (!_ffmpeg.isSuccess(code)) {
-        final logs = await _ffmpeg.output(session);
+          '-hide_banner -nostdin -y -i "${input.path}" '
+          '-vn -ar $rate -ac 1 $codecArgs "${pending.path}"';
+
+      final FFmpegSession session;
+      try {
+        session = await FFmpegKit.execute(command);
+      } catch (e) {
+        // Native library failed to load. Almost always means the Gradle
+        // exclusion for ffmpeg-kit-audio is still active in the build.
         throw StateError(
-            'Format conversion failed (code ${_ffmpeg.codeValue(code) ?? 'unknown'}). ${_trimLog(logs ?? '')}');
+            'FFmpeg native library did not load ($e). '
+            'Run "flutter clean" and rebuild. Also verify '
+            'android/app/build.gradle.kts does NOT contain an "exclude" '
+            'block for "com.antonkarpenko:ffmpeg-kit-audio".');
+      }
+
+      final returnCode = await session.getReturnCode();
+      if (!ReturnCode.isSuccess(returnCode)) {
+        final logs = await session.getOutput();
+        throw StateError(
+            'FFmpeg conversion failed (code ${returnCode?.getValue() ?? 'unknown'}). '
+            '${_trimLog(logs ?? '')}');
       }
       if (!await pending.exists() || await pending.length() < 64) {
         throw StateError(
-            'Format conversion reported success but the output is missing or empty.');
+            'FFmpeg reported success but the output is missing or empty.');
       }
       final destination = File(outputPath);
       if (await destination.exists()) await destination.delete();
@@ -216,15 +190,15 @@ class AudioMergeService {
       if (await pending.exists()) {
         try {
           await pending.delete();
-        } on FileSystemException {}
+        } on FileSystemException {
+          // Cleanup is best-effort; a leftover pending file is harmless.
+        }
       }
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Legacy FFmpeg master merge (kept for API compatibility; not used by the
-  // recorder anymore — the resume-merge pipeline produces a single physical
-  // file so no "master" wrapper is needed).
+  // Legacy API — kept for compile compatibility, now throws clearly
   // ---------------------------------------------------------------------------
 
   Future<File> mergeProject({
@@ -235,115 +209,58 @@ class AudioMergeService {
     int bitRate = 128000,
     int sampleRate = 44100,
   }) async {
-    if (sessions.isEmpty) {
-      throw ArgumentError('There are no audio sessions to merge.');
-    }
-    for (final session in sessions) {
-      if (!await File(session.audioPath).exists()) {
-        throw FileSystemException(
-            'A source recording is missing.', session.audioPath);
-      }
-      if (session.audioPath.endsWith('.ravenenc')) {
-        throw StateError('Protected audio must be decrypted before merging.');
-      }
-    }
-    await outputDirectory.create(recursive: true);
-    final extension = _extensionForFormat(format);
-    if (!isSupported) {
-      throw UnsupportedError(
-          'Continuous master audio is created on FFmpeg-capable platforms only.');
-    }
-    final output = File('${outputDirectory.path}/$projectId.master.$extension');
-    final pending =
-        File('${outputDirectory.path}/$projectId.master.pending.$extension');
-    if (await pending.exists()) await pending.delete();
-    try {
-      final codecArgs = switch (extension) {
-        'wav' => '-c:a pcm_s16le',
-        'flac' => '-c:a flac',
-        'mp3' => '-c:a libmp3lame -b:a ${_safeBitRate(bitRate)}',
-        _ => '-c:a aac -b:a ${_safeBitRate(bitRate)} -movflags +faststart',
-      };
-      final inputs = sessions
-          .map((session) => '-i ${_quote(session.audioPath)}')
-          .join(' ');
-      final rate = sampleRate.clamp(16000, 48000);
-      final normalized = List<String>.generate(
-        sessions.length,
-        (index) =>
-            '[$index:a:0]aresample=$rate,aformat=sample_fmts=fltp:channel_layouts=mono[a$index]',
-      );
-      final labels =
-          List<String>.generate(sessions.length, (index) => '[a$index]').join();
-      final filter =
-          '${normalized.join(';')};${labels}concat=n=${sessions.length}:v=0:a=1[outa]';
-      final command =
-          '-hide_banner -nostdin -y $inputs -filter_complex ${_quote(filter)} -map ${_quote('[outa]')} -vn -ar $rate -ac 1 $codecArgs ${_quote(pending.path)}';
-      final ffmpegSession = await _ffmpeg.execute(command);
-      final code = await _ffmpeg.returnCode(ffmpegSession);
-      if (!_ffmpeg.isSuccess(code)) {
-        final logs = await _ffmpeg.output(ffmpegSession);
-        throw StateError(
-            'Audio merge failed (code ${_ffmpeg.codeValue(code) ?? 'unknown'}). ${_trimLog(logs ?? '')}');
-      }
-      if (!await pending.exists() || await pending.length() < 64) {
-        throw StateError(
-            'Audio merge reported success but the output is missing or empty.');
-      }
-      final backup = File('${output.path}.previous');
-      if (await backup.exists()) {
-        try {
-          await backup.delete();
-        } on FileSystemException {
-          throw FileSystemException(
-              'Could not prepare the master-audio backup.', backup.path);
-        }
-      }
-      var movedPreviousMaster = false;
-      try {
-        if (await output.exists()) {
-          await output.rename(backup.path);
-          movedPreviousMaster = true;
-        }
-        await pending.rename(output.path);
-      } catch (_) {
-        if (movedPreviousMaster &&
-            !await output.exists() &&
-            await backup.exists()) {
-          try {
-            await backup.rename(output.path);
-          } on FileSystemException {}
-        }
-        rethrow;
-      }
-      if (movedPreviousMaster && await backup.exists()) {
-        try {
-          await backup.delete();
-        } on FileSystemException {}
-      }
-      return output;
-    } finally {
-      if (await pending.exists()) {
-        try {
-          await pending.delete();
-        } on FileSystemException {}
-      }
-    }
+    throw UnsupportedError(
+        'mergeProject is no longer used. The recorder uses '
+        'mergeWavSessions + convertToFormat instead.');
   }
 
   // ---------------------------------------------------------------------------
-  // Internals
+  // WAV chunk parsing
   // ---------------------------------------------------------------------------
 
-  _FfmpegBridge get _ffmpeg => _ffmpegBridge ??= _FfmpegBridge();
-  _FfmpegBridge? _ffmpegBridge;
-
-  String _quote(String path) {
-    final portable = path.replaceAll('\\', '/');
-    return "'${portable.replaceAll("'", "'\\''")}'";
+  /// Returns the byte offset where the audio data begins in [bytes],
+  /// or -1 if [bytes] is not a valid RIFF/WAVE with a `data` chunk.
+  int _wavDataOffset(Uint8List bytes) {
+    if (bytes.length < 12) return -1;
+    if (String.fromCharCodes(bytes.sublist(0, 4)) != 'RIFF') return -1;
+    if (String.fromCharCodes(bytes.sublist(8, 12)) != 'WAVE') return -1;
+    final data = bytes.buffer.asByteData(bytes.offsetInBytes);
+    var offset = 12;
+    while (offset + 8 <= bytes.length) {
+      final id = String.fromCharCodes(bytes.sublist(offset, offset + 4));
+      final size = data.getUint32(offset + 4, Endian.little);
+      if (id == 'data') {
+        return offset + 8;
+      }
+      // Guard against corrupt headers that claim an impossibly large size.
+      if (size > bytes.length) return -1;
+      offset += 8 + size;
+      if (size % 2 == 1) offset += 1; // RIFF pad byte for odd-sized chunks
+    }
+    return -1;
   }
 
-  String _safeBitRate(int bitRate) => '${bitRate.clamp(64000, 320000)}';
+  /// Parses a WAV header and computes the duration of [dataLength] bytes of
+  /// sample data. Returns 0 if the header is not parseable.
+  int _wavDurationFromHeaderAndData(Uint8List header, int dataLength) {
+    if (header.length < 44) return 0;
+    final data = header.buffer.asByteData(header.offsetInBytes);
+    if (String.fromCharCodes(header.sublist(12, 16)) != 'fmt ') return 0;
+    final channels = data.getUint16(22, Endian.little);
+    final sampleRate = data.getUint32(24, Endian.little);
+    final bitsPerSample = data.getUint16(34, Endian.little);
+    if (channels == 0 || sampleRate == 0 || bitsPerSample == 0) return 0;
+    final bytesPerSecond = sampleRate * channels * (bitsPerSample ~/ 8);
+    if (bytesPerSecond == 0) return 0;
+    return ((dataLength / bytesPerSecond) * 1000).round();
+  }
+
+  void _writeUint32LE(Uint8List bytes, int offset, int value) {
+    bytes[offset] = value & 0xFF;
+    bytes[offset + 1] = (value >> 8) & 0xFF;
+    bytes[offset + 2] = (value >> 16) & 0xFF;
+    bytes[offset + 3] = (value >> 24) & 0xFF;
+  }
 
   String _extensionForFormat(String format) => switch (format.toLowerCase()) {
         'wav' => 'wav',
@@ -352,99 +269,12 @@ class AudioMergeService {
         _ => 'm4a',
       };
 
+  String _safeBitRate(int bitRate) => '${bitRate.clamp(64000, 320000)}';
+
   String _trimLog(String value) {
     final clean = value.replaceAll(RegExp(r'\s+'), ' ').trim();
     return clean.length <= 220
         ? clean
-        : '${clean.substring(clean.length - 220)}…';
+        : '…${clean.substring(clean.length - 220)}';
   }
 }
-
-/// Lazily resolved handle to the FFmpeg plugin.
-///
-/// The plugin types are bound at runtime so a build that does not bundle the
-/// native binaries still compiles. Calling [execute] / [executeWithProgress]
-/// on such a build throws a clear [UnsupportedError].
-class _FfmpegBridge {
-  static const String _package = 'package:ffmpeg_kit_flutter_new_audio';
-
-  Future<Object> _load<T>() async {
-    try {
-      return await _loader.load<T>(_package);
-    } catch (error) {
-      throw UnsupportedError(
-          'FFmpeg is not available on this platform ($error).');
-    }
-  }
-
-  /// Runs [command] synchronously and returns the completed session.
-  Future<Object> execute(String command) async {
-    final kit = await _load<Object>();
-    return await (kit as dynamic).execute(command) as Future<Object>;
-  }
-
-  /// Runs [command] asynchronously with FFmpeg statistics forwarded to
-  /// [onProgress]. Falls back to [execute] if the async/statistics API is
-  /// not available on the loaded plugin build.
-  Future<Object> executeWithProgress(
-    String command,
-    Duration totalDuration,
-    void Function(double)? onProgress,
-  ) async {
-    final kit = await _load<Object>();
-    if (onProgress == null) {
-      return await (kit as dynamic).execute(command) as Future<Object>;
-    }
-    try {
-      return await (kit as dynamic).executeAsync(
-        command,
-        null,
-        null,
-        (stats) {
-          try {
-            final timeMs = (stats as dynamic).getTime() as int;
-            if (totalDuration.inMilliseconds > 0) {
-              final pct =
-                  (timeMs / totalDuration.inMilliseconds).clamp(0.0, 1.0);
-              onProgress(pct.toDouble());
-            }
-          } catch (_) {
-            // Statistics are best-effort.
-          }
-        },
-      ) as Future<Object>;
-    } catch (_) {
-      // Plugin build does not support async/statistics — fall back.
-      return await (kit as dynamic).execute(command) as Future<Object>;
-    }
-  }
-
-  Future<Object?> returnCode(Object session) async =>
-      await (session as dynamic).getReturnCode() as Object?;
-
-  Future<String?> output(Object session) async =>
-      await (session as dynamic).getOutput() as String?;
-
-  bool isSuccess(Object? code) =>
-      code != null && (code as dynamic).isValueSuccess() as bool;
-
-  int? codeValue(Object? code) =>
-      code == null ? null : (code as dynamic).getValue() as int;
-
-  static const _loader = _DynamicLoader();
-}
-
-class _DynamicLoader {
-  const _DynamicLoader();
-
-  Future<Object> load<T>(String package) {
-    final factory = ffmpegBridgeFactory;
-    if (factory == null) {
-      throw UnsupportedError('No FFmpeg bridge registered for this build.');
-    }
-    return Future<Object>.value(factory());
-  }
-}
-
-/// Set by the app on FFmpeg-capable builds to bind the plugin.
-Object Function()? ffmpegBridgeFactory;
