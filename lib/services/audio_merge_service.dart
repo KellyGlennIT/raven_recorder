@@ -1,12 +1,15 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_session.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/statistics.dart';
 import 'package:flutter/foundation.dart';
 
 import '../models/raven_project.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/ffprobe_kit.dart';
 
 class AudioMergeService {
   static bool get isSupported => !kIsWeb;
@@ -83,7 +86,6 @@ class AudioMergeService {
     builder.add(payload);
     final merged = builder.toBytes();
 
-    // Patch RIFF size (offset 4) and data-chunk size (dataOffset - 4).
     _writeUint32LE(merged, 4, totalLength - 8);
     _writeUint32LE(merged, dataOffsetInHeader! - 4, payload.length);
 
@@ -115,15 +117,11 @@ class AudioMergeService {
   }
 
   // ---------------------------------------------------------------------------
-  // FFmpeg-backed format conversion — direct call, no bridge
+  // FFmpeg-backed format conversion — synchronous, no progress
   // ---------------------------------------------------------------------------
 
-  /// Converts [input] into [format] (`'wav' | 'm4a' | 'mp3' | 'flac'`) and
-  /// writes the result to [outputPath].
-  ///
-  /// Calls [FFmpegKit.execute] directly. The package bundles prebuilt native
-  /// libraries for Android, iOS, macOS, Windows, and Linux — no bridge, no
-  /// custom loader, no external setup required.
+  /// Converts [input] into [format] (`'wav' | 'm4a' | 'mp3' | 'flac'`).
+  /// Blocks until complete. Use [convertToFormatAsync] when you want progress.
   Future<File> convertToFormat({
     required File input,
     required String outputPath,
@@ -146,22 +144,12 @@ class AudioMergeService {
     if (await pending.exists()) await pending.delete();
 
     try {
-      final codecCandidates = switch (extension) {
-        'wav' => <String>['-c:a pcm_s16le'],
-        'flac' => <String>['-c:a flac'],
-        'mp3' => <String>[
-            '-c:a libmp3lame -b:a ${_safeBitRate(bitRate)}',
-            '-c:a mp3 -b:a ${_safeBitRate(bitRate)}',
-          ],
-        _ => <String>[
-            '-c:a aac -b:a ${_safeBitRate(bitRate)} -movflags +faststart'
-          ],
-      };
+      final codecCandidates = _codecCandidates(extension, bitRate);
       final rate = sampleRate.clamp(16000, 48000);
 
       FFmpegSession? session;
       ReturnCode? returnCode;
-      String? lastLogs;
+      String lastLogs = '';
 
       for (final codecArgs in codecCandidates) {
         final command =
@@ -173,50 +161,190 @@ class AudioMergeService {
         } catch (e) {
           throw StateError(
               'FFmpeg native library did not load ($e). '
-              'Run "flutter clean" and rebuild. Also verify '
-              'android/app/build.gradle.kts does NOT contain an "exclude" '
-              'block for "com.antonkarpenko:ffmpeg-kit-audio".');
+              'Run "flutter clean" and rebuild.');
         }
 
         returnCode = await session.getReturnCode();
+        final sessionOutput = await session.getOutput() ?? '';
+        if (sessionOutput.isNotEmpty) lastLogs = sessionOutput;
+
         if (ReturnCode.isSuccess(returnCode) &&
             await pending.exists() &&
-            await pending.length() >= 64) {
-          break;
+            await pending.length() >= 128) {
+          onProgress?.call(1.0);
+          final destination = File(outputPath);
+          if (await destination.exists()) await destination.delete();
+          await pending.rename(destination.path);
+          return destination;
         }
-        lastLogs = await session.getOutput();
+
         if (await pending.exists()) {
           try {
             await pending.delete();
-          } catch (_) {}
+          } on FileSystemException {
+            // Best-effort cleanup between codec attempts.
+          }
         }
       }
 
-      if (!ReturnCode.isSuccess(returnCode) ||
-          !await pending.exists() ||
-          await pending.length() < 64) {
-        throw StateError(
-            'FFmpeg conversion to $extension failed (code ${returnCode?.getValue() ?? 'unknown'}). '
-            '${_trimLog(lastLogs ?? '')}');
-      }
-      final destination = File(outputPath);
-      if (await destination.exists()) await destination.delete();
-      await pending.rename(destination.path);
-      onProgress?.call(1.0);
-      return destination;
+      throw StateError(
+          'FFmpeg could not encode to $extension after '
+          '${codecCandidates.length} attempt(s). '
+          'Last code: ${returnCode?.getValue() ?? 'unknown'}. '
+          'FFmpeg output: ${_trimLog(lastLogs)}');
     } finally {
       if (await pending.exists()) {
         try {
           await pending.delete();
         } on FileSystemException {
-          // Cleanup is best-effort; a leftover pending file is harmless.
+          // Cleanup is best-effort.
+        }
+      }
+    }
+  }
+  /// Reads the duration of [file] via FFprobe. Works for any format that
+  /// FFmpeg can decode — including formats `just_audio` refuses to open
+  /// (WMA, AMR, M4B, some OGG/Opus variants).
+  ///
+  /// Returns milliseconds, or 0 when the duration cannot be determined.
+  Future<int> probeDurationMs(File file) async {
+    if (!await file.exists()) return 0;
+    try {
+      final session = await FFprobeKit.getMediaInformation(file.path);
+      final info = session.getMediaInformation();
+      final durationStr = info?.getDuration();
+      if (durationStr == null) return 0;
+      final seconds = double.tryParse(durationStr);
+      if (seconds == null || seconds <= 0) return 0;
+      return (seconds * 1000).round();
+    } catch (_) {
+      return 0;
+    }
+  }
+  // ---------------------------------------------------------------------------
+  // FFmpeg-backed format conversion — async with progress
+  // ---------------------------------------------------------------------------
+
+  /// Same as [convertToFormat] but reports progress via [onProgress] and
+  /// yields to the Dart event loop while the native encode is running.
+  ///
+  /// The callback fires at roughly 4–8 Hz with values in `[0.0, 1.0]`.
+  /// Use this for the background encode queue — it never blocks the UI thread
+  /// and keeps the app fully interactive during long encodes.
+  Future<File> convertToFormatAsync({
+    required File input,
+    required String outputPath,
+    required String format,
+    int bitRate = 128000,
+    int sampleRate = 44100,
+    Duration? estimatedDuration,
+    void Function(double progress)? onProgress,
+  }) async {
+    if (!await input.exists()) {
+      throw FileSystemException('Conversion input is missing.', input.path);
+    }
+    if (!isSupported) {
+      throw UnsupportedError(
+          'Format conversion requires FFmpeg on this platform.');
+    }
+
+    final extension = _extensionForFormat(format);
+    final pending = File('$outputPath.pending.$extension');
+    if (await pending.exists()) await pending.delete();
+
+    try {
+      final codecCandidates = _codecCandidates(extension, bitRate);
+      final rate = sampleRate.clamp(16000, 48000);
+      final totalMs = estimatedDuration?.inMilliseconds ?? 0;
+      final useStatsCallback = totalMs > 0 && onProgress != null;
+
+      FFmpegSession? session;
+      ReturnCode? returnCode;
+      String lastLogs = '';
+
+      for (final codecArgs in codecCandidates) {
+        final command =
+            '-hide_banner -nostdin -y -i "${input.path}" '
+            '-vn -ar $rate -ac 1 $codecArgs "${pending.path}"';
+
+        final sessionCompleter = Completer<FFmpegSession>();
+        try {
+          await FFmpegKit.executeAsync(
+            command,
+            (FFmpegSession completed) {
+              if (!sessionCompleter.isCompleted) {
+                sessionCompleter.complete(completed);
+              }
+            },
+            null,
+            useStatsCallback
+                ? (Statistics stats) {
+                    final encodedMs = stats.getTime();
+                    if (encodedMs > 0) {
+                      onProgress(
+                          (encodedMs / totalMs).clamp(0.0, 1.0).toDouble());
+                    }
+                  }
+                : null,
+          );
+        } catch (e) {
+          throw StateError(
+              'FFmpeg native library did not load ($e). '
+              'Run "flutter clean" and rebuild.');
+        }
+
+        session = await sessionCompleter.future;
+        returnCode = await session.getReturnCode();
+        final sessionOutput = await session.getOutput() ?? '';
+        if (sessionOutput.isNotEmpty) lastLogs = sessionOutput;
+
+        if (ReturnCode.isSuccess(returnCode) &&
+            await pending.exists() &&
+            await pending.length() >= 128) {
+          onProgress?.call(1.0);
+          final destination = File(outputPath);
+          if (await destination.exists()) await destination.delete();
+          await pending.rename(destination.path);
+          return destination;
+        }
+
+        if (await pending.exists()) {
+          try {
+            await pending.delete();
+          } on FileSystemException {
+            // Best-effort cleanup between codec attempts.
+          }
+        }
+      }
+
+      throw StateError(
+          'FFmpeg could not encode to $extension after '
+          '${codecCandidates.length} attempt(s). '
+          'Last code: ${returnCode?.getValue() ?? 'unknown'}. '
+          'FFmpeg output: ${_trimLog(lastLogs)}');
+    } finally {
+      if (await pending.exists()) {
+        try {
+          await pending.delete();
+        } on FileSystemException {
+          // Cleanup is best-effort.
         }
       }
     }
   }
 
+  /// Cancels any in-flight FFmpeg session. Called by the background encode
+  /// service when the user deletes the project being encoded.
+  Future<void> cancelActiveSession() async {
+    try {
+      await FFmpegKit.cancel();
+    } catch (_) {
+      // Best-effort.
+    }
+  }
+
   // ---------------------------------------------------------------------------
-  // Legacy API — kept for compile compatibility, now throws clearly
+  // Legacy API — kept for compile compatibility
   // ---------------------------------------------------------------------------
 
   Future<File> mergeProject({
@@ -233,11 +361,34 @@ class AudioMergeService {
   }
 
   // ---------------------------------------------------------------------------
+  // Codec candidates
+  // ---------------------------------------------------------------------------
+
+  /// Ordered list of real FFmpeg codec arguments for [extension].
+  /// Every candidate must be a genuine FFmpeg encoder name — invalid
+  /// candidates waste an entire encode attempt.
+  List<String> _codecCandidates(String extension, int bitRate) {
+    final clamped = _safeBitRate(bitRate);
+    return switch (extension) {
+      'wav' => <String>['-c:a pcm_s16le'],
+      'flac' => <String>[
+          '-c:a flac',
+          '-c:a libflac',
+        ],
+      'mp3' => <String>[
+          '-c:a libmp3lame -b:a $clamped',
+          '-c:a libshine -b:a $clamped',
+        ],
+      _ => <String>[
+          '-c:a aac -b:a $clamped -movflags +faststart',
+        ],
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // WAV chunk parsing
   // ---------------------------------------------------------------------------
 
-  /// Returns the byte offset where the audio data begins in [bytes],
-  /// or -1 if [bytes] is not a valid RIFF/WAVE with a `data` chunk.
   int _wavDataOffset(Uint8List bytes) {
     if (bytes.length < 12) return -1;
     if (String.fromCharCodes(bytes.sublist(0, 4)) != 'RIFF') return -1;
@@ -250,16 +401,13 @@ class AudioMergeService {
       if (id == 'data') {
         return offset + 8;
       }
-      // Guard against corrupt headers that claim an impossibly large size.
       if (size > bytes.length) return -1;
       offset += 8 + size;
-      if (size % 2 == 1) offset += 1; // RIFF pad byte for odd-sized chunks
+      if (size % 2 == 1) offset += 1;
     }
     return -1;
   }
 
-  /// Parses a WAV header and computes the duration of [dataLength] bytes of
-  /// sample data. Returns 0 if the header is not parseable.
   int _wavDurationFromHeaderAndData(Uint8List header, int dataLength) {
     if (header.length < 44) return 0;
     final data = header.buffer.asByteData(header.offsetInBytes);

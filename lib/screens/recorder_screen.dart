@@ -221,14 +221,11 @@ class _RecorderScreenState extends State<RecorderScreen> {
             isDraft: true,
           );
 
-      // Standalone recordings store their audio flat in recordingsDirectory —
-      // no per-recording folder is ever created on disk.
       final Directory sessionDirectory;
       if (!shouldCreateProject) {
         sessionDirectory = widget.repository.recordingsDirectory;
         await sessionDirectory.create(recursive: true);
       } else {
-        // Full project: create the named folder tree.
         Directory projectDirectory;
         try {
           projectDirectory =
@@ -274,7 +271,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
           name: '$draftTitle · Session $sessionNumber',
           sampleRate: captureSampleRate,
           recoverablePcm16: captureExt == 'wav',
-          bitRate: widget.preferences.bitRate, // BITRATE: set on creation
+          bitRate: widget.preferences.bitRate,
         );
         final draft = existingProject == null
             ? RavenProject(
@@ -438,9 +435,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
   (AudioEncoder, String) _pickCaptureEncoder(String targetFormat) {
     return switch (targetFormat) {
       'wav' => (AudioEncoder.wav, 'wav'),
-      // Native FLAC capture is unsupported by MediaRecorder on most Android devices
-      // and causes immediate crash/exception. We safely capture lossless PCM WAV
-      // and transcode to FLAC losslessly in the background.
       'flac' => (AudioEncoder.wav, 'wav'),
       'mp3' => (AudioEncoder.wav, 'wav'),
       'm4a' || 'aac' => (AudioEncoder.aacLc, 'm4a'),
@@ -587,9 +581,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
     await widget.repository.update(project);
 
     if (_normalizeFormat(captureFormat) != targetFormat) {
-      // Background encoding: the captured file is already committed and fully
-      // playable, so hand the transcode to the queue and return immediately.
-      // The service swaps the encoded file into the project when it finishes.
       BackgroundEncodeService.instance.enqueueSessionConversion(
         repository: widget.repository,
         project: project,
@@ -611,9 +602,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
 
     final visibility = AudioVisibilityService();
 
-    // Legacy copies (older builds duplicated standalone audio into
-    // Music/RAVEN) are removed instead of refreshed — public visibility now
-    // MOVES the project folder, so a copied duplicate is pure waste.
     if (project.isStandalone) {
       var cleaned = false;
       if (project.publicFolderLocation != null &&
@@ -648,19 +636,11 @@ class _RecorderScreenState extends State<RecorderScreen> {
           progress: progress,
           preferences: widget.preferences,
           work: () async {
-            // Never race a pending background encode of this project: the merge
-            // rewrites the same session record and deletes the old file, and an
-            // in-flight encode job holds/replaces the same paths.
             await BackgroundEncodeService.instance.waitForProject(project.id);
 
-            var updated = await _mergeIntoSession(
+            final updated = await _mergeIntoSession(
                 projectForMerge, target, newWavPath, progress);
 
-            // No public copy is re-created here: visibility is now purely a
-            // folder MOVE managed by ProjectRepository.toggleVisibility, so
-            // the merged file already lives in the right place (the project
-            // folder never left its location — only the session file was
-            // rewritten in-place).
             return updated;
           },
         ),
@@ -680,9 +660,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
     String newWavPath,
     _MergeProgress progress,
   ) async {
-    // Standalone recordings have no named project folder — their audio lives
-    // flat in the shared sessions store. Use the parent directory of the
-    // existing audio file so temp/merged files land in the same location.
     final Directory sessionDir;
     if (project.isStandalone) {
       sessionDir = File(target.audioPath).parent;
@@ -764,7 +741,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
           input: merged.file,
           outputPath: finalPath,
           format: targetFormat,
-          bitRate: target.bitRate, // BITRATE: preserve original tier
+          bitRate: target.bitRate,
           sampleRate: target.sampleRate,
           estimatedDuration: Duration(milliseconds: merged.durationMs),
           onProgress: (p) => progress.update(

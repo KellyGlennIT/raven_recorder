@@ -280,22 +280,6 @@ class SettingsScreen extends StatelessWidget {
                             onSettingsChanged();
                           },
                         ),
-                        const Divider(height: 1),
-                        SwitchListTile.adaptive(
-                          secondary: const Icon(Icons.folder_special_outlined),
-                          title: Text(tr(preferences, 'Create project for new recordings',
-                              'Créer un projet pour les nouveaux enregistrements')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'When disabled, recordings start as simple standalone audio. When enabled, every recording starts as a multi-take project workspace.',
-                              'Désactivé : enregistrement simple autonome. Activé : espace projet multi-prises dès le départ.')),
-                          value: preferences.newRecordingsCreateProject,
-                          onChanged: (value) async {
-                            preferences.newRecordingsCreateProject = value;
-                            await preferences.save();
-                            onSettingsChanged();
-                          },
-                        ),
                       ],
                     ),
                   ),

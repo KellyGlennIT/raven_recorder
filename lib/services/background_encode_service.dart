@@ -12,12 +12,15 @@ import 'project_repository.dart';
 ///
 /// How it works:
 ///
-/// 1. The recorder commits the captured PCM/WAV file immediately as the
-///    session's real audio (fully playable, shareable, resumable) and hands
-///    the transcode to this service instead of blocking behind a dialog.
+/// 1. The recorder commits the captured WAV file immediately as the session's
+///    real audio (fully playable, shareable, resumable) and hands the transcode
+///    to this service instead of blocking behind a dialog.
 /// 2. Jobs run strictly one at a time, in the order queued, so a second
 ///    recording saved while the first is still encoding queues up cleanly.
-/// 3. When a job finishes, the encoded file replaces the session's
+/// 3. While a job runs, its progress in `[0.0, 1.0]` is published through
+///    [progressByJob], keyed by `<projectId>/<sessionId>`. UI can show a
+///    percentage chip on the library tile.
+/// 4. When a job finishes, the encoded file replaces the session's
 ///    `audioPath`/`format` in the project record and the capture WAV is
 ///    deleted. [onProjectUpdated] lets the shell refresh the library.
 ///
@@ -25,15 +28,15 @@ import 'project_repository.dart';
 /// - Every job re-reads the project record from the repository right before
 ///   it acts and again right before it commits, so it merges its swap onto
 ///   the freshest state instead of clobbering newer edits.
-/// - If the take was renamed on disk while queued (rename follows the file),
-///   the job encodes from the renamed path. If the take was REPLACED
-///   (resume-merge, amplify-commit) the stale capture file is removed and
-///   the job aborts without touching the replacement.
+/// - The WAV capture file remains the session's `audioPath` for the entire
+///   duration of the encode, so playback and trimming work normally the whole
+///   time. Only the final atomic swap replaces it.
+/// - If the take was renamed on disk while queued, the job encodes from the
+///   renamed path. If the take was REPLACED (resume-merge, amplify-commit)
+///   the stale capture file is removed and the job aborts without touching
+///   the replacement.
 /// - If FFmpeg fails, nothing is swapped: the original WAV stays referenced
 ///   and playable, and [onError] explains what happened.
-/// - [waitForProject] lets the resume-merge and the recorder's final commits
-///   serialise with in-flight jobs so a merge can never race a file deletion
-///   or write a stale project record over a completed swap.
 class BackgroundEncodeService {
   BackgroundEncodeService._();
   static final BackgroundEncodeService instance = BackgroundEncodeService._();
@@ -44,6 +47,12 @@ class BackgroundEncodeService {
 
   /// Jobs queued or running — observable for UI badges.
   final ValueNotifier<int> pendingJobs = ValueNotifier<int>(0);
+
+  /// Per-job progress in [0.0, 1.0], keyed by `<projectId>/<sessionId>`.
+  /// Entries are added when a job starts and removed when it finishes, fails,
+  /// or is cancelled.
+  final ValueNotifier<Map<String, double>> progressByJob =
+      ValueNotifier<Map<String, double>>(<String, double>{});
 
   /// Called after a job rewrote a project record, so the shell can refresh.
   void Function(RavenProject project)? onProjectUpdated;
@@ -56,6 +65,15 @@ class BackgroundEncodeService {
   void Function(String message)? onError;
 
   bool get isBusy => _running || _queue.isNotEmpty;
+
+  /// Progress of a specific job in [0.0, 1.0], or null when that job isn't
+  /// running or queued.
+  double? progressFor(String projectId, String sessionId) =>
+      progressByJob.value[_key(projectId, sessionId)];
+
+  /// Whether a specific session has an encode queued or running.
+  bool isEncoding(String projectId, String sessionId) =>
+      _isQueuedOrRunning(projectId, sessionId);
 
   // --- Shared mutex ----------------------------------------------------------
   // Serializes background encodes AND other file-rewriting services (audio
@@ -98,20 +116,15 @@ class BackgroundEncodeService {
   }
 
   String? _currentKey;
+  String? _currentProjectId;
 
   /// Completes once no encode job for [projectId] is queued or running.
-  ///
-  /// Used by the resume-merge and the recorder's final commits so they never
-  /// race a background swap on the same project. Polls at a coarse interval
-  /// on purpose: jobs are few and the wait only happens after Save.
   Future<void> waitForProject(String projectId) async {
     while (_queue.any((job) => job.projectId == projectId) ||
         (_running && _currentProjectId == projectId)) {
       await Future<void>.delayed(const Duration(milliseconds: 60));
     }
   }
-
-  String? _currentProjectId;
 
   /// Queues converting the session [sessionId] of [project] from its capture
   /// file at [inputPath] into [targetFormat] (`m4a` | `mp3` | `flac`).
@@ -126,7 +139,7 @@ class BackgroundEncodeService {
     required int sampleRate,
   }) {
     final format = targetFormat.toLowerCase();
-    if (format == 'wav') return; // Capture is already the target format.
+    if (format == 'wav') return;
     if (_isQueuedOrRunning(project.id, sessionId)) return;
 
     _queue.add(_EncodeJob(
@@ -153,6 +166,7 @@ class BackgroundEncodeService {
         _currentKey = _key(job.projectId, job.sessionId);
         _currentProjectId = job.projectId;
         pendingJobs.value = _queue.length + 1;
+        _updateProgress(job, 0.0);
         try {
           await _run(job);
         } catch (error) {
@@ -161,6 +175,7 @@ class BackgroundEncodeService {
             'The recording was kept in its original format and stays playable.',
           );
         }
+        _clearProgress(job);
         _currentKey = null;
         _currentProjectId = null;
         pendingJobs.value = _queue.length;
@@ -172,10 +187,23 @@ class BackgroundEncodeService {
     }
   }
 
+  void _updateProgress(_EncodeJob job, double value) {
+    final key = _key(job.projectId, job.sessionId);
+    final next = Map<String, double>.from(progressByJob.value);
+    next[key] = value.clamp(0.0, 1.0).toDouble();
+    progressByJob.value = next;
+  }
+
+  void _clearProgress(_EncodeJob job) {
+    final key = _key(job.projectId, job.sessionId);
+    if (!progressByJob.value.containsKey(key)) return;
+    final next = Map<String, double>.from(progressByJob.value)..remove(key);
+    progressByJob.value = next;
+  }
+
   Future<void> _run(_EncodeJob job) async {
     final project = job.repository.projectById(job.projectId);
     if (project == null) {
-      // The project was deleted while encoding was pending.
       await _deleteQuietly(job.inputPath);
       return;
     }
@@ -194,13 +222,11 @@ class BackgroundEncodeService {
     var inputPath = job.inputPath;
     if (session.audioPath != inputPath) {
       if (session.audioPath.endsWith('.ravenenc')) {
-        // The user encrypted the project while this job waited. The encrypted
-        // record is now authoritative; encoding ciphertext is never correct.
+        // The user encrypted the project while this job waited.
         return;
       }
       final originalStillExists = await File(inputPath).exists();
       if (originalStillExists) {
-        // Replaced by another take's audio: the capture is dead weight.
         await _deleteQuietly(inputPath);
         return;
       }
@@ -212,7 +238,6 @@ class BackgroundEncodeService {
         );
         return;
       }
-      // Renamed on disk (e.g. take rename / project rename): follow it.
       inputPath = session.audioPath;
     }
 
@@ -230,12 +255,17 @@ class BackgroundEncodeService {
     final targetPath =
         '${directory.path}/$baseName-${job.sessionId}.${job.targetFormat}';
 
-    final encoded = await _merge.convertToFormat(
+    final totalMs = session.durationMs > 0 ? session.durationMs : 0;
+
+    final encoded = await _merge.convertToFormatAsync(
       input: input,
       outputPath: targetPath,
       format: job.targetFormat,
       bitRate: job.bitRate,
       sampleRate: job.sampleRate,
+      estimatedDuration:
+          totalMs > 0 ? Duration(milliseconds: totalMs) : null,
+      onProgress: (p) => _updateProgress(job, p),
     );
 
     // Re-read immediately before committing: the user may have edited the
@@ -243,7 +273,6 @@ class BackgroundEncodeService {
     // onto the freshest record instead of overwriting it.
     final latest = job.repository.projectById(job.projectId);
     if (latest == null) {
-      // Project deleted during the encode: remove everything we created.
       await _deleteQuietly(encoded.path);
       await _deleteQuietly(inputPath);
       return;
@@ -253,9 +282,7 @@ class BackgroundEncodeService {
       if (s.id == job.sessionId) latestSession = s;
     }
     if (latestSession == null || latestSession.audioPath != inputPath) {
-      // The take was replaced or the file moved during the encode. Our output
-      // is stale — drop it and leave whichever path the record now points to
-      // completely untouched.
+      // The take was replaced or the file moved during the encode.
       await _deleteQuietly(encoded.path);
       return;
     }
@@ -271,7 +298,6 @@ class BackgroundEncodeService {
     final updated = latest.copyWith(
       sessions: sessions,
       updatedAt: DateTime.now(),
-      // A fresh encoded file replaces everything the master could point to.
       clearMasterAudioPath: true,
     );
     await job.repository.update(updated);
@@ -290,6 +316,16 @@ class BackgroundEncodeService {
     } on FileSystemException {
       // Best-effort; leftover capture files can be cleared later.
     }
+  }
+
+  /// Cancel the currently running encode, clear the queue, and reset progress.
+  /// Safe to call at any time. The running session's WAV file remains the
+  /// session's `audioPath`, so nothing is lost.
+  Future<void> cancelAll() async {
+    _queue.clear();
+    progressByJob.value = <String, double>{};
+    pendingJobs.value = 0;
+    await _merge.cancelActiveSession();
   }
 }
 

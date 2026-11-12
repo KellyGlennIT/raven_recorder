@@ -30,11 +30,12 @@ class ProjectRepository {
   Directory get projectsDirectory =>
       Directory('${_rootDirectory.path}/projects');
 
-  /// Flat folder for **standalone recordings** — single audio files, no
-  /// sub-directories. Completely separate from [projectsDirectory] so the
-  /// two types never share a folder.
-  Directory get recordingsDirectory =>
-      Directory('${_rootDirectory.path}/recordings');
+  /// Flat root for **standalone recordings** — single audio files live
+  /// directly here, alongside projects.json / categories.json, with no
+  /// intermediate `recordings/` folder and no per-recording sub-folder.
+  /// Completely separate from [projectsDirectory] so the two types never
+  /// share a folder.
+  Directory get recordingsDirectory => _rootDirectory;
 
   static Future<ProjectRepository> create() async {
     final supportDirectory = await getApplicationSupportDirectory();
@@ -42,7 +43,6 @@ class ProjectRepository {
     await ravenDirectory.create(recursive: true);
     final repository = ProjectRepository._(ravenDirectory);
     await repository.projectsDirectory.create(recursive: true);
-    await repository.recordingsDirectory.create(recursive: true);
     await Directory('${ravenDirectory.path}/categories')
         .create(recursive: true);
     await repository.load();
@@ -51,33 +51,10 @@ class ProjectRepository {
 
   String newId() => _uuid.v4();
 
-  // ---------------------------------------------------------------------------
-  // Folder locations
-  // ---------------------------------------------------------------------------
-
-  /// Resolves the platform-appropriate public root that holds every user-visible
-  /// RAVEN project folder. Returns null when no such location is available.
-  ///
-  /// This does **not** create the folder — callers create it when publishing.
-  ///
-  /// Android: `/storage/emulated/0/Music/RAVEN/` — the real, media-scanner-
-  ///   indexed Music folder on shared storage. Requires MANAGE_EXTERNAL_STORAGE
-  ///   to be granted at runtime (see `_ensureAllFilesAccess` in main.dart).
-  ///   Falls back to the app-scoped external directory if the primary Music
-  ///   path is unexpectedly absent (rare OEM configuration).
-  /// Windows / Linux: `<Downloads>/RAVEN/`.
-  /// iOS / macOS: `<Documents>/RAVEN/`.
   Future<Directory?> _publicProjectsRoot() async {
     try {
       Directory? base;
       if (Platform.isAndroid) {
-        // Real filesystem path on shared storage. Requires MANAGE_EXTERNAL_STORAGE
-        // to be granted at runtime (see main.dart `_ensureAllFilesAccess`).
-        // Falls back to the app-scoped external directory if the primary Music
-        // folder is unexpectedly missing (rare OEM configuration) or if the
-        // permission was somehow not granted. The caller's error handling will
-        // surface a permission-denied failure on the fallback path if it too
-        // cannot be written.
         final musicDir = Directory('/storage/emulated/0/Music');
         if (await musicDir.exists()) {
           return Directory('${musicDir.path}/RAVEN');
@@ -95,24 +72,18 @@ class ProjectRepository {
       }
       return Directory('${base.path}/RAVEN');
     } on Exception {
+      // No user-visible storage available; callers surface a clear error.
       return null;
     }
   }
 
-  /// Public root as a plain path, or null when unavailable.
   Future<String?> publicProjectsRootPath() async {
     final dir = await _publicProjectsRoot();
     return dir?.path;
   }
 
-  /// Private root as a plain path — always non-null once [create] has run.
   String privateProjectsRootPath() => projectsDirectory.path;
 
-  /// Resolves the folder that currently stores [project]'s files.
-  ///
-  /// When [RavenProject.hasPublicFolder] is true the folder is assumed to live
-  /// at [RavenProject.publicFolderLocation]. Otherwise the folder is the
-  /// private `<projects>/<name>-<id>/` workspace.
   Future<Directory> _resolveProjectFolder(RavenProject project) async {
     final public = project.publicFolderLocation;
     if (project.hasPublicFolder && public != null && public.isNotEmpty) {
@@ -122,11 +93,6 @@ class ProjectRepository {
         '${projectsDirectory.path}/${projectFolderName(project)}');
   }
 
-  /// Legacy: creates `<projects>/<id>/` with no user-facing name. Kept for
-  /// callers that still use the older identifier-only convention.
-  ///
-  /// New code should use [ensureProjectFolder] — it respects public/private
-  /// visibility and produces a human-readable folder name.
   Future<Directory> createProjectDirectory(String projectId) async {
     final directory = Directory('${projectsDirectory.path}/$projectId');
     await directory.create(recursive: true);
@@ -142,22 +108,8 @@ class ProjectRepository {
     return directory;
   }
 
-  /// Ensures the project's on-device folder exists at the location dictated by
-  /// its current visibility. When [RavenProject.hasPublicFolder] is true the
-  /// folder is created under the public RAVEN root; otherwise under the private
-  /// RAVEN root. Every project owns a stable folder named after its title with
-  /// the ID appended so two projects with the same title never collide.
-  ///
-  /// **Standalone recordings create NO folders at all.** A standalone is a
-  /// single audio file stored flat inside the shared `sessions/` directory at
-  /// the private root. Calling this method on a standalone is a no-op that
-  /// returns the shared sessions directory without creating any per-recording
-  /// folder. Only full multi-session projects get their own named folder with
-  /// `notes/`, `attachments/`, `exports/`, and `metadata/` sub-directories.
   Future<Directory> ensureProjectFolder(RavenProject project) async {
     if (project.isStandalone) {
-      // Standalone recordings live as a flat file in recordingsDirectory.
-      // No per-recording folder is ever created.
       await recordingsDirectory.create(recursive: true);
       return recordingsDirectory;
     }
@@ -166,7 +118,6 @@ class ProjectRepository {
     return folder;
   }
 
-  /// Human-readable, filesystem-safe folder name for a project or recording.
   String projectFolderName(RavenProject project) {
     final base = _safeFolderName(project.title);
     final shortId = project.id.length > 8
@@ -189,22 +140,14 @@ class ProjectRepository {
     }
   }
 
-  /// Moves [from] to [to].
-  ///
-  /// Tries [Directory.rename] first — it is atomic and instant on the same
-  /// filesystem (private app dir to private app dir, or public to public).
-  /// Falls back to recursive copy-then-delete only when [rename] fails (e.g.
-  /// cross-filesystem: private app storage → external/public storage on Android).
   Future<void> _moveDirectory(Directory from, Directory to) async {
     if (from.path == to.path) return;
-    // Fast path: same filesystem — rename is atomic and leaves no copies.
     try {
       await from.rename(to.path);
       return;
     } on FileSystemException {
-      // Cross-filesystem or locked: fall through to copy-then-delete.
+      // Cross-filesystem or locked; fall through to copy-then-delete.
     }
-    // Slow path: copy every file, then remove the source.
     await to.create(recursive: true);
     await for (final entity in from.list(recursive: true, followLinks: false)) {
       final relative = entity.path
@@ -222,30 +165,10 @@ class ProjectRepository {
     try {
       await from.delete(recursive: true);
     } on FileSystemException {
-      // Best-effort cleanup: the copy succeeded so the user still has their
-      // data. A stale source tree is harmless and can be removed manually.
+      // Best-effort: the copy succeeded, source cleanup is housekeeping.
     }
   }
 
-  /// Toggles a project's public / private folder visibility.
-  ///
-  /// **For full projects:** physically moves the project folder between the
-  /// private root and the public root (rename first, copy+delete fallback for
-  /// cross-filesystem), rewrites every [RavenAudioSession.audioPath] and
-  /// [RavenProject.masterAudioPath], and returns the **updated project**.
-  ///
-  /// **For standalone recordings:** moves only the single audio file (no
-  /// folder exists). The file is relocated into the public RAVEN root or back
-  /// into the private sessions store, and [RavenProject.publicFolderLocation]
-  /// is updated to point to the new file path (not a directory).
-  ///
-  /// This method does **not** mutate the repository's index — the caller must
-  /// pass the returned project to [update] (or [add] for brand-new projects).
-  ///
-  /// Encrypted projects cannot be made public: the audio would be ciphertext
-  /// that no other app could open. A [StateError] is thrown so callers can
-  /// show the user an explanation instead of silently producing an unreadable
-  /// public file.
   Future<RavenProject> toggleVisibility(
     RavenProject project, {
     required bool makePublic,
@@ -264,9 +187,6 @@ class ProjectRepository {
     final currentlyPublic = project.hasPublicFolder;
     if (currentlyPublic == makePublic) return project;
 
-    // -------------------------------------------------------------------------
-    // Standalone recordings: move only the single audio file, no folder.
-    // -------------------------------------------------------------------------
     if (project.isStandalone) {
       final session = project.sessions.isEmpty ? null : project.sessions.first;
       if (session == null) return project;
@@ -281,8 +201,6 @@ class ProjectRepository {
         }
         newRoot = public;
       } else {
-        // Private standalones always go into the flat recordings store,
-        // never inside the projects folder.
         newRoot = recordingsDirectory;
       }
       await newRoot.create(recursive: true);
@@ -295,14 +213,15 @@ class ProjectRepository {
       final destFile = File('${newRoot.path}/$leaf');
 
       if (await sourceFile.exists()) {
-        // Try atomic rename first; fall back to copy+delete across filesystems.
         try {
           await sourceFile.rename(destFile.path);
         } on FileSystemException {
           await sourceFile.copy(destFile.path);
           try {
             await sourceFile.delete();
-          } on FileSystemException {/* keep copy; source is stale */}
+          } on FileSystemException {
+            // Best-effort: copy succeeded, source cleanup can be retried later.
+          }
         }
       }
 
@@ -316,9 +235,6 @@ class ProjectRepository {
       );
     }
 
-    // -------------------------------------------------------------------------
-    // Full projects: move the entire folder.
-    // -------------------------------------------------------------------------
     final oldFolder = await _resolveProjectFolder(project);
     final oldPath = oldFolder.path;
 
@@ -347,7 +263,6 @@ class ProjectRepository {
       await _createEmptyProjectTree(newFolder);
     }
 
-    // Rewrite session audio paths inside the moved folder.
     final updatedSessions = <RavenAudioSession>[];
     for (final session in project.sessions) {
       if (session.audioPath.startsWith(oldPath)) {
@@ -360,7 +275,6 @@ class ProjectRepository {
       }
     }
 
-    // Rewrite the master audio path, if any.
     String? updatedMaster = project.masterAudioPath;
     if (updatedMaster != null && updatedMaster.startsWith(oldPath)) {
       updatedMaster =
@@ -376,67 +290,121 @@ class ProjectRepository {
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Rename on disk
-  // ---------------------------------------------------------------------------
-
-  /// Renames a project everywhere: the in-memory/index record AND the physical
-  /// folder on the device. The folder `<Title>-<id8>` is moved (or copied)
-  /// under its new name and every [RavenAudioSession.audioPath] plus
-  /// [RavenProject.masterAudioPath] / [RavenProject.publicFolderLocation] that
-  /// lived inside it are rewritten to the new location.
-  ///
-  /// The returned project is the one the caller must persist via [update];
-  /// this method itself only moves files and does not touch the index, so a
-  /// failure here never corrupts the record.
-  Future<RavenProject> renameProject(RavenProject project, String newTitle) async {
+      Future<RavenProject> renameProject(RavenProject project, String newTitle) async {
     final trimmed = newTitle.trim();
     if (trimmed.isEmpty) {
       throw ArgumentError('The project title must not be empty.');
     }
     if (trimmed == project.title) return project;
 
-    final oldFolder = await _resolveProjectFolder(project);
     final renamedRecord = project.copyWith(title: trimmed);
 
-    // When the folder does not exist yet there is nothing to move; ensureProject
-    // will materialise it later under the NEW name.
-    if (!await oldFolder.exists()) return renamedRecord;
+    // ── Standalone: rename the AUDIO FILE on disk (no folder).
+    // The file naming convention is `<sanitised-title>-<sessionId>.<ext>`,
+    // matching what renameSessionFile already uses. Public standalones keep
+    // publicFolderLocation in sync with the new file path (it points to the
+    // live file for standalones, not a folder).
+    if (project.isStandalone) {
+      final sanitized = _safeFolderName(trimmed);
+      final fileTitle = sanitized.isEmpty ? 'Recording' : sanitized;
+      final newSessions = <RavenAudioSession>[];
+      for (final session in project.sessions) {
+        final source = File(session.audioPath);
+        if (!await source.exists()) {
+          newSessions.add(session);
+          continue;
+        }
+        final ext = session.audioPath.contains('.')
+            ? session.audioPath.split('.').last
+            : session.format;
+        final target =
+            File('${source.parent.path}/$fileTitle-${session.id}.$ext');
+        if (target.path == source.path) {
+          newSessions.add(session);
+          continue;
+        }
+        try {
+          if (await target.exists()) {
+            try {
+              await target.delete();
+            } on FileSystemException {
+              // Best-effort cleanup before the rename attempt.
+            }
+          }
+          await source.rename(target.path);
+          newSessions.add(session.copyWith(audioPath: target.path));
+        } on FileSystemException {
+          try {
+            await source.copy(target.path);
+            await source.delete();
+            newSessions.add(session.copyWith(audioPath: target.path));
+          } on FileSystemException {
+            // Both rename and copy failed; keep the original path so audio
+            // stays playable. The title change still applies to the record.
+            newSessions.add(session);
+          }
+        }
+      }
+      final updatedPublic =
+          (project.hasPublicFolder && newSessions.isNotEmpty)
+              ? newSessions.first.audioPath
+              : project.publicFolderLocation;
+      return renamedRecord.copyWith(
+        sessions: newSessions,
+        publicFolderLocation: updatedPublic,
+      );
+    }
+
+    // ── Project: rename the FOLDER + rewrite all session paths.
+    final oldFolder = await _resolveProjectFolder(project);
+
+    if (!await oldFolder.exists()) {
+      try {
+        await ensureProjectFolder(renamedRecord);
+      } on FileSystemException {
+        // The display rename still applies even if the folder can't be built.
+      }
+      return renamedRecord;
+    }
 
     final sameFolder = project.hasPublicFolder;
     final Directory newFolder;
     if (sameFolder) {
-      // Public folder keeps its location; only the leaf name changes.
       final parent = oldFolder.parent;
-      newFolder = Directory('${parent.path}/${projectFolderName(renamedRecord)}');
+      newFolder =
+          Directory('${parent.path}/${projectFolderName(renamedRecord)}');
     } else {
       newFolder = Directory(
           '${projectsDirectory.path}/${projectFolderName(renamedRecord)}');
     }
 
     if (oldFolder.path == newFolder.path) return renamedRecord;
-    if (await newFolder.exists()) {
-      // A stale folder with the new name already exists; merge into it instead
-      // of failing, so the user is never blocked from renaming.
-      await _moveDirectory(oldFolder, newFolder);
-    } else {
-      try {
-        await oldFolder.rename(newFolder.path);
-      } on FileSystemException {
-        // Cross-device or locked file systems: fall back to copy-then-delete.
+
+    try {
+      if (await newFolder.exists()) {
         await _moveDirectory(oldFolder, newFolder);
+      } else {
+        try {
+          await oldFolder.rename(newFolder.path);
+        } on FileSystemException {
+          await _moveDirectory(oldFolder, newFolder);
+        }
       }
+    } on FileSystemException catch (e) {
+      throw StateError(
+          'Could not rename project folder from "${oldFolder.path}" to '
+          '"${newFolder.path}": $e');
     }
 
     final oldPath = oldFolder.path;
-    String rewrite(String path) =>
-        path.startsWith(oldPath)
-            ? newFolder.path + path.substring(oldPath.length)
-            : path;
+    String rewrite(String path) => path.startsWith(oldPath)
+        ? newFolder.path + path.substring(oldPath.length)
+        : path;
 
     return renamedRecord.copyWith(
       sessions: renamedRecord.sessions
-          .map((session) => session.copyWith(audioPath: rewrite(session.audioPath)))
+          .map((session) =>
+              session.copyWith(audioPath: rewrite(session.audioPath)))
           .toList(),
       masterAudioPath: renamedRecord.masterAudioPath == null
           ? null
@@ -445,14 +413,6 @@ class ProjectRepository {
           sameFolder ? newFolder.path : renamedRecord.publicFolderLocation,
     );
   }
-
-  /// Renames the audio file of [session] on disk to match its new take name.
-  ///
-  /// The physical file becomes `<Sanitized take name>-<sessionId>.<ext>` inside
-  /// the same folder, and the session's `audioPath` is rewritten to the new
-  /// location. Renaming fails soft: if the file is missing, has been replaced,
-  /// or cannot be moved, the original path is kept and the record returned
-  /// unchanged (the display rename still succeeds).
   Future<RavenProject> renameSessionFile(
     RavenProject project,
     RavenAudioSession session,
@@ -480,7 +440,6 @@ class ProjectRepository {
 
     try {
       if (await target.exists()) {
-        // Same recording renamed to the same name twice — overwrite safely.
         final sameLength = await target.length() == await source.length();
         if (!sameLength) {
           await target.delete();
@@ -499,10 +458,6 @@ class ProjectRepository {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Index load / save
-  // ---------------------------------------------------------------------------
-
   Future<void> load() async {
     _projects.clear();
     await _loadCategories();
@@ -510,8 +465,6 @@ class ProjectRepository {
     final backupFile = File('${_rootDirectory.path}/projects.json.bak');
     final temporaryFile = File('${_rootDirectory.path}/projects.json.tmp');
 
-    // Try the primary index first, then the last known-good backup and the
-    // write-in-progress file. A damaged index must not make every project vanish.
     for (final candidate in <File>[indexFile, backupFile, temporaryFile]) {
       if (!await candidate.exists()) continue;
       final recovered = await _tryReadProjects(candidate);
@@ -544,12 +497,9 @@ class ProjectRepository {
     await _ensureProjectFolders();
   }
 
-  /// Give every project its on-device folder tree at the location dictated by
-  /// its current public/private state. Standalone recordings are skipped — they
-  /// have no per-recording folder; their audio lives flat in the sessions store.
   Future<void> _ensureProjectFolders() async {
     for (final project in _projects) {
-      if (project.isStandalone) continue; // standalones own no folder
+      if (project.isStandalone) continue;
       try {
         await ensureProjectFolder(project);
       } on FileSystemException {
@@ -577,9 +527,9 @@ class ProjectRepository {
         }
       }
     } on FormatException {
-      // Rebuild the category index from project records below.
+      // Corrupt category file; rebuild from project records below.
     } on FileSystemException {
-      // Project records remain the source of truth if the category file is unavailable.
+      // Unreadable category file; project records remain the source of truth.
     }
   }
 
@@ -672,7 +622,7 @@ class ProjectRepository {
         try {
           await _syncProjectManifest(project);
         } on FileSystemException {
-          // Project records remain canonical; manifests are rebuilt on update.
+          // Category manifests are derived indexes; the project record is canonical.
         }
       }
     } catch (_) {
@@ -731,7 +681,7 @@ class ProjectRepository {
             sampleRate: session.sampleRate,
           );
         } on FileSystemException {
-          // Keep the draft and source file intact for a later recovery attempt.
+          // Keep the draft and source file intact for a later attempt.
           continue;
         }
 
@@ -759,9 +709,9 @@ class ProjectRepository {
         try {
           projects.add(RavenProject.fromJson(Map<String, Object?>.from(item)));
         } on FormatException {
-          // Isolate one malformed entry instead of losing other projects.
+          // Isolate one malformed entry instead of losing the whole index.
         } on TypeError {
-          // Isolate malformed legacy data.
+          // Isolate one malformed entry instead of losing the whole index.
         }
       }
       return projects;
@@ -786,17 +736,13 @@ class ProjectRepository {
       await indexFile.copy(backupFile.path);
     }
     try {
-      // Rename avoids exposing a partially written JSON index on supported filesystems.
       await temporaryFile.rename(indexFile.path);
     } catch (_) {
-      // Preserve the previous index if replacing it fails on a platform/filesystem.
       if (!await indexFile.exists() && await backupFile.exists()) {
         await backupFile.copy(indexFile.path);
       }
       rethrow;
     }
-    // Backup cleanup is housekeeping, not part of the durable write. If it
-    // fails, keep the valid new index and the old backup for recovery.
     try {
       if (await backupFile.exists()) await backupFile.delete();
     } on FileSystemException {
@@ -815,11 +761,11 @@ class ProjectRepository {
     _projects.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     try {
       await saveAll();
-      // Category manifests are derived indexes; a manifest write failure must
-      // not roll back or hide the canonical project record.
       try {
         await _syncProjectManifest(project);
-      } on FileSystemException {/* rebuilt on next update */}
+      } on FileSystemException {
+        // Category manifests are derived indexes; rebuilt on next update.
+      }
     } catch (_) {
       _projects.removeWhere((item) => item.id == project.id);
       if (previous != null) _projects.add(previous);
@@ -841,7 +787,9 @@ class ProjectRepository {
       await saveAll();
       try {
         await _syncProjectManifest(project);
-      } on FileSystemException {/* rebuilt on next update */}
+      } on FileSystemException {
+        // Category manifests are derived indexes; rebuilt on next update.
+      }
     } catch (_) {
       _projects.removeWhere((item) => item.id == project.id);
       if (previous != null) _projects.add(previous);
@@ -865,24 +813,26 @@ class ProjectRepository {
         '${_rootDirectory.path}/categories/${_safeFolderName(project.category)}');
     await categoryDirectory.create(recursive: true);
     final manifest = File('${categoryDirectory.path}/${project.id}.json');
-    // The canonical folder depends on visibility: public projects live in the
-    // user-visible RAVEN root, private projects in the app-private workspace.
     final folderLocation = project.publicFolderLocation ??
-        '${projectsDirectory.path}/${projectFolderName(project)}';
+        (project.isStandalone
+            ? project.sessions.isEmpty
+                ? recordingsDirectory.path
+                : File(project.sessions.first.audioPath).parent.path
+            : '${projectsDirectory.path}/${projectFolderName(project)}');
     await manifest.writeAsString(
         jsonEncode(<String, Object?>{
           'projectId': project.id,
           'title': project.title,
           'category': project.category,
           'updatedAt': project.updatedAt.toIso8601String(),
-          'projectDirectory': '${projectsDirectory.path}/${project.id}',
+          'projectDirectory': project.isStandalone
+              ? folderLocation
+              : '${projectsDirectory.path}/${project.id}',
           'projectFolder': folderLocation,
           'isPublic': project.isPublic,
           'isPublicFolder': project.hasPublicFolder,
         }),
         flush: true);
-    // Remove stale category pointers when a project moves; project files stay in
-    // their stable ID directory so categorisation can never break audio paths.
     final categoriesRoot = Directory('${_rootDirectory.path}/categories');
     if (await categoriesRoot.exists()) {
       await for (final entity in categoriesRoot.list(followLinks: false)) {
@@ -933,13 +883,11 @@ class ProjectRepository {
   }
 
   Future<void> deleteForever(RavenProject project) async {
-    // Remove any RAVEN-managed single-file public copy before permanently
-    // deleting its project.
     if (project.publicCopyLocation != null) {
       try {
         await AudioVisibilityService().remove(project.publicCopyLocation!);
       } on Exception {
-        // Best-effort: a stale copy must never block deleting the project.
+        // Best-effort: a stale public copy must never block deleting the record.
       }
     }
 
@@ -947,8 +895,6 @@ class ProjectRepository {
     if (existingIndex < 0) return;
     final removed = _projects.removeAt(existingIndex);
     try {
-      // Remove the record from the durable index first. If this write fails,
-      // roll back the in-memory list and leave the audio directory untouched.
       await saveAll();
     } catch (_) {
       _projects.insert(
@@ -957,9 +903,7 @@ class ProjectRepository {
       rethrow;
     }
 
-    // Clean up files/folders depending on whether this is a standalone or project.
     if (project.isStandalone) {
-      // Standalone: delete only the audio files; there is no named folder.
       final filesToDelete = <String>{
         for (final session in project.sessions) session.audioPath,
         if (project.masterAudioPath != null) project.masterAudioPath!,
@@ -970,13 +914,11 @@ class ProjectRepository {
         try {
           final f = File(path);
           if (await f.exists()) await f.delete();
-        } on FileSystemException {/* best-effort */}
+        } on FileSystemException {
+          // Best-effort: leftover files can be cleaned up manually.
+        }
       }
     } else {
-      // Full project: clean up every folder shape used across versions:
-      //   <projects>/<id>/                    — legacy identifier-only folder
-      //   <projects>/<name>-<id>/             — canonical private folder
-      //   <public-root>/RAVEN/<name>-<id>/    — canonical public folder
       final candidates = <Directory>{
         Directory('${projectsDirectory.path}/${project.id}'),
         Directory(
@@ -990,8 +932,7 @@ class ProjectRepository {
             await directory.delete(recursive: true);
           }
         } on FileSystemException {
-          // Best-effort cleanup: a locked folder must not resurrect the project
-          // record we already removed from the index.
+          // Best-effort: a locked folder must not resurrect the removed record.
         }
       }
     }

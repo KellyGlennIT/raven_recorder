@@ -282,6 +282,12 @@ While a recording is active, a microphone-type foreground service shows a visibl
 17. **No duplicate storage:** make a standalone recording public, then check the device with a file manager — exactly one copy of the audio must exist (inside `Music/RAVEN/<name>-<id>/sessions/`), and the app-private folder must be gone. Make it private again and confirm the reverse. Repeat for a multi-take project, and again after resuming a public recording (the merge must not create a second public copy). Compare total device storage before and after to confirm it stays flat.
 18. **Settings switches:** toggle *Public audio by default*, *Lock RAVEN with a PIN* and *Voice enhancement*; close and reopen the app and confirm each switch keeps its state. With *Public audio by default* on, record a new take and confirm it lands in the public RAVEN folder without a duplicate.
 
+## License
+
+RAVEN is released under the [MIT License](LICENSE). You may use, modify, and redistribute it, including commercially, provided the copyright notice and permission notice are kept in copies or substantial portions of the software. The software is provided "as is", without warranty.
+
+Bundled third-party packages keep their own licenses (the FFmpeg audio package is LGPL-3.0). The upstream Fossify Voice Recorder archive in `reference/` is GPL-3.0 and is kept for auditing only — see [NOTICE.md](NOTICE.md).
+
 ## Scope still to finish
 
 This codebase does not yet constitute the entire planned RAVEN product. Remaining larger features include backup hardening, advanced audio editing/noise removal, transcription and AI processing of audio, streaming-safe encryption, and end-to-end recovery verification on every platform. Interrupted-recording draft recovery is wired end to end but still needs device verification across Android versions and storage conditions. Portable project export/import is wired into the Player/Library UI but requires round-trip testing with real archives, imported audio and large attachments. Trimming is region-based (keep/cut spans); waveform-accurate scrubbing, crossfades at cut points and per-region gain are not implemented yet.

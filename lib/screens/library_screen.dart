@@ -6,6 +6,7 @@ import 'package:intl/intl.dart';
 
 import '../models/raven_project.dart';
 import '../services/app_preferences.dart';
+import '../widgets/encoding_status_widgets.dart';
 
 enum LibraryFilter { all, favorites, trash }
 
@@ -1452,15 +1453,26 @@ class ProjectTile extends StatelessWidget {
                               style: theme.textTheme.titleSmall
                                   ?.copyWith(fontWeight: FontWeight.w700)),
                           const SizedBox(height: 5),
-                          Text(
-                            subtitle,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.bodySmall?.copyWith(
-                              color: project.isDraft
-                                  ? theme.colorScheme.tertiary
-                                  : theme.colorScheme.onSurfaceVariant,
-                            ),
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            children: <Widget>[
+                              Expanded(
+                                child: Text(
+                                  subtitle,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: project.isDraft
+                                        ? theme.colorScheme.tertiary
+                                        : theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ),
+                              EncodingStatusChip(
+                                projectId: project.id,
+                                isFrench: preferences.isFrench,
+                              ),
+                            ],
                           ),
                           if (project.category != 'Uncategorized') ...<Widget>[
                             const SizedBox(height: 6),

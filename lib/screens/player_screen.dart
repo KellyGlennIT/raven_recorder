@@ -17,6 +17,7 @@ import '../services/app_preferences.dart';
 import '../services/attachment_service.dart';
 import '../services/project_archive_service.dart';
 import '../services/audio_encryption_service.dart';
+import '../services/audio_merge_service.dart';
 import '../services/project_repository.dart';
 import '../services/ai_provider_service.dart';
 import '../services/ai_key_vault.dart';
@@ -26,6 +27,7 @@ import '../services/audio_protection_service.dart';
 import '../services/document_export_service.dart';
 import '../services/playback_service.dart';
 import '../widgets/audio_password_dialog.dart';
+import '../widgets/encoding_status_widgets.dart';
 import '../widgets/trim_editor.dart';
 import 'recorder_screen.dart';
 
@@ -49,8 +51,6 @@ class PlayerScreen extends StatefulWidget {
 
 class _PlayerScreenState extends State<PlayerScreen>
     with SingleTickerProviderStateMixin {
-  // Shared, app-wide player — playback survives navigating away from this
-  // screen and backgrounding the app. Do NOT dispose here.
   AudioPlayer get _player => PlaybackService().player;
 
   final AudioEncryptionService _encryption = AudioEncryptionService();
@@ -67,10 +67,6 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   int _activeIndex = 0;
 
-  // --- Amplify -------------------------------------------------------------
-  // Mirrors the standalone recording player: render a boosted copy of the
-  // ACTIVE take with FFmpeg, play it in place, and let the user commit it as
-  // that take's audio. Nothing touches the original file until "Save".
   bool _boostProcessing = false;
   bool _savingAmplified = false;
   double _volumeBoost = 1.0;
@@ -140,12 +136,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _notesController.removeListener(_onNotesChanged);
     _notesController.dispose();
     _tabController.dispose();
-    // Boosted audio lives only in the temp cache and is never committed unless
-    // the user taps Save, so it is always safe to drop on the way out.
     unawaited(_deleteBoostedFile());
-    // NOTE: do NOT dispose `_player` here — it's global and used for
-    // background playback. `AudioEncryptionService.cleanupAbandonedPlaybackFiles()`
-    // on next launch cleans any leftover temp decrypted files.
     super.dispose();
   }
 
@@ -153,9 +144,6 @@ class _PlayerScreenState extends State<PlayerScreen>
       ? null
       : _project.sessions[_activeIndex.clamp(0, _project.sessions.length - 1)];
 
-  /// Album art for the media notification:
-  /// 1. The project's first image attachment, if any.
-  /// 2. Otherwise the RAVEN logo, cached to a temp file.
   Future<Uri?> _artUriForSession(RavenAudioSession session) async {
     final images = _attachments.where(_isImageAttachment);
     if (images.isNotEmpty) {
@@ -174,7 +162,6 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
-  /// Builds the [MediaItem] shown in the notification for [session].
   Future<MediaItem> _mediaItemFor(
     RavenAudioSession session, {
     String? overrideTitle,
@@ -283,7 +270,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (salt == null) return null;
     while (mounted) {
       final password = await showAudioPasswordDialog(
-        context, // ignore: use_build_context_synchronously
+        context,
         preferences: widget.preferences,
         createPassword: false,
       );
@@ -368,9 +355,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         if (_project.isAudioProtected && masterExists) {
           try {
             await File(masterPath).delete();
-          } on FileSystemException {
-            // A later cleanup may succeed after the player releases handles.
-          }
+          } on FileSystemException {}
         }
         final withoutMaster = _project.copyWith(clearMasterAudioPath: true);
         try {
@@ -408,10 +393,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         } catch (_) {
           try {
             await _player.stop();
-          } catch (_) {
-            // Best-effort: a failed stop leaves the player in an
-            // inconsistent state but the fallback session path works.
-          }
+          } catch (_) {}
           final withoutMaster = _project.copyWith(clearMasterAudioPath: true);
           try {
             await _saveProject(withoutMaster);
@@ -1043,11 +1025,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
-  /// Opens the trim editor for one take. The editor asks the user whether to
-  /// replace the take's audio or keep both; either way the project record is
-  /// updated here with the real new duration and path.
-  Future<void> _trimSession(
-      RavenAudioSession session, int index) async {
+  Future<void> _trimSession(RavenAudioSession session, int index) async {
     if (_loading || _project.isAudioProtected) return;
     final messenger = ScaffoldMessenger.maybeOf(context);
     final navigator = Navigator.of(context);
@@ -1059,6 +1037,35 @@ class _PlayerScreenState extends State<PlayerScreen>
       ));
       return;
     }
+
+    // Imported or exotic sessions sometimes have durationMs == 0 because
+    // just_audio could not decode them. Probe via FFmpeg now.
+    var effectiveDurationMs = session.durationMs > 0
+        ? session.durationMs
+        : await AudioMergeService().probeDurationMs(source);
+    if (effectiveDurationMs <= 0) {
+      messenger?.showSnackBar(SnackBar(
+        content: Text(tr(
+          widget.preferences,
+          'RAVEN could not read this audio file. Try importing a WAV, MP3, M4A, or FLAC file.',
+          'RAVEN n’a pas pu lire ce fichier audio. Essayez d’importer un fichier WAV, MP3, M4A ou FLAC.',
+        )),
+      ));
+      return;
+    }
+    if (effectiveDurationMs != session.durationMs && session.durationMs <= 0) {
+      try {
+        final updatedSessions = _project.sessions
+            .map((s) => s.id == session.id
+                ? s.copyWith(durationMs: effectiveDurationMs)
+                : s)
+            .toList();
+        await _saveProject(_project.copyWith(sessions: updatedSessions));
+      } catch (_) {
+        // Best-effort — trim still works with the in-memory value.
+      }
+    }
+
     try {
       await _player.stop();
     } catch (_) {}
@@ -1070,9 +1077,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         builder: (_) => TrimEditor(
           source: source,
           format: session.format,
-          durationMs: session.durationMs > 0
-              ? session.durationMs
-              : _activeDurationMs,
+          durationMs: effectiveDurationMs,
           bitRate: session.bitRate,
           sampleRate: session.sampleRate > 0 ? session.sampleRate : 44100,
           title: session.name.isEmpty
@@ -1080,18 +1085,20 @@ class _PlayerScreenState extends State<PlayerScreen>
                   'Prise ${index + 1}')
               : session.name,
           isFrench: widget.preferences.isFrench,
+          isStandalone: false,
         ),
       ),
     );
     if (result == null || !mounted) return;
 
     try {
-      // copyWith has no `id`, so a new take gets a fresh session object.
+      final actualFormat = result.file.path.split('.').last.toLowerCase();
+
       final trimmedSession = result.replacedOriginal
           ? session.copyWith(
               audioPath: result.file.path,
               durationMs: result.durationMs,
-              // Format never changes: the trim preserves the source container.
+              format: actualFormat,
               recoverablePcm16: false,
             )
           : RavenAudioSession(
@@ -1099,7 +1106,7 @@ class _PlayerScreenState extends State<PlayerScreen>
               audioPath: result.file.path,
               createdAt: DateTime.now(),
               durationMs: result.durationMs,
-              format: session.format,
+              format: actualFormat,
               name:
                   '${session.name.isEmpty ? tr(widget.preferences, 'Take ${index + 1}', 'Prise ${index + 1}') : session.name} · ${tr(widget.preferences, 'trimmed', 'rogné')}',
               sampleRate: session.sampleRate,
@@ -1107,23 +1114,36 @@ class _PlayerScreenState extends State<PlayerScreen>
             );
 
       final sessions = List<RavenAudioSession>.of(_project.sessions);
+      var newActiveIndex = _activeIndex;
       if (result.replacedOriginal) {
         sessions[index] = trimmedSession;
+      } else {
+        sessions.insert(index + 1, trimmedSession);
+        if (_activeIndex > index) {
+          newActiveIndex = _activeIndex + 1;
+        }
+      }
+
+      final updated = _project.copyWith(
+        sessions: sessions,
+        clearMasterAudioPath: true,
+      );
+
+      await _saveProject(updated);
+      if (!mounted) return;
+      if (newActiveIndex != _activeIndex) {
+        setState(() => _activeIndex = newActiveIndex);
+      }
+
+      if (result.replacedOriginal) {
         try {
           final old = File(session.audioPath);
           if (await old.exists() && old.path != result.file.path) {
             await old.delete();
           }
         } catch (_) {}
-      } else {
-        // Keep the original untouched and add the trimmed copy as a new take.
-        sessions.insert(index + 1, trimmedSession);
       }
 
-      await _saveProject(_project.copyWith(
-        sessions: sessions,
-        clearMasterAudioPath: true,
-      ));
       messenger?.showSnackBar(SnackBar(
         content: Text(tr(
           widget.preferences,
@@ -1235,37 +1255,47 @@ class _PlayerScreenState extends State<PlayerScreen>
     controller.dispose();
     if (name == null || name.trim().isEmpty || !mounted) return;
     final trimmed = name.trim();
+    if (trimmed == session.name.trim()) return;
+
     final messenger = ScaffoldMessenger.of(context);
     try {
-      var project = _project;
-      // Rename the physical audio file on disk first (fails soft if the file
-      // is missing or locked), then update the record with the new name + path.
-      if (trimmed != session.name.trim()) {
-        project = await widget.repository
-            .renameSessionFile(_project, session, trimmed);
-      }
+      final beforePath = _project.sessions
+          .firstWhere((s) => s.id == session.id, orElse: () => session)
+          .audioPath;
+      var project =
+          await widget.repository.renameSessionFile(_project, session, trimmed);
+      final afterPath = project.sessions
+          .firstWhere((s) => s.id == session.id, orElse: () => session)
+          .audioPath;
+      final fileRenamed = beforePath != afterPath;
+
       final sessions = List<RavenAudioSession>.of(project.sessions);
-      sessions[index] = session.copyWith(
-        name: trimmed,
-        audioPath: project.sessions.firstWhere((s) => s.id == session.id).audioPath,
-      );
+      final targetIdx = sessions.indexWhere((s) => s.id == session.id);
+      if (targetIdx < 0) return;
+      sessions[targetIdx] = sessions[targetIdx].copyWith(name: trimmed);
+
       final validIds = sessions.map((s) => s.id).toSet();
       final bookmarks = project.bookmarks
           .where((b) => b.sessionId.isEmpty || validIds.contains(b.sessionId))
           .toList();
+
       await _saveProject(
           project.copyWith(sessions: sessions, bookmarks: bookmarks));
       if (!mounted) return;
       messenger.showSnackBar(SnackBar(
         content: Text(tr(
           widget.preferences,
-          'Take renamed, including its audio file on disk.',
-          'Prise renommée, y compris son fichier audio sur le disque.',
+          fileRenamed
+              ? 'Take renamed, including its audio file on disk.'
+              : 'Take renamed (the audio file could not be moved on disk).',
+          fileRenamed
+              ? 'Prise renommée, y compris son fichier audio sur le disque.'
+              : 'Prise renommée (le fichier audio n’a pas pu être déplacé sur le disque).',
         )),
       ));
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      messenger.showSnackBar(SnackBar(
         content: Text('Could not rename recording session: $error'),
       ));
     }
@@ -1856,8 +1886,6 @@ class _PlayerScreenState extends State<PlayerScreen>
     final messenger = ScaffoldMessenger.of(context);
     try {
       await _player.stop();
-      // Rename the physical folder + rewrite audio/master paths; the returned
-      // record already points at the new locations.
       final updated =
           await widget.repository.renameProject(_project, trimmed);
       await _saveProject(updated);
@@ -1883,9 +1911,6 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
-  /// Reads duration from a recovered draft's file WITHOUT touching the global
-  /// player (which would briefly show stale data in the notification).
-  /// Recovered drafts are always PCM16 WAV because the recorder captures WAV.
   Future<int> _measureSessionDuration(RavenAudioSession selected) async {
     final original = File(selected.audioPath);
     if (!await original.exists()) {
@@ -1919,10 +1944,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (temporaryPlaintext != null && await temporaryPlaintext.exists()) {
         try {
           await temporaryPlaintext.delete();
-        } on FileSystemException {
-          // Best-effort: the encryption service cleans stale probe files
-          // on next app launch if this delete fails.
-        }
+        } on FileSystemException {}
       }
     }
   }
@@ -2350,11 +2372,6 @@ class _PlayerScreenState extends State<PlayerScreen>
     widget.onProjectChanged(updated);
   }
 
-  // ---------------------------------------------------------------------------
-  // Amplify (project player)
-  // ---------------------------------------------------------------------------
-
-  /// Container extension matching [session]'s format; used for boost output.
   String _boostExt(String format) => switch (format.toLowerCase()) {
         'wav' => 'wav',
         'flac' => 'flac',
@@ -2362,8 +2379,6 @@ class _PlayerScreenState extends State<PlayerScreen>
         _ => 'm4a',
       };
 
-  /// Codec arguments for the FFmpeg amplify pass at the take's own bitrate, so
-  /// committing an amplified take never changes its quality tier.
   String _boostCodec(String ext, int bitRate) {
     final clamped = bitRate.clamp(64000, 320000);
     return switch (ext) {
@@ -2382,13 +2397,9 @@ class _PlayerScreenState extends State<PlayerScreen>
     try {
       final file = File(path);
       if (await file.exists()) await file.delete();
-    } catch (_) {
-      // Temp cache cleanup is best-effort.
-    }
+    } catch (_) {}
   }
 
-  /// Renders a volume-boosted copy of the ACTIVE take into the temp cache and
-  /// plays it. Level 1.0 restores the original, unmodified audio.
   Future<void> _applyBoost(double level) async {
     if (_boostProcessing || _savingAmplified) return;
     final session = _session;
@@ -2496,8 +2507,6 @@ class _PlayerScreenState extends State<PlayerScreen>
         });
       }
     } catch (error) {
-      // Restore the untouched original so a failed boost never leaves the
-      // player pointing at a temp file that is about to be deleted.
       try {
         await _loadSessionForPlayback(session, boosted: false);
       } catch (_) {}
@@ -2524,8 +2533,6 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
-  /// Loads [session] into the shared player, optionally from an explicit
-  /// [path] (a temp amplified copy) instead of its committed audio file.
   Future<void> _loadSessionForPlayback(RavenAudioSession session,
       {required bool boosted, String? path}) async {
     final playbackPath = path ?? session.audioPath;
@@ -2547,8 +2554,6 @@ class _PlayerScreenState extends State<PlayerScreen>
         .timeout(const Duration(seconds: 15));
   }
 
-  /// Commits the amplified render as the active take's audio. The original file
-  /// is deleted only after the project record is durably updated.
   Future<void> _saveAmplifiedTake() async {
     if (_savingAmplified || _boostProcessing) return;
     final boostedPath = _boostedPath;
@@ -2565,7 +2570,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     final ext = _boostExt(session.format);
     final stamp = DateTime.now().millisecondsSinceEpoch;
     File? committed;
-    var updatedProject = _project;
+    final oldProject = _project;
 
     try {
       await _player.pause();
@@ -2575,7 +2580,6 @@ class _PlayerScreenState extends State<PlayerScreen>
         throw StateError('The amplified audio is no longer available.');
       }
 
-      // Write the result beside the take so it lives in the project folder.
       final originalFile = File(oldPath);
       final parent = originalFile.parent;
       await parent.create(recursive: true);
@@ -2596,9 +2600,7 @@ class _PlayerScreenState extends State<PlayerScreen>
           } finally {
             await probe.dispose();
           }
-        } catch (_) {
-          // Duration stays unknown; playback still reports the real length.
-        }
+        } catch (_) {}
       }
 
       final updatedSession = session.copyWith(
@@ -2608,10 +2610,9 @@ class _PlayerScreenState extends State<PlayerScreen>
       );
       final sessions = List<RavenAudioSession>.of(_project.sessions);
       sessions[index] = updatedSession;
-      updatedProject = _project.copyWith(
+      final updatedProject = _project.copyWith(
         sessions: sessions,
         updatedAt: DateTime.now(),
-        // A committed re-encode invalidates any cached merged master.
         clearMasterAudioPath: true,
       );
 
@@ -2626,7 +2627,6 @@ class _PlayerScreenState extends State<PlayerScreen>
       } catch (_) {}
       await _loadSessionForPlayback(updatedSession, boosted: false);
 
-      // Old audio and the temp render are dead weight once the swap is committed.
       try {
         final old = File(oldPath);
         if (old.path != target.path && await old.exists()) await old.delete();
@@ -2646,10 +2646,9 @@ class _PlayerScreenState extends State<PlayerScreen>
         ));
       }
     } catch (error) {
-      // Only remove the new file if the project record never committed.
       final created = committed;
       if (created != null &&
-          !updatedProject.sessions.any((s) => s.audioPath == created.path)) {
+          !oldProject.sessions.any((s) => s.audioPath == created.path)) {
         try {
           if (await created.exists()) await created.delete();
         } catch (_) {}
@@ -2667,9 +2666,6 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
-  /// Opens the amplify sheet: a level slider, a live preview, and the save
-  /// action. Previewing swaps only the temp render; nothing is committed until
-  /// the user taps Save.
   Future<void> _showAmplifySheet() async {
     if (!_canAmplify) return;
     final session = _session;
@@ -2798,9 +2794,11 @@ class _PlayerScreenState extends State<PlayerScreen>
   Future<void> _toggleProjectPin() async {
     final messenger = ScaffoldMessenger.of(context);
     if (_loading) return;
-    if (!_project.requiresAppPin &&
+    final enabling = !_project.requiresAppPin;
+
+    if (enabling &&
         (_project.hasPublicFolder || _project.hasPublicCopy)) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      messenger.showSnackBar(SnackBar(
           content: Text(tr(
         widget.preferences,
         'Make this project private first. Public copies can be opened outside RAVEN.',
@@ -2808,8 +2806,8 @@ class _PlayerScreenState extends State<PlayerScreen>
       ))));
       return;
     }
-    if (!_project.requiresAppPin && !widget.preferences.appLockEnabled) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+    if (enabling && !widget.preferences.appLockEnabled) {
+      messenger.showSnackBar(SnackBar(
         content: Text(tr(
             widget.preferences,
             'First enable the RAVEN PIN in Settings. Then you can lock individual recordings.',
@@ -2818,16 +2816,15 @@ class _PlayerScreenState extends State<PlayerScreen>
       return;
     }
     try {
-      await _saveProject(
-          _project.copyWith(requiresAppPin: !_project.requiresAppPin));
+      await _saveProject(_project.copyWith(requiresAppPin: enabling));
       if (!mounted) return;
       messenger.showSnackBar(SnackBar(
         content: Text(tr(
             widget.preferences,
-            _project.requiresAppPin
+            enabling
                 ? 'This recording now requires your RAVEN PIN.'
                 : 'PIN requirement removed for this recording.',
-            _project.requiresAppPin
+            enabling
                 ? 'Cet enregistrement nécessite maintenant votre code PIN RAVEN.'
                 : 'Le code PIN n’est plus requis pour cet enregistrement.')),
       ));
@@ -2842,7 +2839,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     final messenger = ScaffoldMessenger.of(context);
     if (_loading) return;
     if (_project.sessions.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      messenger.showSnackBar(SnackBar(
           content: Text(tr(
               widget.preferences,
               'There is no saved audio to show in device folders yet.',
@@ -2901,10 +2898,7 @@ class _PlayerScreenState extends State<PlayerScreen>
           AudioVisibilityService.isContentUri(legacyFolder)) {
         try {
           await AudioVisibilityService().removeFolder(legacyFolder);
-        } catch (_) {
-          // Legacy content:// folders are orphaned at worst; the real
-          // audio lives in the private canonical folder and remains safe.
-        }
+        } catch (_) {}
         final cleared = _project.copyWith(clearPublicFolderLocation: true);
         await _saveProject(cleared);
       }
@@ -2912,9 +2906,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (!enabling && legacyCopy != null) {
         try {
           await AudioVisibilityService().remove(legacyCopy);
-        } catch (_) {
-          // Best-effort: an orphaned public file is disk waste, not loss.
-        }
+        } catch (_) {}
         await _saveProject(_project.copyWith(clearPublicCopyLocation: true));
       }
 
@@ -4233,6 +4225,11 @@ class _PlayerScreenState extends State<PlayerScreen>
                       child: ListView(
                         children: <Widget>[
                           _buildWorkspaceHeader(theme),
+                          const SizedBox(height: 12),
+                          EncodingStatusBanner(
+                            projectId: _project.id,
+                            isFrench: widget.preferences.isFrench,
+                          ),
                           const SizedBox(height: 16),
                           _buildHeroAudioConsole(theme),
                         ],
@@ -4283,6 +4280,11 @@ class _PlayerScreenState extends State<PlayerScreen>
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: <Widget>[
                         _buildWorkspaceHeader(theme),
+                        const SizedBox(height: 12),
+                        EncodingStatusBanner(
+                          projectId: _project.id,
+                          isFrench: widget.preferences.isFrench,
+                        ),
                         const SizedBox(height: 14),
                         _buildHeroAudioConsole(theme),
                       ],
@@ -4312,7 +4314,6 @@ class _PlayerScreenState extends State<PlayerScreen>
       ),
     );
   }
-
 
   PopupMenuItem<String> _projectMenuItem(
     String value,

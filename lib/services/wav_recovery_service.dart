@@ -3,6 +3,11 @@ import 'dart:io';
 import 'dart:typed_data';
 
 /// Repairs the header of a RAVEN PCM16 WAV source after process interruption.
+///
+/// Non-destructive: writes to a temp file and atomically replaces the
+/// original, so a mid-repair crash can never leave a corrupt file behind.
+/// Streams the audio data in 64 KB chunks, so it is memory-safe on very long
+/// recordings.
 class WavRecoveryService {
   Future<int?> repairPcm16File(
     File file, {
@@ -37,14 +42,44 @@ class WavRecoveryService {
     view.setRange(36, 40, ascii.encode('data'));
     header.setUint32(40, dataLength, Endian.little);
 
-    final handle = await file.open(mode: FileMode.writeOnly);
+    final tempFile = File('${file.path}.repair.tmp');
+    if (await tempFile.exists()) {
+      try {
+        await tempFile.delete();
+      } catch (_) {
+        // Stale temp from a previous run — ignore.
+      }
+    }
+
+    final source = await file.open(mode: FileMode.read);
+    final sink = tempFile.openWrite();
     try {
-      await handle.setPosition(0);
-      await handle.writeFrom(view);
-      await handle.truncate(headerLength + dataLength);
-      await handle.flush();
+      await source.setPosition(headerLength);
+      sink.add(view);
+      final buffer = Uint8List(64 * 1024);
+      var remaining = dataLength;
+      while (remaining > 0) {
+        final toRead = remaining < buffer.length ? remaining : buffer.length;
+        final read = await source.readInto(buffer, 0, toRead);
+        if (read == 0) break;
+        sink.add(Uint8List.sublistView(buffer, 0, read));
+        remaining -= read;
+      }
     } finally {
-      await handle.close();
+      await source.close();
+      await sink.close();
+    }
+
+    try {
+      await file.delete();
+      await tempFile.rename(file.path);
+    } catch (_) {
+      try {
+        if (await tempFile.exists()) await tempFile.delete();
+      } catch (_) {
+        // Best-effort cleanup.
+      }
+      rethrow;
     }
 
     return (dataLength * 1000) ~/ (rate * frameSize);

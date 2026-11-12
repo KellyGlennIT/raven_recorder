@@ -1,55 +1,26 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_session.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/statistics.dart';
 
 import 'background_encode_service.dart';
 
-/// A user-selected keep region on the recording timeline, in milliseconds of
-/// the source audio. [endMs] is exclusive (matches FFmpeg's `-to` semantics),
-/// so adjacent regions never overlap and no audio is kept twice.
 class TrimRegion {
   const TrimRegion({required this.startMs, required this.endMs});
-
   final int startMs;
   final int endMs;
-
   int get durationMs => endMs - startMs;
 }
 
-/// Result of a trim operation.
 class TrimResult {
-  const TrimResult({
-    required this.outputFile,
-    required this.durationMs,
-  });
-
-  /// The trimmed audio, in the SAME format/bitrate/sample-rate as the input.
+  const TrimResult({required this.outputFile, required this.durationMs});
   final File outputFile;
-
-  /// Measured duration of the output in milliseconds.
   final int durationMs;
 }
 
-/// Trims recordings with FFmpeg while preserving the exact container, codec
-/// tier, and sample rate of the source file.
-///
-/// Design points:
-///
-/// - **Any number of regions anywhere on the timeline.** Each keep-region is
-///   rendered as one segment; segments are joined losslessly in source order.
-///   Overlapping/touching regions are merged first so the command stays
-///   minimal and the result is continuous audio.
-/// - **Format preservation.** Output uses the source's extension and the same
-///   codec arguments RAVEN uses for that format (pcm_s16le / flac /
-///   libmp3lame@bitrate / aac@bitrate) plus the source sample rate. An M4A
-///   stays M4A, a WAV stays WAV, at the same quality tier.
-/// - **Serialization.** Trims and background encodes share one mutex, so a
-///   trim never races a pending transcode on the same library.
-/// - **Never destructive by default.** The service writes to a caller-supplied
-///   output path. Replacing the session file and deleting the original is the
-///   CALLER's decision — the UI always asks.
 class AudioTrimService {
   AudioTrimService._();
   static final AudioTrimService instance = AudioTrimService._();
@@ -58,7 +29,10 @@ class AudioTrimService {
   void _unlock() => BackgroundEncodeService.instance.releaseMutex();
 
   /// Trims [source] to the union of [regions], writing the result to
-  /// [outputPath] (the extension of [format] is appended when missing).
+  /// [outputPath]. Preserves the source's codec tier and sample rate.
+  ///
+  /// [onProgress] fires in `[0.0, 1.0]` roughly 4–8 times per second with a
+  /// short stage description suitable for a UI label.
   Future<TrimResult> trim({
     required File source,
     required String outputPath,
@@ -67,21 +41,19 @@ class AudioTrimService {
     required List<TrimRegion> regions,
     int bitRate = 128000,
     int sampleRate = 44100,
+    void Function(double progress, String stage)? onProgress,
   }) async {
     if (regions.isEmpty) {
       throw ArgumentError('At least one keep-region is required.');
     }
     if (!await source.exists()) {
-      throw FileSystemException(
-          'The recording to trim is missing.', source.path);
+      throw FileSystemException('The recording to trim is missing.', source.path);
     }
     if (source.path == outputPath) {
-      throw ArgumentError(
-          'The trim output must not overwrite the source in place.');
+      throw ArgumentError('The trim output must not overwrite the source.');
     }
 
     await _lock();
-    // The remainder runs inside the shared mutex; see finally below.
     try {
       final keep = _mergeRegions(regions, totalDurationMs);
       if (keep.isEmpty) {
@@ -96,101 +68,54 @@ class AudioTrimService {
       if (await output.exists()) {
         try {
           await output.delete();
-        } catch (_) {}
+        } catch (_) {
+          // Best-effort cleanup of a stale output.
+        }
       }
 
       final workDir = output.parent;
       final stamp = DateTime.now().microsecondsSinceEpoch;
-      final scratchPrefix = '${workDir.path}/.raven-trim-$stamp';
-      final scratchFiles = <String>[];
+      final tempPath = '${workDir.path}/.raven-trim-$stamp.$ext';
 
       try {
         final codecArgs = _codecArgs(ext, bitRate);
         final rate = sampleRate.clamp(16000, 48000);
+        final command = _buildCommand(
+          source: source,
+          outputPath: tempPath,
+          regions: keep,
+          codecArgs: codecArgs,
+          sampleRate: rate,
+        );
 
-        if (keep.length == 1) {
-          // Single region: one render, no concat step.
-          final region = keep.first;
-          scratchFiles.add(effectiveOutput);
-          final command = '-hide_banner -nostdin -y '
-              '-ss ${_seconds(region.startMs)} -i "${source.path}" '
-              '-t ${_seconds(region.durationMs)} '
-              '-vn -ar $rate -ac 1 $codecArgs '
-              '"${effectiveOutput}_trim.tmp.$ext"';
-          if (!await _execute(command)) {
-            throw StateError('FFmpeg failed to cut the selected region.');
-          }
-          final tmp = File('${effectiveOutput}_trim.tmp.$ext');
-          if (!await tmp.exists() || await tmp.length() < 64) {
-            throw StateError('FFmpeg produced an empty trimmed output.');
-          }
-          await tmp.rename(effectiveOutput);
-          scratchFiles.removeLast();
-        } else {
-          // Multiple regions: render each segment, then join with the concat
-          // demuxer (stream copy, lossless join).
-          final segmentPaths = <String>[];
-          for (var i = 0; i < keep.length; i++) {
-            final region = keep[i];
-            final segPath = '$scratchPrefix.seg$i.$ext';
-            scratchFiles.add(segPath);
-            final command = '-hide_banner -nostdin -y '
-                '-ss ${_seconds(region.startMs)} -i "${source.path}" '
-                '-t ${_seconds(region.durationMs)} '
-                '-vn -ar $rate -ac 1 $codecArgs "$segPath"';
-            if (!await _execute(command)) {
-              throw StateError(
-                  'FFmpeg failed cutting segment ${i + 1} of ${keep.length}.');
-            }
-            final segFile = File(segPath);
-            if (!await segFile.exists() || await segFile.length() < 64) {
-              throw StateError(
-                  'FFmpeg produced an empty segment ${i + 1}/${keep.length}.');
-            }
-            segmentPaths.add(segPath);
-          }
-
-          final listPath = '$scratchPrefix.concat.txt';
-          scratchFiles.add(listPath);
-          final listBuffer = StringBuffer();
-          for (final seg in segmentPaths) {
-            final name = seg.split(RegExp(r'[\\/]')).last;
-            listBuffer.writeln("file '${_escapeConcat(name)}'");
-          }
-          await File(listPath).writeAsString(listBuffer.toString(),
-              flush: true);
-
-          final joinedTmp = '${effectiveOutput}_trim.tmp.$ext';
-          scratchFiles.add(joinedTmp);
-          final concatCommand = '-hide_banner -nostdin -y '
-              '-f concat -safe 0 -i "$listPath" -c copy "$joinedTmp"';
-          if (!await _execute(concatCommand)) {
-            throw StateError('FFmpeg failed joining the trimmed segments.');
-          }
-          final joined = File(joinedTmp);
-          if (!await joined.exists() || await joined.length() < 64) {
-            throw StateError('FFmpeg produced an empty trimmed output.');
-          }
-          await joined.rename(effectiveOutput);
-          scratchFiles.remove(joinedTmp);
+        final totalMs = keep.fold<int>(0, (s, r) => s + r.durationMs);
+        final success = await _executeWithProgress(
+          command,
+          totalMs: totalMs,
+          onProgress: onProgress,
+        );
+        if (!success) {
+          throw StateError('FFmpeg failed to render the trimmed audio.');
         }
 
-        if (!await output.exists() || await output.length() < 64) {
-          throw StateError('FFmpeg produced no usable trimmed output.');
+        final tmp = File(tempPath);
+        if (!await tmp.exists() || await tmp.length() < 128) {
+          throw StateError('FFmpeg produced an empty trimmed output.');
         }
-        // The output duration is exact by construction: every segment was
-        // re-encoded with an explicit -t from the merged region math.
-        var expected = 0;
-        for (final region in keep) {
-          expected += region.durationMs;
+        await tmp.rename(effectiveOutput);
+
+        if (!await output.exists() || await output.length() < 128) {
+          throw StateError('Trimmed audio failed verification.');
         }
-        if (expected <= 0) {
-          throw StateError('The trimmed selection is empty.');
-        }
-        return TrimResult(outputFile: output, durationMs: expected);
+
+        onProgress?.call(1.0, 'Done');
+        return TrimResult(outputFile: output, durationMs: totalMs);
       } finally {
-        for (final path in scratchFiles) {
-          _deleteQuietly(path);
+        try {
+          final tmp = File(tempPath);
+          if (await tmp.exists()) await tmp.delete();
+        } on FileSystemException {
+          // Best-effort cleanup.
         }
       }
     } finally {
@@ -198,8 +123,77 @@ class AudioTrimService {
     }
   }
 
-  /// Normalizes and merges keep-regions: clamps to [totalMs], drops empty and
-  /// negative spans, sorts them, and coalesces overlapping/touching ones.
+  String _buildCommand({
+    required File source,
+    required String outputPath,
+    required List<TrimRegion> regions,
+    required String codecArgs,
+    required int sampleRate,
+  }) {
+    if (regions.length == 1) {
+      final r = regions.first;
+      return '-hide_banner -nostdin -y -i "${source.path}" '
+          '-ss ${_sec(r.startMs)} -t ${_sec(r.durationMs)} '
+          '-vn -ar $sampleRate -ac 1 $codecArgs "$outputPath"';
+    }
+
+    // Multiple regions: build a filter graph that atrims each segment and
+    // concatenates them. Single FFmpeg invocation, no temp files.
+    final buffer = StringBuffer();
+    for (var i = 0; i < regions.length; i++) {
+      final r = regions[i];
+      if (i > 0) buffer.write(';');
+      buffer.write(
+        '[0:a]atrim=start=${_sec(r.startMs)}:end=${_sec(r.endMs)},'
+        'asetpts=PTS-STARTPTS[a${i + 1}]',
+      );
+    }
+    final concatInputs =
+        List<String>.generate(regions.length, (i) => '[a${i + 1}]').join();
+    buffer.write(
+      ';${concatInputs}concat=n=${regions.length}:v=0:a=1[out]',
+    );
+    return '-hide_banner -nostdin -y -i "${source.path}" '
+        '-filter_complex "${buffer.toString()}" '
+        '-map "[out]" -vn -ar $sampleRate -ac 1 $codecArgs "$outputPath"';
+  }
+
+  Future<bool> _executeWithProgress(
+    String command, {
+    required int totalMs,
+    void Function(double progress, String stage)? onProgress,
+  }) async {
+    final completer = Completer<FFmpegSession>();
+    try {
+      await FFmpegKit.executeAsync(
+        command,
+        (FFmpegSession session) {
+          if (!completer.isCompleted) completer.complete(session);
+        },
+        null,
+        totalMs > 0
+            ? (Statistics stats) {
+                final encodedMs = stats.getTime();
+                if (encodedMs > 0) {
+                  onProgress?.call(
+                    (encodedMs / totalMs).clamp(0.0, 1.0).toDouble(),
+                    'Trimming',
+                  );
+                }
+              }
+            : null,
+      );
+    } catch (error) {
+      throw StateError(
+          'FFmpeg native library did not load ($error). '
+          'Run "flutter clean" and rebuild.');
+    }
+
+    final session = await completer.future;
+    final code = await session.getReturnCode();
+    return code != null && ReturnCode.isSuccess(code);
+  }
+
   List<TrimRegion> _mergeRegions(List<TrimRegion> input, int totalMs) {
     final maxMs = totalMs > 0 ? totalMs : 0;
     final sorted = input
@@ -232,29 +226,6 @@ class AudioTrimService {
     return merged;
   }
 
-  /// Runs one FFmpeg command; returns true only on a clean success code.
-  Future<bool> _execute(String command) async {
-    final FFmpegSession session;
-    try {
-      session = await FFmpegKit.execute(command);
-    } catch (error) {
-      throw StateError(
-          'FFmpeg native library did not load ($error). '
-          'Run "flutter clean" and rebuild.');
-    }
-    final code = await session.getReturnCode();
-    if (code != null && ReturnCode.isSuccess(code)) return true;
-    if (command.contains('-c:a libmp3lame')) {
-      final fallback = command.replaceFirst('-c:a libmp3lame', '-c:a mp3');
-      try {
-        final fallbackSession = await FFmpegKit.execute(fallback);
-        final fallbackCode = await fallbackSession.getReturnCode();
-        return fallbackCode != null && ReturnCode.isSuccess(fallbackCode);
-      } catch (_) {}
-    }
-    return false;
-  }
-
   String _codecArgs(String ext, int bitRate) {
     final clamped = bitRate.clamp(64000, 320000);
     return switch (ext) {
@@ -272,15 +243,5 @@ class AudioTrimService {
         _ => 'm4a',
       };
 
-  String _seconds(int ms) => (ms / 1000).toStringAsFixed(3);
-
-  String _escapeConcat(String name) =>
-      name.replaceAll("'", r"'\''").replaceAll('\\', r'\\');
-
-  void _deleteQuietly(String path) {
-    try {
-      final f = File(path);
-      if (f.existsSync()) f.deleteSync();
-    } catch (_) {}
-  }
+  String _sec(int ms) => (ms / 1000).toStringAsFixed(3);
 }
