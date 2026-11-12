@@ -257,7 +257,8 @@ class ProjectRepository {
         await _moveDirectory(oldFolder, newFolder);
       }
     } else {
-      await _createEmptyProjectTree(newFolder);
+      await _createEmptyProjectTree(newFolder,
+          isStandalone: project.isStandalone);
     }
 
     // Rewrite session audio paths inside the moved folder.

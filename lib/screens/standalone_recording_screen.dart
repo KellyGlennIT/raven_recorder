@@ -657,11 +657,11 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
                 child: Text(tr(
                   widget.preferences,
                   _publicCopyLocation == null
-                      ? 'Make project public'
-                      : 'Make project private',
+                      ? 'Make recording public'
+                      : 'Make recording private',
                   _publicCopyLocation == null
-                      ? 'Rendre le projet public'
-                      : 'Rendre le projet privé',
+                      ? 'Rendre l’enregistrement public'
+                      : 'Rendre l’enregistrement privé',
                 )),
               ),
               PopupMenuItem<String>(
