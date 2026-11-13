@@ -352,6 +352,7 @@ void main() {
           theme: ThemeData(useMaterial3: true),
           home: Scaffold(
             body: SettingsScreen(
+              repository: FakeProjectRepository(),
               preferences: AppPreferences(),
               onSettingsChanged: () {},
               onShowTour: () {},

@@ -46,6 +46,10 @@ class ProjectRepository {
     await Directory('${ravenDirectory.path}/categories')
         .create(recursive: true);
     await repository.load();
+    
+    // NEW: Clean up any temporary files left behind by crashes
+    await repository._cleanupOrphans();
+    
     return repository;
   }
 
@@ -507,7 +511,40 @@ class ProjectRepository {
       }
     }
   }
+  /// Scans the entire RAVEN directory (private and public) and removes
+  /// temporary files left behind by interrupted background encodes,
+  /// merges, trims, or failed saves.
+  Future<void> _cleanupOrphans() async {
+    try {
+      final dirsToScan = <Directory>[
+        _rootDirectory,
+        projectsDirectory,
+      ];
 
+      for (final dir in dirsToScan) {
+        if (!await dir.exists()) continue;
+        
+        await for (final entity in dir.list(recursive: true, followLinks: false)) {
+          if (entity is File) {
+            final name = entity.path.toLowerCase();
+            // We only delete files with our specific temp extensions.
+            if (name.endsWith('.tmp') ||
+                name.endsWith('.pending') ||
+                name.endsWith('.merging') ||
+                name.endsWith('.repair.tmp')) {
+              try {
+                await entity.delete();
+              } on FileSystemException {
+                // Best-effort: if the file is locked by the OS, skip it.
+              }
+            }
+          }
+        }
+      }
+    } catch (_) {
+      // Never crash the app just because cleanup failed.
+    }
+  }
   Future<void> _loadCategories() async {
     _categories
       ..clear()

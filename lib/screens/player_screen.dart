@@ -18,6 +18,7 @@ import '../services/attachment_service.dart';
 import '../services/project_archive_service.dart';
 import '../services/audio_encryption_service.dart';
 import '../services/audio_merge_service.dart';
+import '../services/audio_clean_service.dart';
 import '../services/project_repository.dart';
 import '../services/ai_provider_service.dart';
 import '../services/ai_key_vault.dart';
@@ -26,6 +27,7 @@ import '../services/audio_share_service.dart';
 import '../services/audio_protection_service.dart';
 import '../services/document_export_service.dart';
 import '../services/playback_service.dart';
+import '../services/waveform_service.dart';
 import '../widgets/audio_password_dialog.dart';
 import '../widgets/encoding_status_widgets.dart';
 import '../widgets/trim_editor.dart';
@@ -62,6 +64,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   SecretKey? _audioKey;
   String? _error;
   String? _securityWarning;
+  File? _waveformFile;
 
   List<File> _attachments = const <File>[];
 
@@ -69,6 +72,7 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   bool _boostProcessing = false;
   bool _savingAmplified = false;
+  double? _cleanProgress;
   double _volumeBoost = 1.0;
   String? _boostedPath;
   String? _boostedSessionId;
@@ -242,7 +246,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       widget.onProjectChanged(updated);
       await _loadSelectedSession();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      messenger.showSnackBar(SnackBar(
         content: Text(tr(
           widget.preferences,
           enabling
@@ -255,7 +259,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       ));
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      messenger.showSnackBar(SnackBar(
         content: Text(
             '${tr(widget.preferences, 'Could not change audio encryption', 'Impossible de modifier le chiffrement audio')}: $error'),
       ));
@@ -271,11 +275,13 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (salt == null) return null;
     while (mounted) {
       final password = await showAudioPasswordDialog(
+        // ignore: use_build_context_synchronously
         context,
         preferences: widget.preferences,
         createPassword: false,
       );
-      if (password == null || !mounted) return null;
+      if (password == null) return null;
+      if (!mounted) return null;
       final key = await _encryption.derivePasswordKey(password, salt);
       final session = _project.sessions.first;
       final source = File(session.audioPath);
@@ -299,6 +305,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         if (await temporary.exists()) await temporary.delete();
       }
     }
+
     return null;
   }
 
@@ -318,7 +325,6 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Future<bool> _loadSelectedSession() async {
-    // Refresh from repository in case the background encoder swapped the file
     final latest = widget.repository.projectById(_project.id);
     if (latest != null) _project = latest;
 
@@ -327,6 +333,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         _loading = true;
         _error = null;
         _securityWarning = null;
+        _waveformFile = null; // Reset waveform when loading a new session
       });
     }
     var loaded = false;
@@ -341,14 +348,14 @@ class _PlayerScreenState extends State<PlayerScreen>
 
       if (_project.isAudioProtected && _project.audioProtectionSalt != null) {
         _audioKey ??= await _requestAudioKey();
-        if (_audioKey == null) {
-          _error = tr(
-            widget.preferences,
-            'Enter the audio password to play this recording.',
-            'Saisissez le mot de passe audio pour lire cet enregistrement.',
-          );
-          return false;
-        }
+      }
+      if (_project.isAudioProtected && _audioKey == null) {
+        _error = tr(
+          widget.preferences,
+          'Enter the audio password to play this recording.',
+          'Saisissez le mot de passe audio pour lire cet enregistrement.',
+        );
+        return false;
       }
 
       final cache = await getTemporaryDirectory();
@@ -378,6 +385,12 @@ class _PlayerScreenState extends State<PlayerScreen>
             'This project has no audio session yet.',
             'Ce projet ne contient pas encore de session audio.');
         return false;
+      }
+
+      if (!_project.isAudioProtected) {
+        WaveformService.instance.getWaveform(File(selected.audioPath)).then((f) {
+          if (mounted) setState(() => _waveformFile = f);
+        });
       }
 
       final useMaster = masterPath != null &&
@@ -425,8 +438,13 @@ class _PlayerScreenState extends State<PlayerScreen>
           final temp = File(
               '${cache.path}/raven-playback-${_project.id}-${selected.id}.$extension');
           if (await temp.exists()) await temp.delete();
+          final audioKey = _audioKey;
+          if (audioKey == null) {
+            throw StateError(
+                'Enter the audio password to play this recording.');
+          }
           await _encryption.decryptFile(
-              input: source, output: temp, key: _audioKey);
+              input: source, output: temp, key: audioKey);
           PlaybackService().registerTemp(temp.path);
           playbackPath = temp.path;
         }
@@ -1025,6 +1043,8 @@ class _PlayerScreenState extends State<PlayerScreen>
         await _renameSession(session, index);
       case 'trim':
         await _trimSession(session, index);
+      case 'clean':
+        await _cleanAudio(session, index);
       case 'delete':
         await _deleteSession(session, index);
     }
@@ -1043,8 +1063,6 @@ class _PlayerScreenState extends State<PlayerScreen>
       return;
     }
 
-    // Imported or exotic sessions sometimes have durationMs == 0 because
-    // just_audio could not decode them. Probe via FFmpeg now.
     var effectiveDurationMs = session.durationMs > 0
         ? session.durationMs
         : await AudioMergeService().probeDurationMs(source);
@@ -1165,6 +1183,126 @@ class _PlayerScreenState extends State<PlayerScreen>
         content: Text(
             '${tr(widget.preferences, 'Could not save the trim', 'Impossible d’enregistrer le rognage')}: $error'),
       ));
+    }
+  }
+
+  Future<void> _cleanAudio(RavenAudioSession session, int index) async {
+    if (_project.isAudioProtected || _loading) return;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+
+    final source = File(session.audioPath);
+    if (!await source.exists()) {
+      messenger?.showSnackBar(SnackBar(
+        content: Text(tr(widget.preferences, 'The recording file is missing.',
+            'Le fichier audio est absent.')),
+      ));
+      return;
+    }
+    if (!mounted) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        icon: const Icon(Icons.auto_fix_high_rounded),
+        title: Text(tr(
+            widget.preferences, 'Clean audio?', 'Nettoyer l’audio ?')),
+        content: Text(tr(
+          widget.preferences,
+          'This removes background hum and hiss with an FFT noise filter. A cleaned copy replaces the original take; the previous file is deleted.',
+          'Cela supprime le bruit de fond et le souffle avec un filtre FFT. Une copie nettoyée remplace la prise d’origine ; l’ancien fichier est supprimé.',
+        )),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(tr(widget.preferences, 'Cancel', 'Annuler')),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(tr(widget.preferences, 'Clean', 'Nettoyer')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    final ext = session.format.isEmpty
+        ? source.path.split('.').last.toLowerCase()
+        : session.format.toLowerCase();
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final base = source.path.split(RegExp(r'[\\/]')).last;
+    final stem = base.contains('.')
+        ? base.substring(0, base.lastIndexOf('.'))
+        : base;
+    final targetPath =
+        '${source.parent.path}/$stem-cleaned-$stamp.$ext';
+
+    setState(() {
+      _loading = true;
+      _cleanProgress = 0.0;
+    });
+
+    try {
+      final result = await AudioCleanService.instance.cleanAudio(
+        input: source,
+        outputPath: targetPath,
+        format: ext,
+        bitRate: session.bitRate,
+        sampleRate: session.sampleRate > 0 ? session.sampleRate : 44100,
+        durationMs: session.durationMs,
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() => _cleanProgress = p);
+        },
+      );
+
+      final cleaned = session.copyWith(
+        audioPath: result.path,
+        format: ext,
+        recoverablePcm16: false,
+      );
+      final sessions = List<RavenAudioSession>.of(_project.sessions);
+      final position = sessions.indexWhere((s) => s.id == session.id);
+      if (position < 0) {
+        sessions[index] = cleaned;
+      } else {
+        sessions[position] = cleaned;
+      }
+
+      final updated = _project.copyWith(
+        sessions: sessions,
+        clearMasterAudioPath: true,
+      );
+      await _saveProject(updated);
+
+      try {
+        if (await source.exists() && source.path != result.path) {
+          await source.delete();
+        }
+      } on FileSystemException {
+        // Best-effort: an old copy left behind never blocks the cleaned take.
+      }
+
+      // Reload so playback picks up the cleaned file.
+      _audioKey = null;
+      await _loadSelectedSession();
+
+      messenger?.showSnackBar(SnackBar(
+        content: Text(tr(widget.preferences, 'Audio cleaned successfully.',
+            'Audio nettoyé avec succès.')),
+      ));
+    } catch (error) {
+      if (mounted) setState(() => _loading = false);
+      messenger?.showSnackBar(SnackBar(
+        content: Text(
+            '${tr(widget.preferences, 'Could not clean the audio', 'Impossible de nettoyer l’audio')}: $error'),
+      ));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _cleanProgress = null;
+        });
+      }
     }
   }
 
@@ -1313,19 +1451,19 @@ class _PlayerScreenState extends State<PlayerScreen>
       builder: (dialogContext) => AlertDialog(
         title: Text(tr(
           widget.preferences,
-          deletesProject ? 'Move recording to Trash?' : 'Delete this session?',
+          deletesProject ? 'Move recording to Trash?' : 'Delete this take?',
           deletesProject
-              ? 'Déplacer dans la corbeille ?'
-              : 'Supprimer cette session ?',
+              ? 'Déplacer l’enregistrement dans la corbeille ?'
+              : 'Supprimer cette prise ?',
         )),
         content: Text(tr(
           widget.preferences,
           deletesProject
-              ? 'The recording will remain recoverable in Trash.'
-              : 'This removes this session from the project. Other sessions remain available.',
+              ? 'This is the last recording in this project. Moving it to Trash will move the whole project to Trash.'
+              : 'This removes this take from the project. Other takes remain available.',
           deletesProject
-              ? 'L’enregistrement pourra être restauré depuis la corbeille.'
-              : 'Cette session sera supprimée du projet. Les autres sessions resteront disponibles.',
+              ? 'C’est le dernier enregistrement de ce projet. Le déplacer dans la corbeille déplacera tout le projet.'
+              : 'Cette prise sera supprimée du projet. Les autres prises resteront disponibles.',
         )),
         actions: <Widget>[
           TextButton(
@@ -1336,8 +1474,8 @@ class _PlayerScreenState extends State<PlayerScreen>
             onPressed: () => Navigator.pop(dialogContext, true),
             child: Text(tr(
               widget.preferences,
-              deletesProject ? 'Move to Trash' : 'Delete session',
-              deletesProject ? 'Mettre à la corbeille' : 'Supprimer la session',
+              deletesProject ? 'Move to Trash' : 'Delete take',
+              deletesProject ? 'Mettre à la corbeille' : 'Supprimer la prise',
             )),
           ),
         ],
@@ -1625,6 +1763,19 @@ class _PlayerScreenState extends State<PlayerScreen>
                           ),
                         ),
                         PopupMenuItem(
+                          value: 'clean',
+                          enabled: !_project.isAudioProtected,
+                          child: Row(
+                            children: <Widget>[
+                              const Icon(Icons.auto_fix_high_rounded, size: 18),
+                              const SizedBox(width: 10),
+                              Text(tr(widget.preferences,
+                                  'Clean audio (remove noise)',
+                                  'Nettoyer l’audio')),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem(
                           value: 'details',
                           child: Row(
                             children: <Widget>[
@@ -1645,10 +1796,10 @@ class _PlayerScreenState extends State<PlayerScreen>
                                 tr(
                                   widget.preferences,
                                   _project.sessions.length == 1
-                                      ? 'Move project to Trash'
+                                      ? 'Move recording to Trash'
                                       : 'Delete this take',
                                   _project.sessions.length == 1
-                                      ? 'Mettre dans la corbeille'
+                                      ? 'Mettre l’enregistrement à la corbeille'
                                       : 'Supprimer cette prise',
                                 ),
                                 style: TextStyle(color: colorScheme.error),
@@ -1935,8 +2086,13 @@ class _PlayerScreenState extends State<PlayerScreen>
       temporaryPlaintext = File(
           '${cache.path}/raven-probe-${_project.id}-${selected.id}.$extension');
       if (await temporaryPlaintext.exists()) await temporaryPlaintext.delete();
+      final audioKey = _audioKey;
+      if (audioKey == null) {
+        throw StateError(
+            'Enter the audio password to play this recording.');
+      }
       await _encryption.decryptFile(
-          input: original, output: temporaryPlaintext, key: _audioKey);
+          input: original, output: temporaryPlaintext, key: audioKey);
       fileToMeasure = temporaryPlaintext;
     }
 
@@ -3268,9 +3424,24 @@ class _PlayerScreenState extends State<PlayerScreen>
               ),
             const SizedBox(height: 14),
             if (_loading)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 20),
-                child: CircularProgressIndicator(),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 20),
+                child: Column(
+                  children: <Widget>[
+                    CircularProgressIndicator(value: _cleanProgress),
+                    if (_cleanProgress != null) ...<Widget>[
+                      const SizedBox(height: 10),
+                      Text(
+                        tr(
+                          widget.preferences,
+                          'Cleaning audio… ${(_cleanProgress! * 100).round()}%',
+                          'Nettoyage de l’audio… ${(_cleanProgress! * 100).round()}%',
+                        ),
+                        style: theme.textTheme.bodySmall,
+                      ),
+                    ],
+                  ],
+                ),
               )
             else if (_error != null)
               Padding(
@@ -3296,24 +3467,44 @@ class _PlayerScreenState extends State<PlayerScreen>
 
                   return Column(
                     children: <Widget>[
-                      SliderTheme(
-                        data: SliderTheme.of(context).copyWith(
-                          trackHeight: 5,
-                          thumbShape: const RoundSliderThumbShape(
-                              enabledThumbRadius: 7),
-                          overlayShape: const RoundSliderOverlayShape(
-                              overlayRadius: 16),
-                          activeTrackColor: colorScheme.primary,
-                          inactiveTrackColor:
-                              colorScheme.primary.withValues(alpha: 0.15),
-                          thumbColor: colorScheme.primary,
-                        ),
-                        child: Slider(
-                          min: 0,
-                          max: maxMs,
-                          value: currentMs,
-                          onChanged: (value) => _seekGlobal(value.round()),
-                        ),
+                      Stack(
+                        alignment: Alignment.center,
+                        children: <Widget>[
+                          if (_waveformFile != null)
+                            Positioned.fill(
+                              left: 24,
+                              right: 24,
+                              child: Opacity(
+                                opacity: 0.3,
+                                child: Image.file(
+                                  _waveformFile!,
+                                  fit: BoxFit.fill,
+                                  height: 32,
+                                ),
+                              ),
+                            ),
+                          SliderTheme(
+                            data: SliderTheme.of(context).copyWith(
+                              trackHeight: 5,
+                              thumbShape: const RoundSliderThumbShape(
+                                  enabledThumbRadius: 7),
+                              overlayShape: const RoundSliderOverlayShape(
+                                  overlayRadius: 16),
+                              activeTrackColor:
+                                  colorScheme.primary.withValues(alpha: 0.8),
+                              inactiveTrackColor:
+                                  colorScheme.primary.withValues(alpha: 0.1),
+                              thumbColor: colorScheme.primary,
+                            ),
+                            child: Slider(
+                              min: 0,
+                              max: maxMs,
+                              value: currentMs,
+                              onChanged: (value) =>
+                                  _seekGlobal(value.round()),
+                            ),
+                          ),
+                        ],
                       ),
                       if (_project.bookmarks.isNotEmpty &&
                           _activeDurationMs > 0)

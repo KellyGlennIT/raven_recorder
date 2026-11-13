@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
@@ -147,8 +148,37 @@ class _RecorderScreenState extends State<RecorderScreen> {
     }
   }
 
+  /// Checks if there is enough disk space to start a new recording.
+  /// Writes a small 5MB test file to the recordings directory and deletes it.
+  Future<bool> _hasEnoughStorage() async {
+    try {
+      final dir = widget.repository.recordingsDirectory;
+      await dir.create(recursive: true);
+      final testFile = File('${dir.path}/raven_storage_test.tmp');
+      final chunk = Uint8List(5 * 1024 * 1024); // 5MB test
+      await testFile.writeAsBytes(chunk, flush: true);
+      await testFile.delete();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _startRecording() async {
     if (_busy || _started || !mounted) return;
+
+    // Proactive storage check to prevent OS crashes on long recordings
+    final hasSpace = await _hasEnoughStorage();
+    if (!hasSpace) {
+      _showMessage(tr(
+        widget.preferences,
+        'Not enough storage. Please free up space and try again.',
+        'Espace de stockage insuffisant. Libérez de l’espace et réessayez.',
+      ));
+      if (mounted) Navigator.of(context).pop();
+      return;
+    }
+
     var notificationPermissionGranted = true;
     setState(() {
       _busy = true;
@@ -327,11 +357,14 @@ class _RecorderScreenState extends State<RecorderScreen> {
           _elapsed = _formatDuration(_clock.elapsed);
         });
       });
+      
       _amplitudeSubscription = _recorder
-          .onAmplitudeChanged(const Duration(milliseconds: 120))
+          .onAmplitudeChanged(const Duration(milliseconds: 80))
           .listen((amplitude) {
         if (!mounted) return;
-        final normalized = ((amplitude.current + 60.0) / 60.0).clamp(0.06, 1.0);
+        final raw = ((amplitude.current + 60.0) / 60.0).clamp(0.0, 1.0);
+        final normalized = (raw * raw * 1.5).clamp(0.05, 1.0);
+        
         setState(() {
           _levels.removeAt(0);
           _levels.add(normalized.toDouble());
@@ -339,6 +372,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
       }, onError: (Object error) {
         _lastError = error;
       });
+      
       await _recordingNotification.start(
         title: _recordingTitle ??
             tr(widget.preferences, 'Recording', 'Enregistrement'),
@@ -626,32 +660,20 @@ class _RecorderScreenState extends State<RecorderScreen> {
     final target = project.sessions.firstWhere((s) => s.id == targetId);
     final projectForMerge = project;
 
-    final progress = _MergeProgress();
-    try {
-      final result = await showDialog<RavenProject>(
-        // ignore: use_build_context_synchronously
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => _MergeProgressDialog(
-          progress: progress,
-          preferences: widget.preferences,
-          work: () async {
-            await BackgroundEncodeService.instance.waitForProject(project.id);
-
-            final updated = await _mergeIntoSession(
-                projectForMerge, target, newWavPath, progress);
-
-            return updated;
-          },
-        ),
-      );
-      if (result == null) {
-        throw StateError(
-            'The merge did not complete. Your original recording is unchanged.');
+    // NON-BLOCKING MERGE: We fire this into the background so the UI
+    // pops immediately. The library refreshes when it's done.
+    unawaited(() async {
+      try {
+        await BackgroundEncodeService.instance.waitForProject(project.id);
+        final progress = _MergeProgress();
+        await _mergeIntoSession(projectForMerge, target, newWavPath, progress);
+        progress.dispose();
+        widget.onSaved();
+      } catch (error) {
+        debugPrint('Background merge failed for ${project.id}: $error');
+        // The original audio and the new WAV take are safe on disk.
       }
-    } finally {
-      progress.dispose();
-    }
+    }());
   }
 
   Future<RavenProject> _mergeIntoSession(
@@ -1007,30 +1029,42 @@ class _RecorderScreenState extends State<RecorderScreen> {
                             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                             children:
                                 List<Widget>.generate(_levels.length, (index) {
-                              final level = _paused ? 0.10 : _levels[index];
+                              final baseLevel = _paused ? 0.05 : _levels[index];
+                              
+                              final distanceFromCenter =
+                                  (index - (_levels.length / 2)).abs();
+                              final envelope = 1.0 -
+                                  (distanceFromCenter / (_levels.length / 2)) *
+                                      0.5;
+                              
+                              final noise = ((index * 17) % 10) / 50.0;
+                              final level = (baseLevel * envelope + noise)
+                                  .clamp(0.05, 1.0);
+
                               final waveColor = Color.lerp(
                                 accent,
                                 theme.colorScheme.tertiary,
                                 level.clamp(0, 1).toDouble(),
                               )!;
+                              
                               return AnimatedContainer(
-                                duration: const Duration(milliseconds: 140),
-                                curve: Curves.easeOutCubic,
+                                duration: const Duration(milliseconds: 80),
+                                curve: Curves.easeOutBack,
                                 width: isCompact ? 3.2 : 4,
                                 height: 7 + (level * (isCompact ? 46 : 64)),
                                 decoration: BoxDecoration(
                                   color: waveColor.withValues(
                                       alpha: _paused
                                           ? 0.35
-                                          : 0.55 + level * 0.45),
+                                          : 0.65 + level * 0.35),
                                   borderRadius: BorderRadius.circular(8),
-                                  boxShadow: level > 0.55 && !_paused
+                                  boxShadow: level > 0.5 && !_paused
                                       ? <BoxShadow>[
                                           BoxShadow(
                                             color: waveColor.withValues(
-                                                alpha: 0.35),
-                                            blurRadius: 8,
-                                            spreadRadius: 1,
+                                                alpha: 0.4),
+                                            blurRadius: 10,
+                                            spreadRadius: 1.5,
                                           ),
                                         ]
                                       : null,

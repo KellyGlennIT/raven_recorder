@@ -8,10 +8,12 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
 
 class AudioPasswordException implements Exception {
-  const AudioPasswordException();
+  final String message;
+  const AudioPasswordException(
+      [this.message = 'The audio password is incorrect.']);
 
   @override
-  String toString() => 'The audio password is incorrect.';
+  String toString() => message;
 }
 
 /// Experimental authenticated AES-256-GCM file encryption for RAVEN projects.
@@ -108,6 +110,7 @@ class AudioEncryptionService {
     required File input,
     required File output,
     required SecretKey key,
+    void Function(double progress)? onProgress,
   }) async {
     if (!await input.exists()) {
       throw FileSystemException('Audio file does not exist.', input.path);
@@ -115,7 +118,16 @@ class AudioEncryptionService {
     if (input.absolute.path == output.absolute.path) {
       throw ArgumentError('Input and output must be different files.');
     }
-    final clearBytes = await input.readAsBytes();
+    final totalBytes = await input.length();
+    final chunks = <int>[];
+    final inputStream = input.openRead();
+    await for (final chunk in inputStream) {
+      chunks.addAll(chunk);
+      if (totalBytes > 0) {
+        onProgress?.call((chunks.length / totalBytes).clamp(0.0, 0.9));
+      }
+    }
+    final clearBytes = Uint8List.fromList(chunks);
     final nonce =
         List<int>.generate(_nonceLength, (_) => Random.secure().nextInt(256));
     final box =
@@ -131,6 +143,7 @@ class AudioEncryptionService {
       ], flush: true);
       if (await output.exists()) await output.delete();
       await temporary.rename(output.path);
+      onProgress?.call(1.0);
     } catch (_) {
       if (await temporary.exists()) await temporary.delete();
       rethrow;
@@ -141,6 +154,7 @@ class AudioEncryptionService {
     required File input,
     required File output,
     SecretKey? key,
+    void Function(double progress)? onProgress,
   }) async {
     final bytes = await input.readAsBytes();
     final isLegacy = _startsWith(bytes, _legacyMagic);
@@ -168,6 +182,7 @@ class AudioEncryptionService {
     if (decryptionKey == null) {
       throw StateError('Enter the audio password to unlock this recording.');
     }
+    onProgress?.call(0.5);
     late final List<int> clear;
     try {
       clear = await _algorithm.decrypt(box, secretKey: decryptionKey);
@@ -181,6 +196,7 @@ class AudioEncryptionService {
       await temporary.writeAsBytes(Uint8List.fromList(clear), flush: true);
       if (await output.exists()) await output.delete();
       await temporary.rename(output.path);
+      onProgress?.call(1.0);
     } catch (_) {
       if (await temporary.exists()) await temporary.delete();
       rethrow;

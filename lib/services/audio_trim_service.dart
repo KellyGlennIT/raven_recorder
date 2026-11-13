@@ -9,9 +9,16 @@ import 'package:ffmpeg_kit_flutter_new_audio/statistics.dart';
 import 'background_encode_service.dart';
 
 class TrimRegion {
-  const TrimRegion({required this.startMs, required this.endMs});
+  const TrimRegion({
+    required this.startMs,
+    required this.endMs,
+    this.gainDb = 0.0, // NEW: Per-region gain in decibels
+  });
+  
   final int startMs;
   final int endMs;
+  final double gainDb;
+  
   int get durationMs => endMs - startMs;
 }
 
@@ -28,11 +35,6 @@ class AudioTrimService {
   Future<void> _lock() => BackgroundEncodeService.instance.acquireMutex();
   void _unlock() => BackgroundEncodeService.instance.releaseMutex();
 
-  /// Trims [source] to the union of [regions], writing the result to
-  /// [outputPath]. Preserves the source's codec tier and sample rate.
-  ///
-  /// [onProgress] fires in `[0.0, 1.0]` roughly 4–8 times per second with a
-  /// short stage description suitable for a UI label.
   Future<TrimResult> trim({
     required File source,
     required String outputPath,
@@ -68,9 +70,7 @@ class AudioTrimService {
       if (await output.exists()) {
         try {
           await output.delete();
-        } catch (_) {
-          // Best-effort cleanup of a stale output.
-        }
+        } catch (_) {}
       }
 
       final workDir = output.parent;
@@ -80,12 +80,15 @@ class AudioTrimService {
       try {
         final codecArgs = _codecArgs(ext, bitRate);
         final rate = sampleRate.clamp(16000, 48000);
+        final formatArg = _formatArg(ext);
+        
         final command = _buildCommand(
           source: source,
           outputPath: tempPath,
           regions: keep,
           codecArgs: codecArgs,
           sampleRate: rate,
+          formatArg: formatArg,
         );
 
         final totalMs = keep.fold<int>(0, (s, r) => s + r.durationMs);
@@ -129,33 +132,44 @@ class AudioTrimService {
     required List<TrimRegion> regions,
     required String codecArgs,
     required int sampleRate,
+    required String formatArg,
   }) {
     if (regions.length == 1) {
       final r = regions.first;
+      final vol = r.gainDb != 0.0 ? ',volume=${r.gainDb}dB' : '';
       return '-hide_banner -nostdin -y -i "${source.path}" '
           '-ss ${_sec(r.startMs)} -t ${_sec(r.durationMs)} '
-          '-vn -ar $sampleRate -ac 1 $codecArgs "$outputPath"';
+          '-vf "null" -af "anull$vol" '
+          '-vn -ar $sampleRate -ac 1 $codecArgs $formatArg "$outputPath"';
     }
 
-    // Multiple regions: build a filter graph that atrims each segment and
-    // concatenates them. Single FFmpeg invocation, no temp files.
     final buffer = StringBuffer();
     for (var i = 0; i < regions.length; i++) {
       final r = regions[i];
+      final vol = r.gainDb != 0.0 ? ',volume=${r.gainDb}dB' : '';
       if (i > 0) buffer.write(';');
       buffer.write(
         '[0:a]atrim=start=${_sec(r.startMs)}:end=${_sec(r.endMs)},'
-        'asetpts=PTS-STARTPTS[a${i + 1}]',
+        'asetpts=PTS-STARTPTS$vol[a${i + 1}]',
       );
     }
-    final concatInputs =
-        List<String>.generate(regions.length, (i) => '[a${i + 1}]').join();
-    buffer.write(
-      ';${concatInputs}concat=n=${regions.length}:v=0:a=1[out]',
-    );
+    
+    if (regions.length > 1) {
+      buffer.write(';');
+      var previousLabel = 'a1';
+      for (var i = 1; i < regions.length; i++) {
+        final nextLabel = 'a${i + 1}';
+        final outLabel = (i == regions.length - 1) ? 'out' : 'c$i';
+        // Apply a 50ms crossfade between the previous output and the next segment
+        buffer.write('[$previousLabel][$nextLabel]acrossfade=d=0.05[$outLabel]');
+        if (i < regions.length - 1) buffer.write(';');
+        previousLabel = outLabel;
+      }
+    }
+
     return '-hide_banner -nostdin -y -i "${source.path}" '
         '-filter_complex "${buffer.toString()}" '
-        '-map "[out]" -vn -ar $sampleRate -ac 1 $codecArgs "$outputPath"';
+        '-map "[out]" -vn -ar $sampleRate -ac 1 $codecArgs $formatArg "$outputPath"';
   }
 
   Future<bool> _executeWithProgress(
@@ -177,16 +191,14 @@ class AudioTrimService {
                 if (encodedMs > 0) {
                   onProgress?.call(
                     (encodedMs / totalMs).clamp(0.0, 1.0).toDouble(),
-                    'Trimming',
+                    'Processing',
                   );
                 }
               }
             : null,
       );
     } catch (error) {
-      throw StateError(
-          'FFmpeg native library did not load ($error). '
-          'Run "flutter clean" and rebuild.');
+      throw StateError('FFmpeg native library did not load ($error).');
     }
 
     final session = await completer.future;
@@ -205,7 +217,7 @@ class AudioTrimService {
             start = end;
             end = t;
           }
-          return TrimRegion(startMs: start, endMs: end);
+          return TrimRegion(startMs: start, endMs: end, gainDb: r.gainDb);
         })
         .where((r) => r.durationMs > 0)
         .toList()
@@ -214,10 +226,12 @@ class AudioTrimService {
     final merged = <TrimRegion>[];
     for (final region in sorted) {
       final last = merged.isEmpty ? null : merged.last;
-      if (last != null && region.startMs <= last.endMs) {
+      // Only merge if they touch AND have the exact same gain
+      if (last != null && region.startMs <= last.endMs && last.gainDb == region.gainDb) {
         merged[merged.length - 1] = TrimRegion(
           startMs: last.startMs,
           endMs: region.endMs > last.endMs ? region.endMs : last.endMs,
+          gainDb: last.gainDb,
         );
       } else {
         merged.add(region);
@@ -235,6 +249,13 @@ class AudioTrimService {
       _ => '-c:a aac -b:a $clamped -movflags +faststart',
     };
   }
+
+  String _formatArg(String extension) => switch (extension) {
+        'mp3' => '-f mp3',
+        'flac' => '-f flac',
+        'wav' => '-f wav',
+        _ => '-f ipod',
+      };
 
   String _extensionFor(String format) => switch (format.toLowerCase()) {
         'wav' => 'wav',

@@ -14,6 +14,7 @@ dependencies:
     sdk: flutter
   record: ^6.2.1
   just_audio: ^0.9.46
+  http: ^1.2.0
   # Background playback + media notification (play/pause/seek in the
   # notification shade and lock screen). Wraps just_audio transparently.
   just_audio_background: ^0.0.1-beta.17

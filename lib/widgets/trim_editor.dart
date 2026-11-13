@@ -8,6 +8,7 @@ import 'package:just_audio_background/just_audio_background.dart';
 
 import '../services/audio_trim_service.dart';
 import '../services/playback_service.dart';
+import '../services/waveform_service.dart';
 
 class TrimEditorResult {
   const TrimEditorResult({
@@ -53,10 +54,12 @@ class _TrimEditorState extends State<TrimEditor> {
   double _selStart = 0.0;
   double _selEnd = 1.0;
   List<(double, double)> _cuts = <(double, double)>[];
+  List<TrimRegion> _gains = <TrimRegion>[]; // Track manual gain adjustments
 
   bool _processing = false;
   double? _progress;
   String _stage = '';
+  File? _waveformFile;
 
   bool _previewing = false;
   StreamSubscription<Duration>? _posSub;
@@ -70,6 +73,9 @@ class _TrimEditorState extends State<TrimEditor> {
     try {
       _player.stop();
     } catch (_) {}
+    WaveformService.instance.getWaveform(widget.source).then((file) {
+      if (mounted) setState(() => _waveformFile = file);
+    });
   }
 
   @override
@@ -86,8 +92,8 @@ class _TrimEditorState extends State<TrimEditor> {
   int get _endMs => (_selEnd * _durationMs).round();
 
   bool get _hasCuts => _cuts.isNotEmpty;
+  bool get _hasGains => _gains.isNotEmpty;
 
-  /// Formats a duration as `MM:SS.S` (or `H:MM:SS.S` for >1 hr).
   String _fmt(int ms) {
     final d = Duration(milliseconds: ms);
     final h = d.inHours;
@@ -97,8 +103,6 @@ class _TrimEditorState extends State<TrimEditor> {
     return h > 0 ? '$h:$m:$s.$tenths' : '$m:$s.$tenths';
   }
 
-  /// Parses user input: accepts `MM:SS.S`, `SS.S`, `H:MM:SS.S`, or bare
-  /// milliseconds. Returns null on parse failure.
   int? _parseTime(String text) {
     final t = text.trim();
     if (t.isEmpty) return null;
@@ -121,7 +125,8 @@ class _TrimEditorState extends State<TrimEditor> {
     return null;
   }
 
-  List<TrimRegion> get _keepRegions {
+  List<TrimRegion> get _finalRegions {
+    // 1. Generate base spans from cuts
     var spans = <(double, double)>[(0.0, 1.0)];
     for (final cut in _cuts) {
       final next = <(double, double)>[];
@@ -135,23 +140,53 @@ class _TrimEditorState extends State<TrimEditor> {
       }
       spans = next;
     }
-    final regions = <TrimRegion>[];
+
+    final base = <TrimRegion>[];
     for (final span in spans) {
       final s = (span.$1 * _durationMs).round();
       final e = (span.$2 * _durationMs).round();
-      if (e > s) regions.add(TrimRegion(startMs: s, endMs: e));
+      if (e > s) base.add(TrimRegion(startMs: s, endMs: e));
     }
-    return regions;
+
+    // 2. Apply gains to the base regions
+    final finalRegions = <TrimRegion>[];
+    for (final b in base) {
+      var currentStart = b.startMs;
+      final currentEnd = b.endMs;
+
+      // Find all gains overlapping this base region
+      final overlaps = _gains
+          .where((g) => g.startMs < currentEnd && g.endMs > currentStart)
+          .toList()
+        ..sort((left, right) => left.startMs.compareTo(right.startMs));
+
+      for (final g in overlaps) {
+        final gStart = math.max(currentStart, g.startMs);
+        final gEnd = math.min(currentEnd, g.endMs);
+
+        if (gStart > currentStart) {
+          finalRegions.add(TrimRegion(startMs: currentStart, endMs: gStart));
+        }
+        if (gEnd > gStart) {
+          finalRegions.add(TrimRegion(startMs: gStart, endMs: gEnd, gainDb: g.gainDb));
+        }
+        currentStart = gEnd;
+      }
+      if (currentStart < currentEnd) {
+        finalRegions.add(TrimRegion(startMs: currentStart, endMs: currentEnd));
+      }
+    }
+    return finalRegions;
   }
 
-  int get _keptMs =>
-      _keepRegions.fold<int>(0, (sum, r) => sum + r.durationMs);
+  int get _keptMs => _finalRegions.fold<int>(0, (sum, r) => sum + r.durationMs);
 
   bool get _isUnchanged {
-    final regions = _keepRegions;
+    final regions = _finalRegions;
     return regions.length == 1 &&
         regions.first.startMs <= 0 &&
-        regions.first.endMs >= _durationMs;
+        regions.first.endMs >= _durationMs &&
+        regions.first.gainDb == 0.0;
   }
 
   Future<void> _playSelection() async {
@@ -193,8 +228,7 @@ class _TrimEditorState extends State<TrimEditor> {
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(
-            '${label('Preview failed', 'Échec de la préécoute')}: $error'),
+        content: Text('${label('Preview failed', 'Échec de la préécoute')}: $error'),
       ));
     }
   }
@@ -212,28 +246,25 @@ class _TrimEditorState extends State<TrimEditor> {
 
   Future<void> _editTime({required bool isStart}) async {
     final currentMs = isStart ? _startMs : _endMs;
-    final controller = TextEditingController(text: _fmt(currentMs));
-    controller.selection = TextSelection(
-      baseOffset: 0,
-      extentOffset: controller.text.length,
-    );
+    final initialTime = _fmt(currentMs);
+    final controller = TextEditingController(text: initialTime)
+      ..selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: initialTime.length,
+      );
     final result = await showDialog<String>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: Text(
-          isStart
-              ? label('Set start time', 'Définir le début')
-              : label('Set end time', 'Définir la fin'),
-        ),
+        title: Text(isStart
+            ? label('Set start time', 'Définir le début')
+            : label('Set end time', 'Définir la fin')),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
             Text(
-              label(
-                'Enter a time as MM:SS.S, SS.S, or HH:MM:SS.S.',
-                'Saisissez un temps au format MM:SS.S, SS.S, ou HH:MM:SS.S.',
-              ),
+              label('Enter a time as MM:SS.S, SS.S, or HH:MM:SS.S.',
+                  'Saisissez un temps au format MM:SS.S, SS.S, ou HH:MM:SS.S.'),
               style: Theme.of(dialogContext).textTheme.bodySmall,
             ),
             const SizedBox(height: 12),
@@ -267,10 +298,8 @@ class _TrimEditorState extends State<TrimEditor> {
     if (ms == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(label(
-            'Could not read that time. Try 01:23.4.',
-            'Impossible de lire ce temps. Essayez 01:23.4.',
-          )),
+          content: Text(label('Could not read that time. Try 01:23.4.',
+              'Impossible de lire ce temps. Essayez 01:23.4.')),
         ));
       }
       return;
@@ -278,11 +307,9 @@ class _TrimEditorState extends State<TrimEditor> {
     final clamped = ms.clamp(0, _durationMs);
     setState(() {
       if (isStart) {
-        _selStart = (clamped / _durationMs)
-            .clamp(0.0, (_selEnd - 0.001).clamp(0.0, 1.0));
+        _selStart = (clamped / _durationMs).clamp(0.0, (_selEnd - 0.001).clamp(0.0, 1.0));
       } else {
-        _selEnd = (clamped / _durationMs)
-            .clamp((_selStart + 0.001).clamp(0.0, 1.0), 1.0);
+        _selEnd = (clamped / _durationMs).clamp((_selStart + 0.001).clamp(0.0, 1.0), 1.0);
       }
     });
   }
@@ -303,10 +330,8 @@ class _TrimEditorState extends State<TrimEditor> {
     final spanMs = _endMs - _startMs;
     if (spanMs >= _durationMs) return;
     if (spanMs < 100) {
-      _toast(label(
-        'Selection is too short to cut. Drag the handles wider.',
-        'La sélection est trop courte. Élargissez les poignées.',
-      ));
+      _toast(label('Selection is too short to cut. Drag the handles wider.',
+          'La sélection est trop courte. Élargissez les poignées.'));
       return;
     }
     setState(() => _cuts = [..._cuts, (_selStart, _selEnd)]);
@@ -315,19 +340,77 @@ class _TrimEditorState extends State<TrimEditor> {
   void _applyKeepOnlySelection() {
     if (_selStart <= 0.001 && _selEnd >= 0.999) return;
     if (_endMs - _startMs < 100) {
-      _toast(label(
-        'Selection is too short to keep. Drag the handles wider.',
-        'La sélection est trop courte. Élargissez les poignées.',
-      ));
+      _toast(label('Selection is too short to keep. Drag the handles wider.',
+          'La sélection est trop courte. Élargissez les poignées.'));
       return;
     }
     final before = _selStart > 0.001
         ? <(double, double)>[(0.0, _selStart)]
         : <(double, double)>[];
-    final after = _selEnd < 0.999
-        ? <(double, double)>[(_selEnd, 1.0)]
-        : <(double, double)>[];
+    final after =
+        _selEnd < 0.999 ? <(double, double)>[(_selEnd, 1.0)] : <(double, double)>[];
     setState(() => _cuts = [...before, ...after]);
+  }
+
+  Future<void> _applyGain() async {
+    final spanMs = _endMs - _startMs;
+    if (spanMs < 100) {
+      _toast(label('Selection is too short to adjust.', 'La sélection est trop courte.'));
+      return;
+    }
+    
+    double gain = 0.0;
+    final result = await showDialog<double>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (builderContext, setDialogState) => AlertDialog(
+          title: Text(label('Adjust volume', 'Ajuster le volume')),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Text(
+                '${gain > 0 ? '+' : ''}${gain.toStringAsFixed(1)} dB',
+                style: Theme.of(builderContext).textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+              ),
+              const SizedBox(height: 8),
+              Slider(
+                min: -20,
+                max: 20,
+                divisions: 40,
+                value: gain,
+                onChanged: (value) => setDialogState(() => gain = value),
+              ),
+              Text(
+                label(
+                  'Boost quiet parts or lower loud parts.',
+                  'Augmentez les parties faibles ou baissez les parties fortes.',
+                ),
+                style: Theme.of(builderContext).textTheme.bodySmall,
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: Text(label('Cancel', 'Annuler')),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, gain),
+              child: Text(label('Apply', 'Appliquer')),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (result != null && mounted) {
+      setState(() {
+        _gains.add(TrimRegion(startMs: _startMs, endMs: _endMs, gainDb: result));
+      });
+    }
   }
 
   void _undoLastCut() {
@@ -335,9 +418,15 @@ class _TrimEditorState extends State<TrimEditor> {
     setState(() => _cuts = _cuts.sublist(0, _cuts.length - 1));
   }
 
+  void _clearGains() {
+    if (_gains.isEmpty) return;
+    setState(() => _gains.clear());
+  }
+
   void _resetAll() {
     setState(() {
       _cuts = <(double, double)>[];
+      _gains = <TrimRegion>[];
       _selStart = 0.0;
       _selEnd = 1.0;
     });
@@ -373,19 +462,14 @@ class _TrimEditorState extends State<TrimEditor> {
   Future<void> _save() async {
     if (_processing) return;
 
-    final regions = _keepRegions;
+    final regions = _finalRegions;
     if (regions.isEmpty) {
-      _toast(label(
-        'Nothing to keep — every region is cut.',
-        'Rien à garder — toutes les régions sont coupées.',
-      ));
+      _toast(label('Nothing to keep — every region is cut.', 'Rien à garder.'));
       return;
     }
     if (_isUnchanged) {
-      _toast(label(
-        'Make a cut or narrow the selection first.',
-        'Faites d’abord une coupe ou réduisez la sélection.',
-      ));
+      _toast(label('Make a cut, adjust gain, or narrow the selection first.',
+          'Faites une coupe, ajustez le volume ou réduisez la sélection.'));
       return;
     }
 
@@ -399,53 +483,36 @@ class _TrimEditorState extends State<TrimEditor> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
             Text(
-              label(
-                'Keep ${_fmt(_keptMs)} of ${_fmt(_durationMs)}.',
-                'Garder ${_fmt(_keptMs)} sur ${_fmt(_durationMs)}.',
-              ),
+              label('Keep ${_fmt(_keptMs)} of ${_fmt(_durationMs)}.',
+                  'Garder ${_fmt(_keptMs)} sur ${_fmt(_durationMs)}.'),
               style: const TextStyle(fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 14),
             _ChoiceOption(
               icon: Icons.library_add_outlined,
               title: widget.isStandalone
-                  ? label('Save as new recording',
-                      'Enregistrer comme nouvel enregistrement')
+                  ? label('Save as new recording', 'Enregistrer comme nouvel enregistrement')
                   : label('Save as new take', 'Enregistrer comme nouvelle prise'),
               subtitle: widget.isStandalone
-                  ? label(
-                      'The original stays untouched. The trimmed copy becomes a new recording in your library.',
-                      'L’original reste intact. La copie rognée devient un nouvel enregistrement dans votre bibliothèque.')
-                  : label(
-                      'The original take stays untouched. The trimmed copy is added next to it in this project.',
-                      'La prise d’origine reste intacte. La copie rognée est ajoutée à côté dans ce projet.'),
+                  ? label('The original stays untouched.', 'L’original reste intact.')
+                  : label('The original take stays untouched.', 'La prise d’origine reste intacte.'),
             ),
             const SizedBox(height: 10),
             _ChoiceOption(
               icon: Icons.swap_horiz_rounded,
               title: label('Replace original', 'Remplacer l’original'),
-              subtitle: label(
-                'The original audio is removed after the trimmed copy is saved.',
-                'L’audio d’origine est supprimé après l’enregistrement de la copie rognée.',
-              ),
+              subtitle: label('The original audio is removed.', 'L’audio d’origine est supprimé.'),
             ),
           ],
         ),
         actions: <Widget>[
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: Text(label('Cancel', 'Annuler'))),
           TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: Text(label('Cancel', 'Annuler')),
-          ),
-          TextButton(
-            onPressed: () =>
-                Navigator.pop(dialogContext, _TrimSaveChoice.saveAsNew),
-            child: Text(widget.isStandalone
-                ? label('New recording', 'Nouvel enregistrement')
-                : label('New take', 'Nouvelle prise')),
+            onPressed: () => Navigator.pop(dialogContext, _TrimSaveChoice.saveAsNew),
+            child: Text(widget.isStandalone ? label('New recording', 'Nouvel enregistrement') : label('New take', 'Nouvelle prise')),
           ),
           FilledButton.icon(
-            onPressed: () =>
-                Navigator.pop(dialogContext, _TrimSaveChoice.replace),
+            onPressed: () => Navigator.pop(dialogContext, _TrimSaveChoice.replace),
             icon: const Icon(Icons.swap_horiz_rounded, size: 18),
             label: Text(label('Replace', 'Remplacer')),
           ),
@@ -500,8 +567,7 @@ class _TrimEditorState extends State<TrimEditor> {
         _stage = '';
       });
       messenger.showSnackBar(SnackBar(
-        content: Text(
-            '${label('Could not trim recording', 'Impossible de rogner')}: $error'),
+        content: Text('${label('Could not trim recording', 'Impossible de rogner')}: $error'),
       ));
     }
   }
@@ -511,22 +577,15 @@ class _TrimEditorState extends State<TrimEditor> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final selectionMs = _endMs - _startMs;
-    final hasEdits = _hasCuts || _selStart > 0.001 || _selEnd < 0.999;
+    final hasEdits = _hasCuts || _hasGains || _selStart > 0.001 || _selEnd < 0.999;
 
     return PopScope(
       canPop: !_processing,
       child: Scaffold(
         appBar: AppBar(
           leading: _processing
-              ? const Center(
-                  child: SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2)))
-              : IconButton(
-                  icon: const Icon(Icons.close_rounded),
-                  onPressed: () => Navigator.of(context).pop(),
-                ),
+              ? const Center(child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)))
+              : IconButton(icon: const Icon(Icons.close_rounded), onPressed: () => Navigator.of(context).pop()),
           title: Text(label('Trim recording', 'Rogner l’enregistrement')),
           actions: <Widget>[
             IconButton(
@@ -545,11 +604,9 @@ class _TrimEditorState extends State<TrimEditor> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: <Widget>[
-                      // Title + pills
                       Text(
                         widget.title,
-                        style: theme.textTheme.titleMedium
-                            ?.copyWith(fontWeight: FontWeight.w800),
+                        style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                       ),
@@ -558,14 +615,8 @@ class _TrimEditorState extends State<TrimEditor> {
                         spacing: 6,
                         runSpacing: 6,
                         children: <Widget>[
-                          _Pill(
-                            icon: Icons.audiotrack_rounded,
-                            text: widget.format.toUpperCase(),
-                          ),
-                          _Pill(
-                            icon: Icons.timer_outlined,
-                            text: _fmt(_durationMs),
-                          ),
+                          _Pill(icon: Icons.audiotrack_rounded, text: widget.format.toUpperCase()),
+                          _Pill(icon: Icons.timer_outlined, text: _fmt(_durationMs)),
                           _Pill(
                             icon: Icons.content_cut_rounded,
                             text: '${label('Keep', 'Garder')} ${_fmt(_keptMs)}',
@@ -575,15 +626,14 @@ class _TrimEditorState extends State<TrimEditor> {
                       ),
                       const SizedBox(height: 20),
 
-                      // Timeline
                       _TimelineBar(
                         durationMs: _durationMs,
                         selStart: _selStart,
                         selEnd: _selEnd,
                         cuts: _cuts,
-                        previewPos: _previewing
-                            ? _previewPos.inMilliseconds / _durationMs
-                            : null,
+                        gains: _gains,
+                        waveformFile: _waveformFile,
+                        previewPos: _previewing ? _previewPos.inMilliseconds / _durationMs : null,
                         enabled: !_processing,
                         fmt: _fmt,
                         onChanged: (start, end) => setState(() {
@@ -593,7 +643,6 @@ class _TrimEditorState extends State<TrimEditor> {
                       ),
                       const SizedBox(height: 12),
 
-                      // Selection card with editable times
                       _SelectionCard(
                         startMs: _startMs,
                         endMs: _endMs,
@@ -602,10 +651,8 @@ class _TrimEditorState extends State<TrimEditor> {
                         enabled: !_processing,
                         onEditStart: () => _editTime(isStart: true),
                         onEditEnd: () => _editTime(isStart: false),
-                        onNudgeStart: (delta) =>
-                            _nudge(isStart: true, deltaMs: delta),
-                        onNudgeEnd: (delta) =>
-                            _nudge(isStart: false, deltaMs: delta),
+                        onNudgeStart: (delta) => _nudge(isStart: true, deltaMs: delta),
+                        onNudgeEnd: (delta) => _nudge(isStart: false, deltaMs: delta),
                         labels: (
                           start: label('Start', 'Début'),
                           end: label('End', 'Fin'),
@@ -615,48 +662,47 @@ class _TrimEditorState extends State<TrimEditor> {
                       ),
                       const SizedBox(height: 16),
 
-                      // Keep strip
                       _KeepStrip(
-                        keepRegions: _keepRegions,
+                        keepRegions: _finalRegions,
                         durationMs: _durationMs,
                         isFrench: widget.isFrench,
                       ),
                       const SizedBox(height: 16),
 
-                      // Action buttons
                       Wrap(
                         spacing: 8,
                         runSpacing: 8,
                         alignment: WrapAlignment.center,
                         children: <Widget>[
                           OutlinedButton.icon(
-                            onPressed: _processing || selectionMs >= _durationMs
-                                ? null
-                                : _applyCutSelection,
-                            icon: const Icon(Icons.content_cut_rounded,
-                                size: 18),
+                            onPressed: _processing || selectionMs >= _durationMs ? null : _applyCutSelection,
+                            icon: const Icon(Icons.content_cut_rounded, size: 18),
                             label: Text(label('Cut selection', 'Couper')),
                           ),
                           OutlinedButton.icon(
-                            onPressed: _processing ||
-                                    (_selStart <= 0.001 && _selEnd >= 0.999)
-                                ? null
-                                : _applyKeepOnlySelection,
+                            onPressed: _processing || (_selStart <= 0.001 && _selEnd >= 0.999) ? null : _applyKeepOnlySelection,
                             icon: const Icon(Icons.crop_rounded, size: 18),
-                            label:
-                                Text(label('Keep only', 'Garder seulement')),
+                            label: Text(label('Keep only', 'Garder seulement')),
                           ),
                           OutlinedButton.icon(
-                            onPressed:
-                                _processing || _cuts.isEmpty ? null : _undoLastCut,
-                            icon: const Icon(Icons.undo_rounded, size: 18),
-                            label:
-                                Text(label('Undo cut', 'Annuler la coupe')),
+                            onPressed: _processing || selectionMs < 100 ? null : _applyGain,
+                            icon: const Icon(Icons.volume_up_rounded, size: 18),
+                            label: Text(label('Adjust volume', 'Ajuster le volume')),
                           ),
+                          OutlinedButton.icon(
+                            onPressed: _processing || _cuts.isEmpty ? null : _undoLastCut,
+                            icon: const Icon(Icons.undo_rounded, size: 18),
+                            label: Text(label('Undo cut', 'Annuler la coupe')),
+                          ),
+                          if (_hasGains)
+                            OutlinedButton.icon(
+                              onPressed: _processing ? null : _clearGains,
+                              icon: const Icon(Icons.volume_off_rounded, size: 18),
+                              label: Text(label('Clear gains', 'Effacer volumes')),
+                            ),
                         ],
                       ),
 
-                      // Processing progress
                       if (_processing) ...<Widget>[
                         const SizedBox(height: 20),
                         Container(
@@ -665,32 +711,22 @@ class _TrimEditorState extends State<TrimEditor> {
                             color: scheme.primaryContainer.withValues(alpha: 0.4),
                             borderRadius: BorderRadius.circular(12),
                           ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                          child: Row(
                             children: <Widget>[
-                              Row(
-                                children: <Widget>[
-                                  SizedBox(
-                                    width: 16,
-                                    height: 16,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      value: _progress,
-                                      color: scheme.primary,
-                                    ),
+                              SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2, value: _progress, color: scheme.primary),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  '${_stage.isEmpty ? label('Trimming…', 'Rognage…') : _stage} · ${((_progress ?? 0) * 100).round()}%',
+                                  style: theme.textTheme.labelMedium?.copyWith(
+                                    fontWeight: FontWeight.w700,
+                                    color: scheme.onPrimaryContainer,
                                   ),
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: Text(
-                                      '${_stage.isEmpty ? label('Trimming…', 'Rognage…') : _stage} · ${((_progress ?? 0) * 100).round()}%',
-                                      style: theme.textTheme.labelMedium
-                                          ?.copyWith(
-                                        fontWeight: FontWeight.w700,
-                                        color: scheme.onPrimaryContainer,
-                                      ),
-                                    ),
-                                  ),
-                                ],
+                                ),
                               ),
                             ],
                           ),
@@ -707,14 +743,9 @@ class _TrimEditorState extends State<TrimEditor> {
                     children: <Widget>[
                       Expanded(
                         child: OutlinedButton.icon(
-                          onPressed:
-                              _previewing ? _stopPreview : _playSelection,
-                          icon: Icon(_previewing
-                              ? Icons.stop_rounded
-                              : Icons.play_arrow_rounded),
-                          label: Text(_previewing
-                              ? label('Stop', 'Arrêter')
-                              : label('Preview', 'Préécoute')),
+                          onPressed: _previewing ? _stopPreview : _playSelection,
+                          icon: Icon(_previewing ? Icons.stop_rounded : Icons.play_arrow_rounded),
+                          label: Text(_previewing ? label('Stop', 'Arrêter') : label('Preview', 'Préécoute')),
                         ),
                       ),
                       const SizedBox(width: 12),
@@ -723,8 +754,7 @@ class _TrimEditorState extends State<TrimEditor> {
                         child: FilledButton.icon(
                           onPressed: hasEdits ? _save : null,
                           icon: const Icon(Icons.save_rounded),
-                          label: Text(label('Save trimmed audio',
-                              'Enregistrer le rognage')),
+                          label: Text(label('Save trimmed audio', 'Enregistrer le rognage')),
                         ),
                       ),
                     ],
@@ -739,12 +769,7 @@ class _TrimEditorState extends State<TrimEditor> {
 }
 
 class _Pill extends StatelessWidget {
-  const _Pill({
-    required this.icon,
-    required this.text,
-    this.highlight = false,
-  });
-
+  const _Pill({required this.icon, required this.text, this.highlight = false});
   final IconData icon;
   final String text;
   final bool highlight;
@@ -755,29 +780,20 @@ class _Pill extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
-        color: highlight
-            ? scheme.primaryContainer
-            : scheme.surfaceContainerHighest,
+        color: highlight ? scheme.primaryContainer : scheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(20),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          Icon(
-            icon,
-            size: 12,
-            color:
-                highlight ? scheme.onPrimaryContainer : scheme.onSurfaceVariant,
-          ),
+          Icon(icon, size: 12, color: highlight ? scheme.onPrimaryContainer : scheme.onSurfaceVariant),
           const SizedBox(width: 4),
           Text(
             text,
             style: TextStyle(
               fontSize: 11,
               fontWeight: FontWeight.w600,
-              color: highlight
-                  ? scheme.onPrimaryContainer
-                  : scheme.onSurfaceVariant,
+              color: highlight ? scheme.onPrimaryContainer : scheme.onSurfaceVariant,
             ),
           ),
         ],
@@ -787,12 +803,7 @@ class _Pill extends StatelessWidget {
 }
 
 class _ChoiceOption extends StatelessWidget {
-  const _ChoiceOption({
-    required this.icon,
-    required this.title,
-    required this.subtitle,
-  });
-
+  const _ChoiceOption({required this.icon, required this.title, required this.subtitle});
   final IconData icon;
   final String title;
   final String subtitle;
@@ -815,19 +826,9 @@ class _ChoiceOption extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Text(
-                  title,
-                  style: const TextStyle(
-                      fontWeight: FontWeight.w700, fontSize: 13),
-                ),
+                Text(title, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
                 const SizedBox(height: 2),
-                Text(
-                  subtitle,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: scheme.onSurfaceVariant,
-                  ),
-                ),
+                Text(subtitle, style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
               ],
             ),
           ),
@@ -871,8 +872,7 @@ class _SelectionCard extends StatelessWidget {
       decoration: BoxDecoration(
         color: scheme.surfaceContainerLow,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-            color: scheme.outlineVariant.withValues(alpha: 0.5)),
+        border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.5)),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -990,8 +990,7 @@ class _TimeField extends StatelessWidget {
                     ),
                   ),
                 ),
-                Icon(Icons.edit_outlined,
-                    size: 14, color: scheme.onSurfaceVariant),
+                Icon(Icons.edit_outlined, size: 14, color: scheme.onSurfaceVariant),
               ],
             ),
           ),
@@ -1001,25 +1000,13 @@ class _TimeField extends StatelessWidget {
           message: nudgeLabel,
           child: Row(
             children: <Widget>[
-              _NudgeButton(
-                text: '−5s',
-                onTap: enabled ? () => onNudge(-5000) : null,
-              ),
+              _NudgeButton(text: '−5s', onTap: enabled ? () => onNudge(-5000) : null),
               const SizedBox(width: 4),
-              _NudgeButton(
-                text: '−1s',
-                onTap: enabled ? () => onNudge(-1000) : null,
-              ),
+              _NudgeButton(text: '−1s', onTap: enabled ? () => onNudge(-1000) : null),
               const SizedBox(width: 4),
-              _NudgeButton(
-                text: '+1s',
-                onTap: enabled ? () => onNudge(1000) : null,
-              ),
+              _NudgeButton(text: '+1s', onTap: enabled ? () => onNudge(1000) : null),
               const SizedBox(width: 4),
-              _NudgeButton(
-                text: '+5s',
-                onTap: enabled ? () => onNudge(5000) : null,
-              ),
+              _NudgeButton(text: '+5s', onTap: enabled ? () => onNudge(5000) : null),
             ],
           ),
         ),
@@ -1051,9 +1038,7 @@ class _NudgeButton extends StatelessWidget {
                 style: TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w700,
-                  color: onTap == null
-                      ? scheme.onSurfaceVariant.withValues(alpha: 0.4)
-                      : scheme.onSurface,
+                  color: onTap == null ? scheme.onSurfaceVariant.withValues(alpha: 0.4) : scheme.onSurface,
                 ),
               ),
             ),
@@ -1072,20 +1057,24 @@ class _TimelineBar extends StatefulWidget {
     required this.selStart,
     required this.selEnd,
     required this.cuts,
+    required this.gains,
     required this.previewPos,
     required this.enabled,
     required this.fmt,
     required this.onChanged,
+    this.waveformFile,
   });
 
   final int durationMs;
   final double selStart;
   final double selEnd;
   final List<(double, double)> cuts;
+  final List<TrimRegion> gains;
   final double? previewPos;
   final bool enabled;
   final String Function(int) fmt;
   final void Function(double start, double end) onChanged;
+  final File? waveformFile;
 
   @override
   State<_TimelineBar> createState() => _TimelineBarState();
@@ -1105,12 +1094,8 @@ class _TimelineBarState extends State<_TimelineBar> {
       const handleHalf = 14.0;
       const labelWidth = 70.0;
 
-      double fracOf(double x) =>
-          ((x - handleHalf) / (width - 2 * handleHalf)).clamp(0.0, 1.0)
-              .toDouble();
-
-      double xOf(double frac) =>
-          handleHalf + frac * (width - 2 * handleHalf);
+      double fracOf(double x) => ((x - handleHalf) / (width - 2 * handleHalf)).clamp(0.0, 1.0).toDouble();
+      double xOf(double frac) => handleHalf + frac * (width - 2 * handleHalf);
 
       void move(double f) {
         if (_activeHandle == 1) {
@@ -1125,26 +1110,17 @@ class _TimelineBarState extends State<_TimelineBar> {
         move(f);
       }
 
-      // Calculate tick spacing
       final totalSeconds = widget.durationMs / 1000.0;
       final labelIntervalSec = totalSeconds / 6;
-      // ignore: unused_local_variable
-      final minorIntervalSec = totalSeconds / 30;
 
       final startX = xOf(selStart);
       final endX = xOf(selEnd);
       final labelsOverlap = (endX - startX) < labelWidth * 1.2;
 
       return GestureDetector(
-        onTapDown: widget.enabled
-            ? (details) => pick(fracOf(details.localPosition.dx))
-            : null,
-        onHorizontalDragStart: widget.enabled
-            ? (details) => pick(fracOf(details.localPosition.dx))
-            : null,
-        onHorizontalDragUpdate: widget.enabled
-            ? (details) => move(fracOf(details.localPosition.dx))
-            : null,
+        onTapDown: widget.enabled ? (details) => pick(fracOf(details.localPosition.dx)) : null,
+        onHorizontalDragStart: widget.enabled ? (details) => pick(fracOf(details.localPosition.dx)) : null,
+        onHorizontalDragUpdate: widget.enabled ? (details) => move(fracOf(details.localPosition.dx)) : null,
         onHorizontalDragEnd: (_) => _activeHandle = 0,
         child: SizedBox(
           height: 104,
@@ -1152,7 +1128,6 @@ class _TimelineBarState extends State<_TimelineBar> {
           child: Stack(
             clipBehavior: Clip.none,
             children: <Widget>[
-              // Handle labels
               Positioned(
                 left: (startX - labelWidth / 2).clamp(0.0, width - labelWidth),
                 top: 0,
@@ -1183,7 +1158,7 @@ class _TimelineBarState extends State<_TimelineBar> {
                   ),
                 ),
 
-              // Main track
+              // Main track with Waveform
               Positioned(
                 left: 0,
                 right: 0,
@@ -1194,10 +1169,39 @@ class _TimelineBarState extends State<_TimelineBar> {
                     color: scheme.surfaceContainerHighest,
                     borderRadius: BorderRadius.circular(8),
                   ),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: widget.waveformFile != null
+                        ? Image.file(
+                            widget.waveformFile!,
+                            fit: BoxFit.fill,
+                            opacity: const AlwaysStoppedAnimation(0.5),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
                 ),
               ),
 
-              // Cut gaps
+              // Gain Regions (Green overlay)
+              for (final gain in widget.gains)
+                Positioned(
+                  left: xOf(gain.startMs / widget.durationMs),
+                  width: math.max(2, xOf(gain.endMs / widget.durationMs) - xOf(gain.startMs / widget.durationMs)),
+                  top: 44,
+                  child: Container(
+                    height: 16,
+                    color: Colors.green.withValues(alpha: 0.4),
+                    child: Center(
+                      child: Text(
+                        '${gain.gainDb > 0 ? '+' : ''}${gain.gainDb.toStringAsFixed(1)}dB',
+                        style: const TextStyle(fontSize: 8, fontWeight: FontWeight.bold, color: Colors.black87),
+                        overflow: TextOverflow.clip,
+                      ),
+                    ),
+                  ),
+                ),
+
+              // Cut Regions (Red overlay)
               for (final cut in widget.cuts)
                 Positioned(
                   left: xOf(cut.$1),
@@ -1212,7 +1216,6 @@ class _TimelineBarState extends State<_TimelineBar> {
                   ),
                 ),
 
-              // Selection overlay
               Positioned(
                 left: xOf(selStart),
                 width: math.max(2, xOf(selEnd) - xOf(selStart)),
@@ -1226,19 +1229,13 @@ class _TimelineBarState extends State<_TimelineBar> {
                 ),
               ),
 
-              // Playhead
               if (widget.previewPos != null)
                 Positioned(
                   left: xOf(widget.previewPos!.clamp(0.0, 1.0)) - 1,
                   top: 32,
-                  child: Container(
-                    width: 2,
-                    height: 40,
-                    color: scheme.tertiary,
-                  ),
+                  child: Container(width: 2, height: 40, color: scheme.tertiary),
                 ),
 
-              // Handles
               Positioned(
                 left: xOf(selStart) - handleHalf,
                 top: 32,
@@ -1250,7 +1247,6 @@ class _TimelineBarState extends State<_TimelineBar> {
                 child: _HandleGlyph(color: scheme.primary),
               ),
 
-              // Minor + major ticks
               Positioned(
                 left: 0,
                 right: 0,
@@ -1259,18 +1255,12 @@ class _TimelineBarState extends State<_TimelineBar> {
                   height: 16,
                   child: Stack(
                     children: <Widget>[
-                      // Minor ticks
                       for (var i = 0; i <= 30; i++)
                         Positioned(
                           left: (i / 30) * width - 0.5,
                           top: 0,
-                          child: Container(
-                            width: 1,
-                            height: 6,
-                            color: scheme.outlineVariant,
-                          ),
+                          child: Container(width: 1, height: 6, color: scheme.outlineVariant),
                         ),
-                      // Major tick labels
                       for (var i = 0; i <= 6; i++)
                         Positioned(
                           left: (i / 6) * width,
@@ -1278,14 +1268,11 @@ class _TimelineBarState extends State<_TimelineBar> {
                           child: Transform.translate(
                             offset: const Offset(-14, 0),
                             child: Text(
-                              widget.fmt(
-                                  (i * labelIntervalSec * 1000).round()),
+                              widget.fmt((i * labelIntervalSec * 1000).round()),
                               style: theme.textTheme.labelSmall?.copyWith(
                                 fontSize: 9,
                                 color: scheme.onSurfaceVariant,
-                                fontFeatures: const [
-                                  FontFeature.tabularFigures()
-                                ],
+                                fontFeatures: const [FontFeature.tabularFigures()],
                               ),
                             ),
                           ),
@@ -1303,12 +1290,7 @@ class _TimelineBarState extends State<_TimelineBar> {
 }
 
 class _HandleLabel extends StatelessWidget {
-  const _HandleLabel({
-    required this.text,
-    required this.color,
-    required this.alignEnd,
-  });
-
+  const _HandleLabel({required this.text, required this.color, required this.alignEnd});
   final String text;
   final Color color;
   final bool alignEnd;
@@ -1317,18 +1299,10 @@ class _HandleLabel extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-      decoration: BoxDecoration(
-        color: color,
-        borderRadius: BorderRadius.circular(6),
-      ),
+      decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(6)),
       child: Text(
         text,
-        style: const TextStyle(
-          color: Colors.white,
-          fontSize: 11,
-          fontWeight: FontWeight.w700,
-          fontFeatures: [FontFeature.tabularFigures()],
-        ),
+        style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, fontFeatures: [FontFeature.tabularFigures()]),
       ),
     );
   }
@@ -1346,23 +1320,15 @@ class _HandleGlyph extends StatelessWidget {
       decoration: BoxDecoration(
         color: color,
         shape: BoxShape.circle,
-        boxShadow: <BoxShadow>[
-          BoxShadow(color: color.withValues(alpha: 0.4), blurRadius: 6),
-        ],
+        boxShadow: <BoxShadow>[BoxShadow(color: color.withValues(alpha: 0.4), blurRadius: 6)],
       ),
-      child: const Icon(Icons.drag_handle_rounded,
-          size: 14, color: Colors.white),
+      child: const Icon(Icons.drag_handle_rounded, size: 14, color: Colors.white),
     );
   }
 }
 
 class _KeepStrip extends StatelessWidget {
-  const _KeepStrip({
-    required this.keepRegions,
-    required this.durationMs,
-    required this.isFrench,
-  });
-
+  const _KeepStrip({required this.keepRegions, required this.durationMs, required this.isFrench});
   final List<TrimRegion> keepRegions;
   final int durationMs;
   final bool isFrench;
@@ -1372,26 +1338,14 @@ class _KeepStrip extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final count = keepRegions.length;
     final label = isFrench
-        ? (count == 0
-            ? 'Aucune région conservée'
-            : count == 1
-                ? '1 région conservée'
-                : '$count régions conservées')
-        : (count == 0
-            ? 'No region kept'
-            : count == 1
-                ? '1 region kept'
-                : '$count regions kept');
+        ? (count == 0 ? 'Aucune région conservée' : count == 1 ? '1 région conservée' : '$count régions conservées')
+        : (count == 0 ? 'No region kept' : count == 1 ? '1 region kept' : '$count regions kept');
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
         Text(
           label,
-          style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                color: scheme.onSurfaceVariant,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 0.4,
-              ),
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant, fontWeight: FontWeight.w700, letterSpacing: 0.4),
         ),
         const SizedBox(height: 6),
         SizedBox(
@@ -1402,27 +1356,16 @@ class _KeepStrip extends StatelessWidget {
               children: <Widget>[
                 Container(
                   height: 12,
-                  decoration: BoxDecoration(
-                    color: scheme.errorContainer.withValues(alpha: 0.7),
-                    borderRadius: BorderRadius.circular(6),
-                  ),
+                  decoration: BoxDecoration(color: scheme.errorContainer.withValues(alpha: 0.7), borderRadius: BorderRadius.circular(6)),
                 ),
                 for (final region in keepRegions)
                   Positioned(
-                    left: (region.startMs / durationMs * width)
-                        .clamp(0.0, width)
-                        .toDouble(),
-                    width: math.max(
-                        3,
-                        ((region.endMs - region.startMs) /
-                                durationMs *
-                                width)
-                            .clamp(0.0, width)
-                            .toDouble()),
+                    left: (region.startMs / durationMs * width).clamp(0.0, width).toDouble(),
+                    width: math.max(3, ((region.endMs - region.startMs) / durationMs * width).clamp(0.0, width).toDouble()),
                     child: Container(
                       height: 12,
                       decoration: BoxDecoration(
-                        color: scheme.primary,
+                        color: region.gainDb != 0.0 ? Colors.green : scheme.primary,
                         borderRadius: BorderRadius.circular(6),
                       ),
                     ),

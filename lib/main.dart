@@ -157,6 +157,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
   final TextEditingController _lockPinController = TextEditingController();
   Timer? _trashTimer;
   bool _recordingRouteActive = false;
+  DateTime? _lastPausedTime; // <--- ADD THIS LINE
 
   @override
   void initState() {
@@ -214,7 +215,22 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
+    if (state == AppLifecycleState.paused) {
+      // App went to background or screen locked. Record the time.
+      _lastPausedTime = DateTime.now();
+    } else if (state == AppLifecycleState.resumed) {
+      // App is coming back to the foreground.
+      if (widget.preferences.appLockEnabled && _lastPausedTime != null) {
+        final elapsed = DateTime.now().difference(_lastPausedTime!);
+        // If away for more than 2 minutes, lock the app.
+        if (elapsed >= const Duration(minutes: 2)) {
+          if (mounted) {
+            setState(() => _locked = true);
+            _lockPinController.clear();
+          }
+        }
+      }
+      _lastPausedTime = null; // Reset
       _purgeExpiredTrash();
     }
   }
@@ -1833,6 +1849,7 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         },
       ),
       SettingsScreen(
+        repository: widget.repository,
         preferences: preferences,
         onSettingsChanged: widget.onSettingsChanged,
         onShowTour: _showGuidedTour,

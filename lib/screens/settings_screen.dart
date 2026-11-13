@@ -5,9 +5,12 @@ import '../services/app_preferences.dart';
 import '../services/ai_key_vault.dart';
 import '../services/app_lock_service.dart';
 import '../services/ai_provider_service.dart';
+import '../services/project_archive_service.dart';
+import '../services/project_repository.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({
+    required this.repository,
     required this.preferences,
     required this.onSettingsChanged,
     required this.onShowTour,
@@ -17,6 +20,7 @@ class SettingsScreen extends StatelessWidget {
     super.key,
   });
 
+  final ProjectRepository repository;
   final AppPreferences preferences;
   final VoidCallback onSettingsChanged;
   final VoidCallback onShowTour;
@@ -37,12 +41,7 @@ class SettingsScreen extends StatelessWidget {
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 820),
               child: ListView(
-                padding: EdgeInsets.fromLTRB(
-                  horizontalPadding,
-                  isCompact ? 16 : 28,
-                  horizontalPadding,
-                  32,
-                ),
+                padding: EdgeInsets.fromLTRB(horizontalPadding, isCompact ? 16 : 28, horizontalPadding, 32),
                 children: <Widget>[
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.center,
@@ -50,56 +49,33 @@ class SettingsScreen extends StatelessWidget {
                       Container(
                         width: 48,
                         height: 48,
-                        decoration: BoxDecoration(
-                          color: theme.colorScheme.primaryContainer,
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                        child: Icon(
-                          Icons.tune_rounded,
-                          color: theme.colorScheme.onPrimaryContainer,
-                        ),
+                        decoration: BoxDecoration(color: theme.colorScheme.primaryContainer, borderRadius: BorderRadius.circular(16)),
+                        child: Icon(Icons.tune_rounded, color: theme.colorScheme.onPrimaryContainer),
                       ),
                       const SizedBox(width: 14),
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: <Widget>[
-                            Text(
-                              tr(preferences, 'Settings', 'Paramètres'),
-                              style: theme.textTheme.headlineSmall?.copyWith(
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
+                            Text(tr(preferences, 'Settings', 'Paramètres'), style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800)),
                             const SizedBox(height: 3),
-                            Text(
-                              tr(
-                                preferences,
-                                'Tune your recording workspace.',
-                                'Personnalisez votre espace d’enregistrement.',
-                              ),
-                              style: theme.textTheme.bodyMedium?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
+                            Text(tr(preferences, 'Tune your recording workspace.', 'Personnalisez votre espace d’enregistrement.'), style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
                           ],
                         ),
                       ),
                     ],
                   ),
                   const SizedBox(height: 28),
-                  _SectionHeading(
-                      title: tr(preferences, 'Appearance', 'Apparence')),
+                  
+                  // --- APPEARANCE ---
+                  _SectionHeading(title: tr(preferences, 'Appearance', 'Apparence')),
                   Card(
                     child: Column(
                       children: <Widget>[
                         SwitchListTile.adaptive(
                           secondary: const Icon(Icons.dark_mode_outlined),
-                          title: Text(tr(preferences, 'Dark appearance',
-                              'Apparence sombre')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'A low-glare workspace for recording and listening.',
-                              'Une interface reposante pour enregistrer et écouter.')),
+                          title: Text(tr(preferences, 'Dark appearance', 'Apparence sombre')),
+                          subtitle: Text(tr(preferences, 'A low-glare workspace for recording and listening.', 'Une interface reposante pour enregistrer et écouter.')),
                           value: preferences.isDarkMode,
                           onChanged: (value) async {
                             preferences.isDarkMode = value;
@@ -110,18 +86,14 @@ class SettingsScreen extends StatelessWidget {
                         const Divider(height: 1),
                         ListTile(
                           leading: const Icon(Icons.language_rounded),
-                          title: Text(tr(preferences, 'Interface language',
-                              'Langue de l’interface')),
-                          subtitle: Text(
-                              preferences.isFrench ? 'Français' : 'English'),
+                          title: Text(tr(preferences, 'Interface language', 'Langue de l’interface')),
+                          subtitle: Text(preferences.isFrench ? 'Français' : 'English'),
                           trailing: DropdownButton<bool>(
                             value: preferences.isFrench,
                             underline: const SizedBox.shrink(),
                             items: const <DropdownMenuItem<bool>>[
-                              DropdownMenuItem(
-                                  value: false, child: Text('English')),
-                              DropdownMenuItem(
-                                  value: true, child: Text('Français')),
+                              DropdownMenuItem(value: false, child: Text('English')),
+                              DropdownMenuItem(value: true, child: Text('Français')),
                             ],
                             onChanged: (value) async {
                               if (value == null) return;
@@ -135,14 +107,50 @@ class SettingsScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 24),
-                  _SectionHeading(
-                      title: tr(preferences, 'Library & trash',
-                          'Bibliothèque et corbeille')),
+
+                  // --- BACKUP ---
+                  _SectionHeading(title: tr(preferences, 'Backup & Restore', 'Sauvegarde et restauration')),
+                  Card(
+                    child: ListTile(
+                      leading: const Icon(Icons.cloud_upload_outlined),
+                      title: Text(tr(preferences, 'Backup all recordings', 'Sauvegarder tous les enregistrements')),
+                      subtitle: Text(tr(
+                        preferences,
+                        'Export a ZIP file of your entire library (audio, notes, and attachments) to save to Google Drive or your computer.',
+                        'Exportez un fichier ZIP de toute votre bibliothèque (audio, notes, pièces jointes) vers Google Drive ou votre ordinateur.',
+                      )),
+                      trailing: const Icon(Icons.chevron_right_rounded),
+                      onTap: () async {
+                        final messenger = ScaffoldMessenger.of(context);
+                        showDialog(
+                          context: context,
+                          barrierDismissible: false,
+                          builder: (_) => const AlertDialog(
+                            content: Row(children: [
+                              CircularProgressIndicator(),
+                              SizedBox(width: 20),
+                              Expanded(child: Text('Compressing library...')),
+                            ]),
+                          ),
+                        );
+                        try {
+                          await ProjectArchiveService(repository).backupAllData();
+                          if (context.mounted) Navigator.of(context).pop();
+                        } catch (e) {
+                          if (context.mounted) Navigator.of(context).pop();
+                          messenger.showSnackBar(SnackBar(content: Text('Backup failed: $e')));
+                        }
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+
+                  // --- LIBRARY & TRASH ---
+                  _SectionHeading(title: tr(preferences, 'Library & trash', 'Bibliothèque et corbeille')),
                   Card(
                     child: ListTile(
                       leading: const Icon(Icons.delete_sweep_outlined),
-                      title: Text(tr(preferences, 'Trash retention',
-                          'Durée de conservation')),
+                      title: Text(tr(preferences, 'Trash retention', 'Durée de conservation')),
                       subtitle: Text(tr(
                         preferences,
                         'Items are permanently deleted after this many days in Trash. Choose Never to keep them until you delete them yourself.',
@@ -154,10 +162,7 @@ class SettingsScreen extends StatelessWidget {
                         items: AppPreferences.supportedTrashRetentionDays
                             .map((days) => DropdownMenuItem<int>(
                                   value: days,
-                                  child: Text(days == 0
-                                      ? tr(preferences, 'Never', 'Jamais')
-                                      : tr(preferences, '$days days',
-                                          '$days jours')),
+                                  child: Text(days == 0 ? tr(preferences, 'Never', 'Jamais') : tr(preferences, '$days days', '$days jours')),
                                 ))
                             .toList(),
                         onChanged: (days) async {
@@ -171,30 +176,24 @@ class SettingsScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 24),
-                  _SectionHeading(
-                      title: tr(preferences, 'Recording quality',
-                          'Qualité d’enregistrement')),
+
+                  // --- RECORDING QUALITY ---
+                  _SectionHeading(title: tr(preferences, 'Recording quality', 'Qualité d’enregistrement')),
                   Card(
                     child: Column(
                       children: <Widget>[
                         ListTile(
                           leading: const Icon(Icons.graphic_eq_rounded),
-                          title: Text(tr(preferences, 'Sample rate',
-                              'Fréquence d’échantillonnage')),
-                          subtitle: Text(
-                              '${(preferences.sampleRate / 1000).toStringAsFixed(preferences.sampleRate == 22050 ? 2 : 1)} kHz · ${tr(preferences, 'More samples capture more high-frequency detail; 44.1/48 kHz are good general-purpose choices.', 'Plus d’échantillons capturent plus de détails aigus ; 44,1/48 kHz conviennent à la plupart des usages.')}'),
+                          title: Text(tr(preferences, 'Sample rate', 'Fréquence d’échantillonnage')),
+                          subtitle: Text('${(preferences.sampleRate / 1000).toStringAsFixed(preferences.sampleRate == 22050 ? 2 : 1)} kHz · ${tr(preferences, 'More samples capture more high-frequency detail; 44.1/48 kHz are good general-purpose choices.', 'Plus d’échantillons capturent plus de détails aigus ; 44,1/48 kHz conviennent à la plupart des usages.')}'),
                           trailing: DropdownButton<int>(
                             value: preferences.sampleRate,
                             underline: const SizedBox.shrink(),
                             items: const <DropdownMenuItem<int>>[
-                              DropdownMenuItem(
-                                  value: 16000, child: Text('16 kHz')),
-                              DropdownMenuItem(
-                                  value: 22050, child: Text('22.05 kHz')),
-                              DropdownMenuItem(
-                                  value: 44100, child: Text('44.1 kHz')),
-                              DropdownMenuItem(
-                                  value: 48000, child: Text('48 kHz')),
+                              DropdownMenuItem(value: 16000, child: Text('16 kHz')),
+                              DropdownMenuItem(value: 22050, child: Text('22.05 kHz')),
+                              DropdownMenuItem(value: 44100, child: Text('44.1 kHz')),
+                              DropdownMenuItem(value: 48000, child: Text('48 kHz')),
                             ],
                             onChanged: (value) async {
                               if (value == null) return;
@@ -207,24 +206,17 @@ class SettingsScreen extends StatelessWidget {
                         const Divider(height: 1),
                         ListTile(
                           leading: const Icon(Icons.tune_rounded),
-                          title: Text(
-                              tr(preferences, 'Bit rate', 'Débit binaire')),
-                          subtitle: Text(
-                              '${preferences.bitRate ~/ 1000} kbps · ${tr(preferences, 'Higher bitrate usually means larger files and better compressed-audio quality. WAV/FLAC are not controlled by this setting on every platform.', 'Un débit plus élevé produit généralement des fichiers plus volumineux et une meilleure qualité compressée. WAV/FLAC ne dépendent pas toujours de ce réglage.')}'),
+                          title: Text(tr(preferences, 'Bit rate', 'Débit binaire')),
+                          subtitle: Text('${preferences.bitRate ~/ 1000} kbps · ${tr(preferences, 'Higher bitrate usually means larger files and better compressed-audio quality. WAV/FLAC are not controlled by this setting on every platform.', 'Un débit plus élevé produit généralement des fichiers plus volumineux et une meilleure qualité compressée. WAV/FLAC ne dépendent pas toujours de ce réglage.')}'),
                           trailing: DropdownButton<int>(
                             value: preferences.bitRate,
                             underline: const SizedBox.shrink(),
                             items: const <DropdownMenuItem<int>>[
-                              DropdownMenuItem(
-                                  value: 64000, child: Text('64 kbps')),
-                              DropdownMenuItem(
-                                  value: 96000, child: Text('96 kbps')),
-                              DropdownMenuItem(
-                                  value: 128000, child: Text('128 kbps')),
-                              DropdownMenuItem(
-                                  value: 192000, child: Text('192 kbps')),
-                              DropdownMenuItem(
-                                  value: 256000, child: Text('256 kbps')),
+                              DropdownMenuItem(value: 64000, child: Text('64 kbps')),
+                              DropdownMenuItem(value: 96000, child: Text('96 kbps')),
+                              DropdownMenuItem(value: 128000, child: Text('128 kbps')),
+                              DropdownMenuItem(value: 192000, child: Text('192 kbps')),
+                              DropdownMenuItem(value: 256000, child: Text('256 kbps')),
                             ],
                             onChanged: (value) async {
                               if (value == null) return;
@@ -237,24 +229,16 @@ class SettingsScreen extends StatelessWidget {
                         const Divider(height: 1),
                         ListTile(
                           leading: const Icon(Icons.audiotrack_rounded),
-                          title: Text(tr(preferences, 'Recording format',
-                              'Format d’enregistrement')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'Choose the format for new recordings',
-                              'Choisissez le format des nouveaux enregistrements')),
+                          title: Text(tr(preferences, 'Recording format', 'Format d’enregistrement')),
+                          subtitle: Text(tr(preferences, 'Choose the format for new recordings', 'Choisissez le format des nouveaux enregistrements')),
                           trailing: DropdownButton<String>(
                             value: preferences.recordingFormat,
                             underline: const SizedBox.shrink(),
                             items: const <DropdownMenuItem<String>>[
-                              DropdownMenuItem(
-                                  value: 'm4a', child: Text('M4A / AAC')),
-                              DropdownMenuItem(
-                                  value: 'mp3', child: Text('MP3')),
-                              DropdownMenuItem(
-                                  value: 'wav', child: Text('WAV / PCM')),
-                              DropdownMenuItem(
-                                  value: 'flac', child: Text('FLAC')),
+                              DropdownMenuItem(value: 'm4a', child: Text('M4A / AAC')),
+                              DropdownMenuItem(value: 'mp3', child: Text('MP3')),
+                              DropdownMenuItem(value: 'wav', child: Text('WAV / PCM')),
+                              DropdownMenuItem(value: 'flac', child: Text('FLAC')),
                             ],
                             onChanged: (value) async {
                               if (value == null) return;
@@ -267,12 +251,8 @@ class SettingsScreen extends StatelessWidget {
                         const Divider(height: 1),
                         SwitchListTile.adaptive(
                           secondary: const Icon(Icons.graphic_eq_outlined),
-                          title: Text(tr(preferences, 'Voice enhancement',
-                              'Amélioration de la voix')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'Request automatic gain, echo cancellation and noise suppression when the device supports them.',
-                              'Demander le gain automatique, la réduction de l’écho et du bruit si l’appareil les prend en charge.')),
+                          title: Text(tr(preferences, 'Voice enhancement', 'Amélioration de la voix')),
+                          subtitle: Text(tr(preferences, 'Request automatic gain, echo cancellation and noise suppression when the device supports them.', 'Demander le gain automatique, la réduction de l’écho et du bruit si l’appareil les prend en charge.')),
                           value: preferences.voiceProcessing,
                           onChanged: (value) async {
                             preferences.voiceProcessing = value;
@@ -284,71 +264,48 @@ class SettingsScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 24),
-                  _SectionHeading(
-                      title: tr(preferences, 'AI tools (optional)',
-                          'Outils IA (facultatifs)')),
+
+                  // --- AI TOOLS ---
+                  _SectionHeading(title: tr(preferences, 'AI tools (optional)', 'Outils IA (facultatifs)')),
                   Card(
                     child: ListTile(
                       leading: const Icon(Icons.key_outlined),
-                      title: Text(tr(preferences, 'Your AI provider key',
-                          'Votre clé de fournisseur IA')),
-                      subtitle: Text(
-                          '${preferences.aiProvider} · ${preferences.aiModel}\n${tr(preferences, 'Your key is stored securely. AI is optional and runs only when you request it.', 'Votre clé est stockée en sécurité. L’IA est facultative et ne fonctionne que sur demande.')}'),
+                      title: Text(tr(preferences, 'Your AI provider key', 'Votre clé de fournisseur IA')),
+                      subtitle: Text('${preferences.aiProvider} · ${preferences.aiModel}\n${tr(preferences, 'Your key is stored securely. AI is optional and runs only when you request it.', 'Votre clé est stockée en sécurité. L’IA est facultative et ne fonctionne que sur demande.')}'),
                       trailing: const Icon(Icons.chevron_right_rounded),
-                      onTap: () => _configureAiKey(
-                          context, preferences, onSettingsChanged),
+                      onTap: () => _configureAiKey(context, preferences, onSettingsChanged),
                     ),
                   ),
                   const SizedBox(height: 24),
-                  _SectionHeading(
-                      title: tr(preferences, 'Privacy & storage',
-                          'Confidentialité et stockage')),
+
+                  // --- PRIVACY & STORAGE ---
+                  _SectionHeading(title: tr(preferences, 'Privacy & storage', 'Confidentialité et stockage')),
                   Card(
                     child: Column(
                       children: <Widget>[
                         ListTile(
                           leading: const Icon(Icons.shield_outlined),
-                          title: Text(tr(preferences, 'Private app storage',
-                              'Stockage privé de l’application')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'Recordings are stored in the app’s private directory by default.',
-                              'Les enregistrements sont stockés par défaut dans le dossier privé de l’application.')),
+                          title: Text(tr(preferences, 'Private app storage', 'Stockage privé de l’application')),
+                          subtitle: Text(tr(preferences, 'Recordings are stored in the app’s private directory by default.', 'Les enregistrements sont stockés par défaut dans le dossier privé de l’application.')),
                         ),
                         const Divider(height: 1),
                         ListTile(
                           leading: const Icon(Icons.lock_outline_rounded),
-                          title: Text(tr(preferences, 'Audio encryption',
-                              'Chiffrement audio')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'Use a recording’s three-dot menu → Lock audio with a password. The password is not stored; forgetting it means the audio cannot be recovered. This is separate from the RAVEN app PIN.',
-                              'Utilisez le menu à trois points d’un enregistrement → Verrouiller l’audio avec un mot de passe. Le mot de passe n’est pas enregistré ; si vous l’oubliez, l’audio ne pourra pas être récupéré. Cette protection est indépendante du code PIN de RAVEN.')),
+                          title: Text(tr(preferences, 'Audio encryption', 'Chiffrement audio')),
+                          subtitle: Text(tr(preferences, 'Use a recording’s three-dot menu → Lock audio with a password. The password is not stored; forgetting it means the audio cannot be recovered. This is separate from the RAVEN app PIN.', 'Utilisez le menu à trois points d’un enregistrement → Verrouiller l’audio avec un mot de passe. Le mot de passe n’est pas enregistré ; si vous l’oubliez, l’audio ne pourra pas être récupéré. Cette protection est indépendante du code PIN de RAVEN.')),
                         ),
                         const Divider(height: 1),
                         SwitchListTile.adaptive(
                           secondary: const Icon(Icons.public_rounded),
-                          title: Text(tr(preferences, 'Public audio by default',
-                              'Audio public par défaut')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'New recordings are moved into your device’s RAVEN music folder so other apps can play them. No duplicate copy is created; switch a recording back to private to move it into app storage again.',
-                              'Les nouveaux enregistrements sont déplacés dans le dossier musical RAVEN de l’appareil pour que d’autres applications puissent les lire. Aucune copie n’est créée ; repassez un enregistrement en privé pour le replacer dans le stockage de l’application.')),
+                          title: Text(tr(preferences, 'Public audio by default', 'Audio public par défaut')),
+                          subtitle: Text(tr(preferences, 'New recordings are moved into your device’s RAVEN music folder so other apps can play them. No duplicate copy is created; switch a recording back to private to move it into app storage again.', 'Les nouveaux enregistrements sont déplacés dans le dossier musical RAVEN de l’appareil pour que d’autres applications puissent les lire. Aucune copie n’est créée ; repassez un enregistrement en privé pour le replacer dans le stockage de l’application.')),
                           value: preferences.defaultPublicAudioVisible,
                           onChanged: (value) async {
                             if (value && onRequestStoragePermission != null) {
-                              final granted =
-                                  await onRequestStoragePermission!();
+                              final granted = await onRequestStoragePermission!();
                               if (!granted) {
                                 if (context.mounted) {
-                                  ScaffoldMessenger.of(context)
-                                      .showSnackBar(SnackBar(
-                                    content: Text(tr(
-                                      preferences,
-                                      'All files access is required to store audio in Music/RAVEN.',
-                                      'L’accès à tous les fichiers est requis pour stocker l’audio dans Music/RAVEN.',
-                                    )),
-                                  ));
+                                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(tr(preferences, 'All files access is required to store audio in Music/RAVEN.', 'L’accès à tous les fichiers est requis pour stocker l’audio dans Music/RAVEN.'))));
                                 }
                                 return;
                               }
@@ -361,38 +318,18 @@ class SettingsScreen extends StatelessWidget {
                         const Divider(height: 1),
                         ListTile(
                           leading: const Icon(Icons.public_rounded),
-                          title: Text(tr(
-                              preferences,
-                              'Make all recordings public',
-                              'Rendre tous les enregistrements publics')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'Move all unencrypted recordings into Music/RAVEN so other apps can play them.',
-                              'Déplacer tous les enregistrements non chiffrés vers Music/RAVEN pour que d’autres applications puissent les lire.')),
+                          title: Text(tr(preferences, 'Make all recordings public', 'Rendre tous les enregistrements publics')),
+                          subtitle: Text(tr(preferences, 'Move all unencrypted recordings into Music/RAVEN so other apps can play them.', 'Déplacer tous les enregistrements non chiffrés vers Music/RAVEN pour que d’autres applications puissent les lire.')),
                           trailing: const Icon(Icons.chevron_right_rounded),
                           onTap: () async {
                             final confirmed = await showDialog<bool>(
                               context: context,
                               builder: (dialogContext) => AlertDialog(
-                                title: Text(tr(
-                                    preferences,
-                                    'Make all recordings public?',
-                                    'Rendre tous les enregistrements publics ?')),
-                                content: Text(tr(
-                                    preferences,
-                                    'RAVEN will move every non-protected recording into your device’s Music/RAVEN folder.',
-                                    'RAVEN déplacera tous les enregistrements non protégés vers le dossier Music/RAVEN de l’appareil.')),
+                                title: Text(tr(preferences, 'Make all recordings public?', 'Rendre tous les enregistrements publics ?')),
+                                content: Text(tr(preferences, 'RAVEN will move every non-protected recording into your device’s Music/RAVEN folder.', 'RAVEN déplacera tous les enregistrements non protégés vers le dossier Music/RAVEN de l’appareil.')),
                                 actions: <Widget>[
-                                  TextButton(
-                                      onPressed: () =>
-                                          Navigator.pop(dialogContext, false),
-                                      child: Text(tr(
-                                          preferences, 'Cancel', 'Annuler'))),
-                                  FilledButton(
-                                      onPressed: () =>
-                                          Navigator.pop(dialogContext, true),
-                                      child: Text(tr(preferences, 'Make public',
-                                          'Rendre public'))),
+                                  TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: Text(tr(preferences, 'Cancel', 'Annuler'))),
+                                  FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: Text(tr(preferences, 'Make public', 'Rendre public'))),
                                 ],
                               ),
                             );
@@ -405,38 +342,18 @@ class SettingsScreen extends StatelessWidget {
                         const Divider(height: 1),
                         ListTile(
                           leading: const Icon(Icons.public_off_rounded),
-                          title: Text(tr(
-                              preferences,
-                              'Make all recordings private',
-                              'Rendre tous les enregistrements privés')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'Move all recordings back into RAVEN’s private storage.',
-                              'Replacer tous les enregistrements dans le stockage privé de RAVEN.')),
+                          title: Text(tr(preferences, 'Make all recordings private', 'Rendre tous les enregistrements privés')),
+                          subtitle: Text(tr(preferences, 'Move all recordings back into RAVEN’s private storage.', 'Replacer tous les enregistrements dans le stockage privé de RAVEN.')),
                           trailing: const Icon(Icons.chevron_right_rounded),
                           onTap: () async {
                             final confirmed = await showDialog<bool>(
                               context: context,
                               builder: (dialogContext) => AlertDialog(
-                                title: Text(tr(
-                                    preferences,
-                                    'Make all recordings private?',
-                                    'Rendre tous les enregistrements privés ?')),
-                                content: Text(tr(
-                                    preferences,
-                                    'RAVEN will move all recordings back into private app storage.',
-                                    'RAVEN replacera tous les enregistrements dans le stockage privé de l’application.')),
+                                title: Text(tr(preferences, 'Make all recordings private?', 'Rendre tous les enregistrements privés ?')),
+                                content: Text(tr(preferences, 'RAVEN will move all recordings back into private app storage.', 'RAVEN replacera tous les enregistrements dans le stockage privé de l’application.')),
                                 actions: <Widget>[
-                                  TextButton(
-                                      onPressed: () =>
-                                          Navigator.pop(dialogContext, false),
-                                      child: Text(tr(
-                                          preferences, 'Cancel', 'Annuler'))),
-                                  FilledButton(
-                                      onPressed: () =>
-                                          Navigator.pop(dialogContext, true),
-                                      child: Text(tr(preferences,
-                                          'Make private', 'Rendre privé'))),
+                                  TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: Text(tr(preferences, 'Cancel', 'Annuler'))),
+                                  FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: Text(tr(preferences, 'Make private', 'Rendre privé'))),
                                 ],
                               ),
                             );
@@ -450,45 +367,34 @@ class SettingsScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 24),
-                  _SectionHeading(
-                      title: tr(preferences, 'Privacy', 'Confidentialité')),
+
+                  // --- SECURITY ---
+                  _SectionHeading(title: tr(preferences, 'Privacy', 'Confidentialité')),
                   Card(
                     child: SwitchListTile.adaptive(
                       secondary: const Icon(Icons.lock_outline_rounded),
-                      title: Text(tr(preferences, 'Lock RAVEN with a PIN',
-                          'Verrouiller RAVEN avec un code PIN')),
-                      subtitle: Text(tr(
-                          preferences,
-                          'Require a 4–12 digit PIN when RAVEN starts after being closed. The app stays unlocked when you switch away and return; this does not encrypt audio files.',
-                          'Demander un code PIN de 4 à 12 chiffres au redémarrage de RAVEN après sa fermeture. L’application reste déverrouillée lorsque vous la mettez en arrière-plan ; cela ne chiffre pas les fichiers audio.')),
+                      title: Text(tr(preferences, 'Lock RAVEN with a PIN', 'Verrouiller RAVEN avec un code PIN')),
+                      subtitle: Text(tr(preferences, 'Require a 4–12 digit PIN when RAVEN starts after being closed. The app stays unlocked when you switch away and return; this does not encrypt audio files.', 'Demander un code PIN de 4 à 12 chiffres au redémarrage de RAVEN après sa fermeture. L’application reste déverrouillée lorsque vous la mettez en arrière-plan ; cela ne chiffre pas les fichiers audio.')),
                       value: preferences.appLockEnabled,
                       onChanged: (enabled) async {
-                        final changed = await _configureAppLock(
-                            context, preferences,
-                            enable: enabled);
+                        final changed = await _configureAppLock(context, preferences, enable: enabled);
                         if (changed) onSettingsChanged();
                       },
                     ),
                   ),
                   const SizedBox(height: 24),
-                  _SectionHeading(
-                      title: tr(preferences, 'Help & learning',
-                          'Aide et découverte')),
+
+                  // --- HELP & ABOUT ---
+                  _SectionHeading(title: tr(preferences, 'Help & learning', 'Aide et découverte')),
                   Card(
                       child: ListTile(
                           leading: const Icon(Icons.explore_outlined),
-                          title: Text(tr(preferences, 'Replay the guided tour',
-                              'Revoir la visite guidée')),
-                          subtitle: Text(tr(
-                              preferences,
-                              'A short walkthrough of recording, the library, settings and privacy.',
-                              'Une courte présentation de l’enregistrement, de la bibliothèque, des réglages et de la confidentialité.')),
+                          title: Text(tr(preferences, 'Replay the guided tour', 'Revoir la visite guidée')),
+                          subtitle: Text(tr(preferences, 'A short walkthrough of recording, the library, settings and privacy.', 'Une courte présentation de l’enregistrement, de la bibliothèque, des réglages et de la confidentialité.')),
                           trailing: const Icon(Icons.chevron_right_rounded),
                           onTap: onShowTour)),
                   const SizedBox(height: 24),
-                  _SectionHeading(
-                      title:
-                          tr(preferences, 'About RAVEN', 'À propos de RAVEN')),
+                  _SectionHeading(title: tr(preferences, 'About RAVEN', 'À propos de RAVEN')),
                   Card(
                     child: Padding(
                       padding: const EdgeInsets.all(18),
@@ -497,32 +403,18 @@ class SettingsScreen extends StatelessWidget {
                         children: <Widget>[
                           ClipRRect(
                             borderRadius: BorderRadius.circular(14),
-                            child: Image.asset('assets/images/raven_logo.png',
-                                width: 78, height: 78, fit: BoxFit.cover),
+                            child: Image.asset('assets/images/raven_logo.png', width: 78, height: 78, fit: BoxFit.cover),
                           ),
                           const SizedBox(width: 16),
                           Expanded(
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: <Widget>[
-                                Text('RAVEN',
-                                    style: theme.textTheme.titleLarge?.copyWith(
-                                        fontWeight: FontWeight.w900,
-                                        letterSpacing: 2.2)),
+                                Text('RAVEN', style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900, letterSpacing: 2.2)),
                                 const SizedBox(height: 4),
-                                Text(
-                                    'Record · Archive · Visualise · Edit · Notes',
-                                    style: theme.textTheme.bodySmall?.copyWith(
-                                        color: theme.colorScheme.primary)),
+                                Text('Record · Archive · Visualise · Edit · Notes', style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.primary)),
                                 const SizedBox(height: 8),
-                                Text(
-                                    tr(
-                                        preferences,
-                                        'Flutter conversion baseline · 0.1.0',
-                                        'Base de conversion Flutter · 0.1.0'),
-                                    style: theme.textTheme.bodySmall?.copyWith(
-                                        color: theme
-                                            .colorScheme.onSurfaceVariant)),
+                                Text(tr(preferences, 'Flutter conversion baseline · 0.1.0', 'Base de conversion Flutter · 0.1.0'), style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
                               ],
                             ),
                           ),
@@ -532,12 +424,8 @@ class SettingsScreen extends StatelessWidget {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    tr(
-                        preferences,
-                        'RAVEN keeps recordings in its private app storage by default, so they do not normally appear in public music folders. The PIN protects access to the app interface; it is not file encryption. Exporting a recording creates a separate copy outside RAVEN.',
-                        'Par défaut, RAVEN conserve les enregistrements dans le stockage privé de l’application : ils n’apparaissent normalement pas dans les dossiers musicaux publics. Le code PIN protège l’accès à l’interface, pas les fichiers par chiffrement. Exporter un enregistrement crée une copie distincte hors de RAVEN.'),
-                    style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant, height: 1.5),
+                    tr(preferences, 'RAVEN keeps recordings in its private app storage by default, so they do not normally appear in public music folders. The PIN protects access to the app interface; it is not file encryption. Exporting a recording creates a separate copy outside RAVEN.', 'Par défaut, RAVEN conserve les enregistrements dans le stockage privé de l’application : ils n’apparaissent normalement pas dans les dossiers musicaux publics. Le code PIN protège l’accès à l’interface, pas les fichiers par chiffrement. Exporter un enregistrement crée une copie distincte hors de RAVEN.'),
+                    style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant, height: 1.5),
                   ),
                 ],
               ),
@@ -559,21 +447,13 @@ class _SectionHeading extends StatelessWidget {
       padding: const EdgeInsets.only(left: 3, bottom: 10),
       child: Text(
         title.toUpperCase(),
-        style: Theme.of(context).textTheme.labelLarge?.copyWith(
-              letterSpacing: 1.2,
-              color: Theme.of(context).colorScheme.primary,
-              fontWeight: FontWeight.w800,
-            ),
+        style: Theme.of(context).textTheme.labelLarge?.copyWith(letterSpacing: 1.2, color: Theme.of(context).colorScheme.primary, fontWeight: FontWeight.w800),
       ),
     );
   }
 }
 
-Future<bool> _configureAppLock(
-  BuildContext context,
-  AppPreferences preferences, {
-  required bool enable,
-}) async {
+Future<bool> _configureAppLock(BuildContext context, AppPreferences preferences, {required bool enable}) async {
   final service = AppLockService();
   final currentController = TextEditingController();
   final pinController = TextEditingController();
@@ -582,62 +462,29 @@ Future<bool> _configureAppLock(
   final result = await showDialog<bool>(
     context: context,
     builder: (dialogContext) => AlertDialog(
-      title: Text(tr(preferences, enable ? 'Set app PIN' : 'Turn off app lock',
-          enable ? 'Définir le code PIN' : 'Désactiver le verrouillage')),
+      title: Text(tr(preferences, enable ? 'Set app PIN' : 'Turn off app lock', enable ? 'Définir le code PIN' : 'Désactiver le verrouillage')),
       content: SizedBox(
         width: 380,
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
             if (wasEnabled) ...<Widget>[
-              TextField(
-                  controller: currentController,
-                  obscureText: true,
-                  keyboardType: TextInputType.number,
-                  maxLength: 12,
-                  decoration: InputDecoration(
-                      labelText:
-                          tr(preferences, 'Current PIN', 'Code PIN actuel'))),
+              TextField(controller: currentController, obscureText: true, keyboardType: TextInputType.number, maxLength: 12, decoration: InputDecoration(labelText: tr(preferences, 'Current PIN', 'Code PIN actuel'))),
               const SizedBox(height: 8),
             ],
             if (enable) ...<Widget>[
-              Text(tr(
-                  preferences,
-                  'Choose 4 to 12 digits. If you forget this PIN, you may need to clear app data to regain access; keep your recordings backed up.',
-                  'Choisissez 4 à 12 chiffres. Si vous oubliez ce code, il peut être nécessaire d’effacer les données de l’application pour retrouver l’accès ; sauvegardez vos enregistrements.')),
+              Text(tr(preferences, 'Choose 4 to 12 digits. If you forget this PIN, you may need to clear app data to regain access; keep your recordings backed up.', 'Choisissez 4 à 12 chiffres. Si vous oubliez ce code, il peut être nécessaire d’effacer les données de l’application pour retrouver l’accès ; sauvegardez vos enregistrements.')),
               const SizedBox(height: 12),
-              TextField(
-                  controller: pinController,
-                  obscureText: true,
-                  keyboardType: TextInputType.number,
-                  maxLength: 12,
-                  decoration: InputDecoration(
-                      labelText:
-                          tr(preferences, 'New PIN', 'Nouveau code PIN'))),
-              TextField(
-                  controller: confirmController,
-                  obscureText: true,
-                  keyboardType: TextInputType.number,
-                  maxLength: 12,
-                  decoration: InputDecoration(
-                      labelText: tr(preferences, 'Confirm PIN',
-                          'Confirmer le code PIN'))),
+              TextField(controller: pinController, obscureText: true, keyboardType: TextInputType.number, maxLength: 12, decoration: InputDecoration(labelText: tr(preferences, 'New PIN', 'Nouveau code PIN'))),
+              TextField(controller: confirmController, obscureText: true, keyboardType: TextInputType.number, maxLength: 12, decoration: InputDecoration(labelText: tr(preferences, 'Confirm PIN', 'Confirmer le code PIN'))),
             ] else
-              Text(tr(
-                  preferences,
-                  'Enter your current PIN to disable the app lock.',
-                  'Saisissez votre code PIN actuel pour désactiver le verrouillage.')),
+              Text(tr(preferences, 'Enter your current PIN to disable the app lock.', 'Saisissez votre code PIN actuel pour désactiver le verrouillage.')),
           ],
         ),
       ),
       actions: <Widget>[
-        TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: Text(tr(preferences, 'Cancel', 'Annuler'))),
-        FilledButton(
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: Text(tr(preferences, enable ? 'Save PIN' : 'Disable lock',
-                enable ? 'Enregistrer' : 'Désactiver'))),
+        TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: Text(tr(preferences, 'Cancel', 'Annuler'))),
+        FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: Text(tr(preferences, enable ? 'Save PIN' : 'Disable lock', enable ? 'Enregistrer' : 'Désactiver'))),
       ],
     ),
   );
@@ -645,33 +492,25 @@ Future<bool> _configureAppLock(
   if (result == true) {
     try {
       if (wasEnabled && !await service.verifyPin(currentController.text)) {
-        throw StateError(tr(preferences, 'The current PIN is incorrect.',
-            'Le code PIN actuel est incorrect.'));
+        throw StateError(tr(preferences, 'The current PIN is incorrect.', 'Le code PIN actuel est incorrect.'));
       }
       if (enable) {
         if (pinController.text != confirmController.text) {
-          throw StateError(tr(preferences, 'The PIN entries do not match.',
-              'Les codes PIN ne correspondent pas.'));
+          throw StateError(tr(preferences, 'The PIN entries do not match.', 'Les codes PIN ne correspondent pas.'));
         }
         await service.setPin(pinController.text);
         preferences.appLockEnabled = true;
       } else {
-        // Keep the verifier so individually PIN-locked projects remain accessible.
         preferences.appLockEnabled = false;
       }
       await preferences.save();
       changed = true;
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(tr(
-                preferences,
-                enable ? 'App lock enabled.' : 'App lock disabled.',
-                enable ? 'Verrouillage activé.' : 'Verrouillage désactivé.'))));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(tr(preferences, enable ? 'App lock enabled.' : 'App lock disabled.', enable ? 'Verrouillage activé.' : 'Verrouillage désactivé.'))));
       }
     } catch (error) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('$error')));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$error')));
       }
     }
   }
@@ -681,42 +520,34 @@ Future<bool> _configureAppLock(
   return changed;
 }
 
-Future<void> _configureAiKey(
-  BuildContext context,
-  AppPreferences preferences,
-  VoidCallback onSettingsChanged,
-) async {
+Future<void> _configureAiKey(BuildContext context, AppPreferences preferences, VoidCallback onSettingsChanged) async {
   var provider = RavenAiProvider.values.firstWhere(
     (item) => item.id == preferences.aiProvider,
     orElse: () => RavenAiProvider.openRouter,
   );
   final keyController = TextEditingController();
   final modelController = TextEditingController(
-      text: preferences.aiModel.isNotEmpty
-          ? preferences.aiModel
-          : provider.defaultModel);
+      text: preferences.aiModel.isNotEmpty ? preferences.aiModel : provider.defaultModel);
   final vault = AiKeyVault();
   final ai = RavenAiProviderService(vault: vault);
   var busy = false;
   String? status;
   bool statusIsError = false;
   var keyExists = false;
+  
   try {
     keyExists = await vault.hasKey(provider.id);
   } catch (_) {
-    status = tr(
-        preferences,
-        'RAVEN could not access secure storage. Check your device configuration and try again.',
-        'RAVEN n’a pas pu accéder au stockage sécurisé. Vérifiez la configuration de l’appareil et réessayez.');
+    status = tr(preferences, 'RAVEN could not access secure storage. Check your device configuration and try again.', 'RAVEN n’a pas pu accéder au stockage sécurisé. Vérifiez la configuration de l’appareil et réessayez.');
     statusIsError = true;
   }
 
   if (!context.mounted) {
     keyController.dispose();
     modelController.dispose();
-    ai.close();
     return;
   }
+  
   await showDialog<void>(
     context: context,
     barrierDismissible: false,
@@ -729,8 +560,7 @@ Future<void> _configureAiKey(
           RavenAiProvider.gemini => 'https://aistudio.google.com/app/apikey',
         };
         return AlertDialog(
-          title: Text(tr(preferences, 'Configure your AI assistant',
-              'Configurer votre assistant IA')),
+          title: Text(tr(preferences, 'Configure your AI assistant', 'Configurer votre assistant IA')),
           content: SizedBox(
             width: 480,
             child: SingleChildScrollView(
@@ -738,20 +568,37 @@ Future<void> _configureAiKey(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
-                  Text(tr(
-                      preferences,
-                      'AI is optional and uses your own provider account. RAVEN does not pay for API usage. A ChatGPT subscription is separate from OpenAI API billing. Check each provider’s pricing and limits before sending requests.',
-                      'L’IA est facultative et utilise votre propre compte fournisseur. RAVEN ne paie pas les appels API. Un abonnement ChatGPT est distinct de la facturation API OpenAI. Vérifiez les tarifs et limites avant d’envoyer des requêtes.')),
+                  Text(tr(preferences, 'AI is optional and uses your own provider account. RAVEN does not pay for API usage. A ChatGPT subscription is separate from OpenAI API billing. Check each provider’s pricing and limits before sending requests.', 'L’IA est facultative et utilise votre propre compte fournisseur. RAVEN ne paie pas les appels API. Un abonnement ChatGPT est distinct de la facturation API OpenAI. Vérifiez les tarifs et limites avant d’envoyer des requêtes.')),
+                  
+                  // --- FREE AI OPTION TIP ---
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Theme.of(dialogContext).colorScheme.tertiaryContainer.withValues(alpha: 0.4),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Theme.of(dialogContext).colorScheme.tertiary.withValues(alpha: 0.3)),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Icon(Icons.lightbulb_outline_rounded, size: 20, color: Theme.of(dialogContext).colorScheme.onTertiaryContainer),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            tr(preferences, 'Free Option: Choose OpenRouter and use the exact model ID `meta-llama/llama-3.3-70b-instruct:free`. It requires no credit card.', 'Option gratuite : Choisissez OpenRouter et utilisez l\'identifiant `meta-llama/llama-3.3-70b-instruct:free`. Aucune carte de crédit requise.'),
+                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Theme.of(dialogContext).colorScheme.onTertiaryContainer),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  
                   const SizedBox(height: 16),
                   DropdownButtonFormField<RavenAiProvider>(
                     initialValue: provider,
-                    decoration: InputDecoration(
-                        labelText:
-                            tr(preferences, 'AI provider', 'Fournisseur IA')),
-                    items: RavenAiProvider.values
-                        .map((item) => DropdownMenuItem(
-                            value: item, child: Text(item.label)))
-                        .toList(),
+                    decoration: InputDecoration(labelText: tr(preferences, 'AI provider', 'Fournisseur IA')),
+                    items: RavenAiProvider.values.map((item) => DropdownMenuItem(value: item, child: Text(item.label))).toList(),
                     onChanged: busy
                         ? null
                         : (value) async {
@@ -768,10 +615,7 @@ Future<void> _configureAiKey(
                               keyExists = await vault.hasKey(value.id);
                             } catch (_) {
                               keyExists = false;
-                              status = tr(
-                                  preferences,
-                                  'RAVEN could not access secure storage. Check your device configuration and try again.',
-                                  'RAVEN n’a pas pu accéder au stockage sécurisé. Vérifiez la configuration de l’appareil et réessayez.');
+                              status = tr(preferences, 'RAVEN could not access secure storage.', 'RAVEN n’a pas pu accéder au stockage sécurisé.');
                               statusIsError = true;
                             } finally {
                               if (dialogContext.mounted) {
@@ -781,23 +625,17 @@ Future<void> _configureAiKey(
                           },
                   ),
                   const SizedBox(height: 12),
-                  Text(help,
-                      style: Theme.of(dialogContext).textTheme.bodySmall),
+                  Text(help, style: Theme.of(dialogContext).textTheme.bodySmall),
                   const SizedBox(height: 4),
                   Align(
                     alignment: Alignment.centerLeft,
                     child: TextButton.icon(
                       icon: const Icon(Icons.content_copy_rounded, size: 17),
-                      label: Text(tr(preferences, 'Copy official API-key page',
-                          'Copier la page officielle de clé API')),
+                      label: Text(tr(preferences, 'Copy official API-key page', 'Copier la page officielle de clé API')),
                       onPressed: () async {
                         await Clipboard.setData(ClipboardData(text: url));
                         if (dialogContext.mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                              content: Text(tr(
-                                  preferences,
-                                  'Official page address copied.',
-                                  'Adresse de la page officielle copiée.'))));
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(tr(preferences, 'Official page address copied.', 'Adresse de la page officielle copiée.'))));
                         }
                       },
                     ),
@@ -807,12 +645,8 @@ Future<void> _configureAiKey(
                     controller: modelController,
                     enabled: !busy,
                     decoration: InputDecoration(
-                      labelText: tr(preferences, 'Model identifier',
-                          'Identifiant du modèle'),
-                      helperText: tr(
-                          preferences,
-                          'Use the exact model ID shown by your provider. Model availability and prices can change.',
-                          'Utilisez l’identifiant exact du modèle indiqué par le fournisseur. Disponibilité et tarifs peuvent changer.'),
+                      labelText: tr(preferences, 'Model identifier', 'Identifiant du modèle'),
+                      helperText: tr(preferences, 'Use the exact model ID shown by your provider.', 'Utilisez l’identifiant exact du modèle indiqué par le fournisseur.'),
                     ),
                   ),
                   const SizedBox(height: 12),
@@ -823,45 +657,21 @@ Future<void> _configureAiKey(
                     enableSuggestions: false,
                     autocorrect: false,
                     decoration: InputDecoration(
-                      labelText: keyExists
-                          ? tr(
-                              preferences,
-                              'API key (leave blank to keep saved key)',
-                              'Clé API (laisser vide pour conserver la clé)')
-                          : tr(preferences, 'Paste your API key',
-                              'Collez votre clé API'),
-                      helperText: keyExists
-                          ? tr(
-                              preferences,
-                              'A key is saved securely for this provider.',
-                              'Une clé est enregistrée en sécurité pour ce fournisseur.')
-                          : tr(
-                              preferences,
-                              'The key is stored in OS secure storage, never in project notes.',
-                              'La clé est stockée dans le coffre sécurisé du système, jamais dans les notes du projet.'),
+                      labelText: keyExists ? tr(preferences, 'API key (leave blank to keep saved key)', 'Clé API (laisser vide pour conserver la clé)') : tr(preferences, 'Paste your API key', 'Collez votre clé API'),
+                      helperText: keyExists ? tr(preferences, 'A key is saved securely for this provider.', 'Une clé est enregistrée en sécurité pour ce fournisseur.') : tr(preferences, 'The key is stored in OS secure storage, never in project notes.', 'La clé est stockée dans le coffre sécurisé du système, jamais dans les notes du projet.'),
                     ),
                   ),
                   if (status != null) ...<Widget>[
                     const SizedBox(height: 12),
-                    Text(status!,
-                        style: TextStyle(
-                            color: statusIsError
-                                ? Theme.of(dialogContext).colorScheme.error
-                                : Theme.of(dialogContext).colorScheme.primary)),
+                    Text(status!, style: TextStyle(color: statusIsError ? Theme.of(dialogContext).colorScheme.error : Theme.of(dialogContext).colorScheme.primary)),
                   ],
-                  if (busy)
-                    const Padding(
-                        padding: EdgeInsets.only(top: 12),
-                        child: LinearProgressIndicator()),
+                  if (busy) const Padding(padding: EdgeInsets.only(top: 12), child: LinearProgressIndicator()),
                 ],
               ),
             ),
           ),
           actions: <Widget>[
-            TextButton(
-              onPressed: busy ? null : () => Navigator.pop(dialogContext),
-              child: Text(tr(preferences, 'Close', 'Fermer')),
-            ),
+            TextButton(onPressed: busy ? null : () => Navigator.pop(dialogContext), child: Text(tr(preferences, 'Close', 'Fermer'))),
             TextButton(
               onPressed: busy
                   ? null
@@ -872,27 +682,20 @@ Future<void> _configureAiKey(
                       });
                       try {
                         if (modelController.text.trim().isEmpty) {
-                          throw StateError(tr(
-                              preferences,
-                              'Enter a model identifier.',
-                              'Saisissez l’identifiant du modèle.'));
+                          throw StateError(tr(preferences, 'Enter a model identifier.', 'Saisissez l’identifiant du modèle.'));
                         }
                         if (keyController.text.trim().isNotEmpty) {
                           await vault.saveKey(provider.id, keyController.text);
                           keyExists = true;
                         }
-                        await ai.testConnection(
-                            provider: provider, model: modelController.text);
+                        await ai.testConnection(provider: provider, model: modelController.text);
                         preferences.aiProvider = provider.id;
                         preferences.aiModel = modelController.text.trim();
                         await preferences.save();
                         onSettingsChanged();
                         if (dialogContext.mounted) {
                           setDialogState(() {
-                            status = tr(
-                                preferences,
-                                'Connection successful. Your provider and model are ready.',
-                                'Connexion réussie. Le fournisseur et le modèle sont prêts.');
+                            status = tr(preferences, 'Connection successful.', 'Connexion réussie.');
                             statusIsError = false;
                           });
                         }
@@ -909,8 +712,7 @@ Future<void> _configureAiKey(
                         }
                       }
                     },
-              child: Text(
-                  tr(preferences, 'Test connection', 'Tester la connexion')),
+              child: Text(tr(preferences, 'Test connection', 'Tester la connexion')),
             ),
             FilledButton(
               onPressed: busy
@@ -918,20 +720,14 @@ Future<void> _configureAiKey(
                   : () async {
                       try {
                         if (modelController.text.trim().isEmpty) {
-                          throw StateError(tr(
-                              preferences,
-                              'Enter a model identifier.',
-                              'Saisissez l’identifiant du modèle.'));
+                          throw StateError(tr(preferences, 'Enter a model identifier.', 'Saisissez l’identifiant du modèle.'));
                         }
                         if (keyController.text.trim().isNotEmpty) {
                           await vault.saveKey(provider.id, keyController.text);
                           keyExists = true;
                         }
                         if (!keyExists) {
-                          throw StateError(tr(
-                              preferences,
-                              'Paste and save an API key first.',
-                              'Collez et enregistrez d’abord une clé API.'));
+                          throw StateError(tr(preferences, 'Paste and save an API key first.', 'Collez et enregistrez d’abord une clé API.'));
                         }
                         preferences.aiProvider = provider.id;
                         preferences.aiModel = modelController.text.trim();
@@ -939,11 +735,7 @@ Future<void> _configureAiKey(
                         onSettingsChanged();
                         if (dialogContext.mounted) Navigator.pop(dialogContext);
                         if (context.mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                              content: Text(tr(
-                                  preferences,
-                                  'AI settings saved. Test the connection before use.',
-                                  'Paramètres IA enregistrés. Testez la connexion avant utilisation.'))));
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(tr(preferences, 'AI settings saved.', 'Paramètres IA enregistrés.'))));
                         }
                       } catch (error) {
                         if (dialogContext.mounted) {
@@ -958,8 +750,7 @@ Future<void> _configureAiKey(
             ),
             if (keyExists)
               IconButton(
-                tooltip: tr(preferences, 'Delete saved key',
-                    'Supprimer la clé enregistrée'),
+                tooltip: tr(preferences, 'Delete saved key', 'Supprimer la clé enregistrée'),
                 onPressed: busy
                     ? null
                     : () async {
@@ -969,10 +760,7 @@ Future<void> _configureAiKey(
                           keyController.clear();
                           if (dialogContext.mounted) {
                             setDialogState(() {
-                              status = tr(
-                                  preferences,
-                                  'Saved key deleted from secure storage.',
-                                  'Clé supprimée du stockage sécurisé.');
+                              status = tr(preferences, 'Saved key deleted.', 'Clé supprimée.');
                               statusIsError = false;
                             });
                           }
@@ -994,5 +782,4 @@ Future<void> _configureAiKey(
   );
   keyController.dispose();
   modelController.dispose();
-  ai.close();
 }

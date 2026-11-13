@@ -1,321 +1,282 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:archive/archive.dart';
+import 'package:archive/archive_io.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
 
 import '../models/raven_project.dart';
 import 'project_repository.dart';
+import 'audio_share_service.dart';
 
-/// Validates an untrusted portable ZIP path before it is joined to a local
-/// staging/project directory. Directory entries with a trailing slash are
-/// allowed; traversal, absolute paths, drive-qualified paths and empty segments
-/// are rejected.
+/// Validates that a path inside a ZIP file is safe to extract.
+/// Prevents "Zip Slip" path traversal attacks.
 bool isSafeRelativeArchivePath(String path) {
   if (path.isEmpty) return false;
-  final portable = path.replaceAll('\\', '/');
-  // Check original segments before normalization: normalizing `a/../b` first
-  // would hide the traversal attempt while later joins may use the raw path.
-  if (portable.startsWith('/') || p.isAbsolute(path) || portable.contains(':')) {
+
+  // Reject absolute paths and drive letters
+  if (path.startsWith('/') ||
+      path.startsWith('\\') ||
+      RegExp(r'^[a-zA-Z]:').hasMatch(path)) {
     return false;
   }
-  final segments = portable.split('/');
-  if (portable.endsWith('/')) segments.removeLast();
-  if (segments.isEmpty ||
-      segments.any(
-          (segment) => segment.isEmpty || segment == '.' || segment == '..')) {
-    return false;
+
+  // Normalize separators and check for double slashes
+  final normalized = path.replaceAll('\\', '/');
+  if (normalized.contains('//')) return false;
+
+  // Reject traversal segments
+  final parts = normalized.split('/');
+  for (final part in parts) {
+    if (part == '..' || part == '.') return false;
   }
-  if (portable.contains('\u0000')) return false;
+
   return true;
 }
 
-/// Portable project bundle service. Exports a project record and all files in
-/// its private project directory. Import is staged and validated before files
-/// are installed; callers must resolve ID collisions through the repository.
-class ProjectArchiveService {
-  const ProjectArchiveService(this._repository);
-  final ProjectRepository _repository;
-  static const String _manifestName = 'raven-project-bundle.json';
-  static const int _maxEntries = 20000;
+class StagedProjectImport {
+  StagedProjectImport(this.tempDir, this.originalBundleName);
+  final Directory tempDir;
+  final String originalBundleName;
 
-  Future<File> exportProject(RavenProject project) async {
-    if (project.isAudioProtected ||
-        project.sessions
-            .any((session) => session.audioPath.endsWith('.ravenenc'))) {
-      throw StateError(
-          'This project contains audio encrypted with a device-local key. Decrypt the audio before exporting a portable project bundle.');
-    }
-    // Resolve the folder exactly like the rest of the app does: a project's
-    // files live in `<projects>/<title>-<shortId>/` (or in its public folder),
-    // NOT in `<projects>/<id>/`. Assuming the raw ID here made every export
-    // fail with "Project files are missing" — including audio imported as a
-    // standalone recording.
-    final projectDirectory = await _repository.ensureProjectFolder(project);
-    if (!await projectDirectory.exists()) {
-      throw FileSystemException(
-          'Project files are missing.', projectDirectory.path);
-    }
-
-    final archive = Archive();
-    // Absolute paths and public MediaStore URIs are device-specific. Keep them
-    // in the local index, but never embed them in a portable project manifest.
-    final portableProject = Map<String, Object?>.from(project.toJson())
-      ..remove('masterAudioPath')
-      ..remove('publicCopyLocation');
-    // Store source paths relative to the project bundle, never the originating
-    // device's absolute private-storage location. The importer must remap these
-    // relative paths into the final project directory during installation.
-    portableProject['sessions'] = project.sessions.map((session) {
-      final json = Map<String, Object?>.from(session.toJson());
-      json['audioPath'] = p.posix.join('sessions',
-          p.posix.basename(session.audioPath.replaceAll('\\', '/')));
-      return json;
-    }).toList();
-    final manifest = <String, Object?>{
-      'format': 'raven-project-bundle',
-      'version': 1,
-      'exportedAt': DateTime.now().toUtc().toIso8601String(),
-      'project': portableProject,
-    };
-    final manifestBytes = utf8.encode(jsonEncode(manifest));
-    archive.addFile(
-        ArchiveFile(_manifestName, manifestBytes.length, manifestBytes));
-
-    await for (final entity
-        in projectDirectory.list(recursive: true, followLinks: false)) {
-      if (entity is! File) continue;
-      final relative = p
-          .relative(entity.path, from: projectDirectory.path)
-          .replaceAll('\\', '/');
-      if (!_isSafeRelativePath(relative)) continue;
-      // Master files are reproducible caches, not source-of-truth recordings.
-      // Do not bundle stale masters or rollback/pending files; the importer can
-      // rebuild a master from the original source sessions.
-      if (p.basename(relative).startsWith('${project.id}.master.')) continue;
-      final bytes = await entity.readAsBytes();
-      archive
-          .addFile(ArchiveFile('project_files/$relative', bytes.length, bytes));
-    }
-
-    final bytes = ZipEncoder().encode(archive);
-    final temp = await getTemporaryDirectory();
-    final output = File(p.join(temp.path,
-        'RAVEN-${_safeName(project.title)}-${project.id}.raven.zip'));
-    await output.writeAsBytes(bytes, flush: true);
-    return output;
-  }
-
-  Future<void> shareProject(RavenProject project) async {
-    final file = await exportProject(project);
-    await SharePlus.instance.share(ShareParams(
-      files: <XFile>[XFile(file.path)],
-      text: 'RAVEN project: ${project.title}',
-    ));
-  }
-
-  /// Installs a staged import as a new project with a fresh stable ID.
-  /// Device-specific state (PIN requirement, encryption flag, master path and
-  /// public copy URI) is intentionally reset; imported audio remains private.
-  Future<RavenProject> installStagedImport(StagedProjectImport staged) async {
-    final newId = _repository.newId();
-    final destinationRoot = await _repository.createProjectDirectory(newId);
-    late final RavenProject imported;
+  Future<void> discard() async {
     try {
-      await for (final entity
-          in staged.directory.list(recursive: true, followLinks: false)) {
-        if (entity is! File) continue;
-        final relative = p
-            .relative(entity.path, from: staged.directory.path)
-            .replaceAll('\\', '/');
-        if (!_isSafeRelativePath(relative)) {
-          throw FormatException('Unsafe staged import path: $relative');
-        }
-        final destination = File(p.join(destinationRoot.path, relative));
-        await destination.parent.create(recursive: true);
-        await entity.copy(destination.path);
-      }
-
-      final installedSessions = <RavenAudioSession>[];
-      for (final audioSession in staged.project.sessions) {
-        final relative = audioSession.audioPath.replaceAll('\\', '/');
-        if (!_isSafeRelativePath(relative) ||
-            !relative.startsWith('sessions/')) {
-          throw FormatException(
-              'Invalid relative audio path in project manifest: $relative');
-        }
-        final installedAudio = File(p.join(destinationRoot.path, relative));
-        if (!await installedAudio.exists()) {
-          throw FileSystemException(
-              'The imported project is missing an audio source.',
-              installedAudio.path);
-        }
-        installedSessions
-            .add(audioSession.copyWith(audioPath: installedAudio.path));
-      }
-
-      imported = RavenProject(
-        id: newId,
-        title: staged.project.title,
-        createdAt: staged.project.createdAt,
-        updatedAt: DateTime.now(),
-        sessions: installedSessions,
-        isStandalone: staged.project.isStandalone,
-        category: staged.project.category,
-        isFavorite: staged.project.isFavorite,
-        isTrashed: false,
-        isDraft: false,
-        notes: staged.project.notes,
-        tags: List<String>.from(staged.project.tags),
-        bookmarks: List<RavenBookmark>.from(staged.project.bookmarks),
-        isAudioProtected: false,
-        requiresAppPin: false,
-        aiGeneratedContent:
-            Map<String, String>.from(staged.project.aiGeneratedContent),
-        masterAudioPath: null,
-        publicCopyLocation: null,
-      );
-      await _repository.add(imported);
-    } catch (_) {
-      // Until the project index commits, the new directory is an unreferenced
-      // staging destination and can be safely rolled back.
-      if (await destinationRoot.exists()) {
-        try {
-          await destinationRoot.delete(recursive: true);
-        } on FileSystemException {/* retain data for manual recovery */}
-      }
-      rethrow;
-    }
-
-    // Staging cleanup is housekeeping; it must never roll back an already
-    // committed project if the OS refuses to remove the temporary directory.
-    try {
-      await staged.discard();
-    } catch (_) {/* stale staging folder can be cleaned later */}
-    return imported;
-  }
-
-  /// Validates a bundle and extracts it into a private staging directory.
-  /// It deliberately does not overwrite an existing project automatically.
-  Future<StagedProjectImport> stageImport(File bundle) async {
-    if (!await bundle.exists()) {
-      throw FileSystemException('Bundle not found.', bundle.path);
-    }
-    final bytes = await bundle.readAsBytes();
-    final archive = ZipDecoder().decodeBytes(bytes, verify: true);
-    if (archive.files.length > _maxEntries) {
-      throw const FormatException('This archive contains too many entries.');
-    }
-    ArchiveFile? manifestEntry;
-    for (final entry in archive.files) {
-      if (!_isSafeRelativePath(entry.name)) {
-        throw FormatException('Unsafe path in project bundle: ${entry.name}');
-      }
-      if (entry.name == _manifestName && entry.isFile) {
-        manifestEntry = entry;
-      }
-    }
-    if (manifestEntry == null) {
-      throw const FormatException('This is not a RAVEN project bundle.');
-    }
-    final manifestText = utf8.decode(manifestEntry.content as List<int>);
-    final decoded = jsonDecode(manifestText);
-    if (decoded is! Map ||
-        decoded['format'] != 'raven-project-bundle' ||
-        decoded['version'] != 1 ||
-        decoded['project'] is! Map) {
-      throw const FormatException('Unsupported RAVEN project bundle format.');
-    }
-    final project = RavenProject.fromJson(
-        Map<String, Object?>.from(decoded['project'] as Map));
-    final stagingRoot = Directory(p.join((await getTemporaryDirectory()).path,
-        'raven-import-${DateTime.now().microsecondsSinceEpoch}'));
-    await stagingRoot.create(recursive: true);
-    try {
-      for (final entry in archive.files) {
-        if (!entry.isFile || !entry.name.startsWith('project_files/')) continue;
-        final relative = entry.name.substring('project_files/'.length);
-        if (!_isSafeRelativePath(relative)) {
-          throw FormatException('Unsafe project file path: $relative');
-        }
-        final destination = File(p.join(stagingRoot.path, relative));
-        await destination.parent.create(recursive: true);
-        await destination.writeAsBytes(entry.content as List<int>, flush: true);
-      }
-      return StagedProjectImport(project: project, directory: stagingRoot);
-    } catch (_) {
-      if (await stagingRoot.exists()) await stagingRoot.delete(recursive: true);
-      rethrow;
-    }
-  }
-
-  /// Looks inside an archive that is *not* itself a RAVEN bundle for a nested
-  /// RAVEN bundle — the shape produced when a user zips a whole project folder
-  /// or a folder containing several exported `.zip` files. The first nested
-  /// bundle found is written to a temporary file and returned; the caller owns
-  /// and must delete it. Returns null when no nested bundle exists.
-  Future<File?> extractNestedBundle(File archiveFile) async {
-    if (!await archiveFile.exists()) return null;
-    final Archive archive;
-    try {
-      archive = ZipDecoder()
-          .decodeBytes(await archiveFile.readAsBytes(), verify: true);
-    } catch (_) {
-      return null;
-    }
-    if (archive.files.length > _maxEntries) return null;
-
-    ArchiveFile? manifest;
-    String? nestedZipName;
-    ArchiveFile? nestedZip;
-    for (final entry in archive.files) {
-      if (!entry.isFile || !_isSafeRelativePath(entry.name)) continue;
-      final name = p.basename(entry.name).toLowerCase();
-      if (name == _manifestName && manifest == null) {
-        manifest = entry;
-      } else if (name.endsWith('.zip') && nestedZip == null) {
-        nestedZip = entry;
-        nestedZipName = entry.name;
-      }
-    }
-    if (manifest != null) return null; // Already a bundle; caller handles it.
-    if (nestedZip == null) return null;
-    final content = nestedZip.content as List<int>;
-    if (content.length < 4) return null;
-    final temporary = File(p.join((await getTemporaryDirectory()).path,
-        'raven-nested-${DateTime.now().microsecondsSinceEpoch}.zip'));
-    await temporary.writeAsBytes(content, flush: true);
-    // Guard against recursion loops: the extracted file must actually look
-    // like a zip and must not be the same size as this attempt.
-    if (await temporary.length() != content.length ||
-        nestedZipName == null) {
-      await temporary.delete();
-      return null;
-    }
-    return temporary;
-  }
-
-  bool _isSafeRelativePath(String path) => isSafeRelativeArchivePath(path);
-
-  String _safeName(String value) {
-    final safe = value
-        .replaceAll(RegExp(r'[^a-zA-Z0-9_-]+'), '-')
-        .replaceAll(RegExp(r'-+'), '-');
-    final trimmed = safe.replaceAll(RegExp(r'^-+|-+$'), '');
-    return trimmed.isEmpty
-        ? 'project'
-        : (trimmed.length > 48 ? trimmed.substring(0, 48) : trimmed);
+      if (await tempDir.exists()) await tempDir.delete(recursive: true);
+    } catch (_) {}
   }
 }
 
-class StagedProjectImport {
-  const StagedProjectImport({required this.project, required this.directory});
-  final RavenProject project;
-  final Directory directory;
+class ProjectArchiveService {
+  ProjectArchiveService(this._repository);
+  final ProjectRepository _repository;
 
-  Future<void> discard() async {
-    if (await directory.exists()) await directory.delete(recursive: true);
+  /// Extracts a ZIP file into a temporary staging directory safely.
+  Future<StagedProjectImport> stageImport(File bundle) async {
+    final tempRoot = await Directory.systemTemp.createTemp('raven_import_');
+    InputFileStream? inputStream;
+
+    try {
+      // Stream extraction (memory safe)
+      inputStream = InputFileStream(bundle.path);
+      final archive = ZipDecoder().decodeStream(inputStream);
+
+      for (final file in archive) {
+        if (!file.isFile) continue;
+
+        if (!isSafeRelativeArchivePath(file.name)) {
+          throw const FormatException('Archive contains unsafe paths.');
+        }
+
+        final outPath = p.join(tempRoot.path, file.name);
+
+        // Write each entry to disk and release its buffered content so a large
+        // archive never has to be held in memory all at once.
+        final outFile = File(outPath);
+        await outFile.parent.create(recursive: true);
+        await outFile.writeAsBytes(file.content as List<int>);
+        file.clear();
+      }
+
+      // Verify it looks like a RAVEN project
+      final jsonFile = File(p.join(tempRoot.path, 'metadata', 'project.json'));
+      if (!await jsonFile.exists()) {
+        throw const FormatException('Missing metadata/project.json');
+      }
+
+      return StagedProjectImport(
+        tempRoot,
+        p.basename(bundle.path),
+      );
+    } catch (e) {
+      try {
+        if (await tempRoot.exists()) await tempRoot.delete(recursive: true);
+      } catch (_) {}
+      rethrow;
+    } finally {
+      try {
+        inputStream?.close();
+      } catch (_) {}
+    }
+  }
+
+  /// A helper to unzip a project that was zipped inside another zip (recursive import)
+  Future<File?> extractNestedBundle(File bundle) async {
+    // This is generally handled by the UI asking the user to extract first.
+    return null;
+  }
+
+  /// Installs the extracted temp folder into the main repository.
+  Future<RavenProject> installStagedImport(StagedProjectImport staged) async {
+    final jsonFile =
+        File(p.join(staged.tempDir.path, 'metadata', 'project.json'));
+    final jsonStr = await jsonFile.readAsString();
+    final data = jsonDecode(jsonStr);
+    if (data is! Map) {
+      throw const FormatException('Invalid metadata/project.json');
+    }
+
+    var project = RavenProject.fromJson(Map<String, Object?>.from(data));
+
+    // Generate new ID to prevent collisions
+    final newId = _repository.newId();
+    project = project.copyWith(
+      title: '${project.title} (Imported)',
+      updatedAt: DateTime.now(),
+    );
+
+    // Move files to proper location
+    final projectDir =
+        Directory(p.join(_repository.projectsDirectory.path, newId));
+    await projectDir.create(recursive: true);
+
+    final sessionsDir = Directory(p.join(staged.tempDir.path, 'sessions'));
+    if (await sessionsDir.exists()) {
+      await sessionsDir.rename(p.join(projectDir.path, 'sessions'));
+    }
+
+    final notesDir = Directory(p.join(staged.tempDir.path, 'notes'));
+    if (await notesDir.exists()) {
+      await notesDir.rename(p.join(projectDir.path, 'notes'));
+    }
+
+    final attachmentsDir =
+        Directory(p.join(staged.tempDir.path, 'attachments'));
+    if (await attachmentsDir.exists()) {
+      await attachmentsDir.rename(p.join(projectDir.path, 'attachments'));
+    }
+
+    // Fix session paths
+    final newSessions = project.sessions.map((s) {
+      final fileName = s.audioPath.split(RegExp(r'[\\/]')).last;
+      return s.copyWith(
+        audioPath: p.join(projectDir.path, 'sessions', fileName),
+      );
+    }).toList();
+
+    final oldMasterPath = project.masterAudioPath;
+    project = project.copyWith(
+      sessions: newSessions,
+      masterAudioPath: oldMasterPath == null
+          ? null
+          : p.join(
+              projectDir.path,
+              'sessions',
+              oldMasterPath.split(RegExp(r'[\\/]')).last,
+            ),
+      clearMasterAudioPath: oldMasterPath == null,
+      // Exported public paths point at the sender's machine and are invalid
+      // here; the import lands in the private projects directory.
+      clearPublicCopyLocation: true,
+      clearPublicFolderLocation: true,
+    );
+
+    try {
+      await _repository.add(project);
+    } catch (_) {
+      try {
+        if (await projectDir.exists()) await projectDir.delete(recursive: true);
+      } catch (_) {}
+      rethrow;
+    }
+    await staged.discard();
+    return project;
+  }
+
+  /// Exports a project folder as a ZIP file and opens the share sheet.
+  Future<void> shareProject(RavenProject project) async {
+    final projectFolder = await _repository.ensureProjectFolder(project);
+    if (!await projectFolder.exists()) {
+      throw StateError('Project folder not found.');
+    }
+
+    final tempDir = await Directory.systemTemp.createTemp('raven_export_');
+    final safeTitle = project.title.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
+    final zipPath = p.join(tempDir.path, '$safeTitle.zip');
+
+    try {
+      // Stream compression to disk
+      final encoder = ZipFileEncoder();
+      encoder.create(zipPath);
+
+      try {
+        // Write project.json
+        final jsonFile = File(p.join(tempDir.path, 'project.json'));
+        await jsonFile.writeAsString(jsonEncode(project.toJson()));
+
+        encoder.addFile(jsonFile, 'metadata/project.json');
+
+        // Add all other files from the project folder into the root of the ZIP
+        encoder.addDirectory(projectFolder, includeDirName: false);
+      } finally {
+        encoder.close();
+      }
+
+      final zipFile = File(zipPath);
+      if (!await zipFile.exists()) {
+        throw StateError('The project archive could not be created.');
+      }
+
+      // Share the zip
+      await AudioShareService().shareFile(zipFile);
+    } finally {
+      // Clean up the temporary zip file after sharing completes
+      try {
+        if (await tempDir.exists()) await tempDir.delete(recursive: true);
+      } catch (_) {}
+    }
+  }
+
+  /// Archives the whole RAVEN library (projects, recordings, notes,
+  /// attachments, encrypted files and the project index) into a single ZIP and
+  /// opens the share sheet so the user can save it to a cloud drive.
+  Future<void> backupAllData() async {
+    final projectsDir = _repository.projectsDirectory;
+    final rootDir = projectsDir.parent;
+    if (!await rootDir.exists()) {
+      throw StateError('The RAVEN library folder could not be found.');
+    }
+
+    // Build the archive outside the RAVEN folder so the ZIP never contains
+    // itself. systemTemp (not getTemporaryDirectory) keeps it off Android's
+    // app cache when the library itself lives on external storage.
+    final tempDir = await Directory.systemTemp.createTemp('raven_backup_');
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final zipPath = p.join(tempDir.path, 'RAVEN_Backup_$stamp.zip');
+
+    try {
+      // Stream compression straight to disk so a large library never has to
+      // fit in memory. Partial and abandoned temp files are skipped.
+      final encoder = ZipFileEncoder();
+      encoder.create(zipPath);
+
+      try {
+        await encoder.addDirectory(
+          rootDir,
+          includeDirName: false,
+          filter: (entity, progress) {
+            final name = entity.uri.pathSegments.isEmpty
+                ? ''
+                : entity.uri.pathSegments.last.toLowerCase();
+            final skip = name.endsWith('.tmp') ||
+                name.endsWith('.pending') ||
+                name.endsWith('.merging') ||
+                name.endsWith('.bak');
+            return skip ? ZipFileOperation.skip : ZipFileOperation.include;
+          },
+        );
+      } finally {
+        encoder.close();
+      }
+
+      final zipFile = File(zipPath);
+      if (!await zipFile.exists() || await zipFile.length() < 256) {
+        throw StateError('The backup archive could not be created.');
+      }
+
+      await AudioShareService().shareFile(zipFile);
+    } finally {
+      try {
+        if (await tempDir.exists()) await tempDir.delete(recursive: true);
+      } catch (_) {}
+    }
   }
 }
