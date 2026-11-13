@@ -13,10 +13,12 @@ import 'package:path_provider/path_provider.dart';
 import '../models/raven_project.dart';
 import '../services/app_preferences.dart';
 import '../services/playback_service.dart';
+import '../services/project_repository.dart';
 
 class StandaloneRecordingScreen extends StatefulWidget {
   const StandaloneRecordingScreen({
     required this.project,
+    required this.repository,
     required this.preferences,
     required this.onResume,
     required this.onCreateProject,
@@ -33,6 +35,7 @@ class StandaloneRecordingScreen extends StatefulWidget {
   });
 
   final RavenProject project;
+  final ProjectRepository repository;
   final AppPreferences preferences;
   final VoidCallback onResume;
   final VoidCallback onCreateProject;
@@ -161,6 +164,19 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
       if (mounted) setState(() => _loading = false);
       return;
     }
+    
+    // CRITICAL FIX: Refresh the project from the repository to get the latest file path.
+    // The background encoder may have swapped the .wav file for an .mp3 or .flac.
+    final latest = widget.repository.projectById(_currentProject.id);
+    if (latest != null) {
+      _currentProject = latest;
+      _title = _currentProject.title;
+      _isProtected = _currentProject.isAudioProtected;
+      _requiresPin = _currentProject.requiresAppPin;
+      _publicCopyLocation = _currentProject.publicFolderLocation ??
+          _currentProject.publicCopyLocation;
+    }
+
     if (_loadingInProgress) return;
     _loadingInProgress = true;
     if (mounted) {
@@ -243,12 +259,6 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
     };
   }
 
-  /// Codec args for the FFmpeg amplify pass, at the session's own bitrate.
-  ///
-  /// - WAV: pcm_s16le, no bitrate (lossless PCM).
-  /// - FLAC: flac, no bitrate (lossless).
-  /// - MP3: libmp3lame at `bitRate` from the session.
-  /// - M4A: aac at `bitRate` from the session.
   String _boostCodec(String ext, int bitRate) {
     final clamped = bitRate.clamp(64000, 320000);
     return switch (ext) {
@@ -331,7 +341,7 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
         } catch (_) {}
       }
 
-      final codec = _boostCodec(ext, session.bitRate); // BITRATE
+      final codec = _boostCodec(ext, session.bitRate);
       final sampleRate = session.sampleRate > 0 ? session.sampleRate : 44100;
       final command = '-hide_banner -nostdin -y '
           '-i "${source.path}" '
@@ -341,8 +351,10 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
 
       var ffSession = await FFmpegKit.execute(command);
       var code = await ffSession.getReturnCode();
+      
+      // FIX: Use libshine for the fallback, as `-c:a mp3` is not a valid FFmpeg encoder.
       if (!ReturnCode.isSuccess(code) && command.contains('-c:a libmp3lame')) {
-        final fallbackCommand = command.replaceFirst('-c:a libmp3lame', '-c:a mp3');
+        final fallbackCommand = command.replaceFirst('-c:a libmp3lame', '-c:a libshine');
         ffSession = await FFmpegKit.execute(fallbackCommand);
         code = await ffSession.getReturnCode();
       }
@@ -466,8 +478,6 @@ class _StandaloneRecordingScreenState extends State<StandaloneRecordingScreen> {
         }
       }
 
-      // Format and bitrate are preserved from the session — copyWith keeps
-      // bitRate as-is (the source audio was already encoded at that tier).
       final updatedSession = session.copyWith(
         audioPath: newPath,
         durationMs: newDurationMs,

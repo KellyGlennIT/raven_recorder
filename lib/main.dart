@@ -589,17 +589,24 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
         try {
           await _encoder.waitForProject(newProject.id);
         } catch (_) {}
-        try {
-          await _applyVisibilitySilently(newProject, visible: true);
-        } catch (error) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text(tr(
-                widget.preferences,
-                'Recording saved privately — could not publish: $error',
-                'Enregistrement sauvegardé en privé — publication impossible : $error',
-              )),
-            ));
+        
+        // CRITICAL FIX: Re-fetch the project. The background encoder just
+        // finished and changed the path from .wav to .mp3/.flac. If we use
+        // the old `newProject` object, we will look for the deleted .wav file!
+        final refreshedProject = widget.repository.projectById(newProject.id);
+        if (refreshedProject != null) {
+          try {
+            await _applyVisibilitySilently(refreshedProject, visible: true);
+          } catch (error) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                content: Text(tr(
+                  widget.preferences,
+                  'Recording saved privately — could not publish: $error',
+                  'Enregistrement sauvegardé en privé — publication impossible : $error',
+                )),
+              ));
+            }
           }
         }
       }
@@ -1095,33 +1102,37 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
     }
     if (!mounted) return;
 
-    final isStandalone = project.isStandalone && !project.isDraft;
+    // CRITICAL FIX: Always pass the freshest project state so we don't open
+    // a screen pointing to a deleted .wav file.
+    final freshProject = _fresh(project);
+    final isStandalone = freshProject.isStandalone && !freshProject.isDraft;
 
     await navigator.push<void>(
       MaterialPageRoute<void>(
         builder: (_) => isStandalone
             ? StandaloneRecordingScreen(
-                project: project,
+                project: freshProject,
+                repository: widget.repository, // <--- ADD THIS LINE
                 preferences: widget.preferences,
                 autoPlay: true,
-                onResume: () => _resumeStandaloneFromPlayer(_fresh(project)),
+                onResume: () => _resumeStandaloneFromPlayer(_fresh(freshProject)),
                 onCreateProject: () {
-                  _createProjectFromRecording(_fresh(project),
+                  _createProjectFromRecording(_fresh(freshProject),
                       replaceCurrentRoute: true);
                 },
                 onShare: () async {
-                  await _shareRecording(_fresh(project));
+                  await _shareRecording(_fresh(freshProject));
                 },
-                onRename: (title) => _renameStandalone(_fresh(project), title),
+                onRename: (title) => _renameStandalone(_fresh(freshProject), title),
                 onTogglePin: () async {
-                  await _toggleProjectPin(_fresh(project));
+                  await _toggleProjectPin(_fresh(freshProject));
                 },
                 onToggleEncryption: () async {
-                  await _toggleRecordingProtection(_fresh(project),
+                  await _toggleRecordingProtection(_fresh(freshProject),
                       closeCurrentScreen: true);
                 },
                 onToggleVisibility: () async {
-                  return _toggleRecordingVisibility(_fresh(project));
+                  return _toggleRecordingVisibility(_fresh(freshProject));
                 },
                 onSaveAmplified: (RavenProject updated) async {
                   try {
@@ -1132,11 +1143,11 @@ class _MainShellState extends State<_MainShell> with WidgetsBindingObserver {
                     return false;
                   }
                 },
-                onTrim: () => _trimStandalone(_fresh(project)),
+                onTrim: () => _trimStandalone(_fresh(freshProject)),
                 onOpenDetails: () {},
               )
             : PlayerScreen(
-                project: project,
+                project: freshProject,
                 repository: widget.repository,
                 preferences: widget.preferences,
                 onProjectChanged: (_) => _refreshProjects(),

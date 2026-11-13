@@ -6,6 +6,7 @@ import 'package:raven/models/raven_project.dart';
 import 'package:raven/screens/library_screen.dart';
 import 'package:raven/screens/standalone_recording_screen.dart';
 import 'package:raven/services/app_preferences.dart';
+import 'package:raven/services/project_repository.dart';
 
 void main() {
   setUpAll(() async {
@@ -91,6 +92,7 @@ void main() {
         theme: ThemeData(useMaterial3: true),
         home: StandaloneRecordingScreen(
           project: recording,
+          repository: FakeProjectRepository(), // <--- FIX ADDED HERE
           preferences: AppPreferences(),
           onResume: () {},
           onOpenDetails: () {},
@@ -118,4 +120,13 @@ void main() {
 
     expect(pinToggled, isTrue);
   });
+}
+
+// Minimal mock for testing StandaloneRecordingScreen without needing file system access.
+class FakeProjectRepository implements ProjectRepository {
+  @override
+  RavenProject? projectById(String id) => null;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

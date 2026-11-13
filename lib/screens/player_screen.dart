@@ -207,6 +207,7 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   Future<void> _toggleAudioEncryption() async {
     if (_loading) return;
+    final messenger = ScaffoldMessenger.of(context);
     final enabling = !_project.isAudioProtected;
     String? password;
     SecretKey? key;
@@ -317,6 +318,10 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Future<bool> _loadSelectedSession() async {
+    // Refresh from repository in case the background encoder swapped the file
+    final latest = widget.repository.projectById(_project.id);
+    if (latest != null) _project = latest;
+
     if (mounted) {
       setState(() {
         _loading = true;
@@ -355,7 +360,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         if (_project.isAudioProtected && masterExists) {
           try {
             await File(masterPath).delete();
-          } on FileSystemException {}
+          } on FileSystemException { /* Best-effort cleanup. */ }
         }
         final withoutMaster = _project.copyWith(clearMasterAudioPath: true);
         try {
@@ -1944,7 +1949,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (temporaryPlaintext != null && await temporaryPlaintext.exists()) {
         try {
           await temporaryPlaintext.delete();
-        } on FileSystemException {}
+        } on FileSystemException { /* Best-effort cleanup. */ }
       }
     }
   }
