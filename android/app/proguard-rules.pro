@@ -8,7 +8,8 @@
 
 # share_plus / file_picker use method channels only; nothing to keep.
 
-# Keep the recording foreground service referenced from the manifest.
+# Keep the recording foreground service and the MainActivity method channels
+# referenced from the manifest / invoked by class name from Dart.
 -keep class com.raven.raven.** { *; }
 
 # just_audio_background — AudioService and MediaButtonReceiver are referenced

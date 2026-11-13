@@ -52,6 +52,20 @@ android {
     }
 
     packaging {
+        // The com.antonkarpenko:ffmpeg-kit-audio AAR (pulled in transitively by
+        // ffmpeg_kit_flutter_new_audio) ships x86/x86_64 libraries that `ndk
+        // { abiFilters }` does NOT strip for transitive AAR dependencies. Without
+        // this block the release APK carries unsigned x86_64 FFmpeg natives that
+        // no phone uses (~16 MB wasted). Keep every shipped library SIGNED so the
+        // Android 14+ installer accepts them, and drop the useless architectures.
+        jniLibs {
+            useLegacyPackaging = false
+            keepDebugSymbols += "**/*.so"
+            excludes += listOf(
+                "lib/x86/**",
+                "lib/x86_64/**"
+            )
+        }
         // Only keep the resource-language defaults RAVEN actually uses.
         resources {
             excludes += listOf(
