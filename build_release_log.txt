@@ -1,3 +1,2 @@
-Running Gradle task 'assembleRelease'...                         1015.4s
-√ Built build\app\outputs\flutter-apk\app-release.apk (139.1MB)
-EXITCODE=0  
+Running Gradle task 'assembleRelease'...                        
+Warning: SDK processing. This version only understands SDK XML versions up to 3 but an SDK XML file of version 4 was encountered. This can happen if you use versions of Android Studio and the command-line tools that were released at different times.

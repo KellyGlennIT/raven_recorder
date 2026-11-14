@@ -10,6 +10,34 @@ RAVEN is a Flutter-first audio workspace for recording, organising, reviewing an
 >
 > **License:** RAVEN is distributed under the **GNU General Public License v3.0**. See [License](#license).
 
+### Download the Android APK
+
+**[⬇ Download Raven.apk (release build)](https://www.dropbox.com/scl/fi/m2fvbuz11alzrebv511ie/Raven.apk?rlkey=3ndcd0qlxljylclec52rf4g8u&st=uat0fpuc&dl=1)** — hosted on Dropbox, ~146 MB (arm64-v8a + armeabi-v7a).
+
+| | |
+|---|---|
+| Package | `com.raven.raven` |
+| Version | `0.1.0` (versionCode 1) |
+| Min Android | 8.0 (API 26) |
+| Target Android | 16 (API 36) |
+| ABIs | `arm64-v8a`, `armeabi-v7a` |
+| Size | 145,897,093 bytes (~146 MB) — most of it is the bundled FFmpeg encode/decode libraries |
+| SHA-256 | `42cd214f2d9cb40a86d357d11805eb89eba3838ebb7b7565cd57cb4beffc23d4` |
+| SHA-1 | `00a8ab1f625b27d81983c8260577bf44a07787a2` |
+
+Verify a downloaded copy before installing (PowerShell):
+
+```powershell
+Get-FileHash .\Raven.apk -Algorithm SHA256
+# must print 42CD214F2D9CB40A86D357D11805EB89EBA3838EBB7B7565CD57CB4BEFFC23D4
+```
+
+> ⚠️ **This APK is signed with the Android debug certificate, not a release keystore.** It installs on any device, but it cannot be uploaded to Google Play, and each rebuild signed with a different debug key requires an uninstall before installing over the previous one. See [Release signing](#release-signing-before-publishing) before distributing publicly.
+
+**Installing on a phone:** download the file on the device, then open it from your notifications or Files app. Android will ask you to allow *"Install unknown apps"* for the browser or file manager you used — this is normal for sideloaded APKs, since RAVEN is not yet distributed through Play. The first launch requests microphone permission; recording does not work without it.
+
+Because RAVEN is GPL-3.0, anyone who receives this APK is entitled to the corresponding source code — this repository is that source.
+
 ### Quick build commands
 
 ```powershell
@@ -30,6 +58,7 @@ flutter build windows --release
 
 ## Contents
 
+- [Download the Android APK](#download-the-android-apk)
 - [Who RAVEN is for](#who-raven-is-for)
 - [Everyday scenarios](#everyday-scenarios)
 - [Capability map](#capability-map)
@@ -44,6 +73,7 @@ flutter build windows --release
 - [Engineering references](#engineering-references)
 - [Windows development (Flutter 3.47.5)](#windows-development-flutter-3475)
 - [Android setup notes](#android-setup-notes)
+- [Release signing before publishing](#release-signing-before-publishing)
 - [Recording notifications on Android](#recording-notifications-on-android)
 - [Test plan before release](#test-plan-before-release)
 - [Contributing](#contributing)
@@ -464,6 +494,57 @@ To verify after a release build: start playback, press Home, confirm the media n
 ### Saving notes as `.txt` on Android
 
 Notes are written to the project folder (`projects/<id>/notes/`) and are therefore private to the app. To open them outside RAVEN, use the **Share** action in the confirmation snackbar, or export the project bundle. The `publishDocument` method channel in `MainActivity.kt` can copy a text file into the public `Documents/RAVEN` folder on Android 10+ if you want a user-visible copy; it is not called by default so notes stay inside the project.
+
+## Release signing before publishing
+
+The current `android/app/build.gradle.kts` signs release builds with `signingConfigs.getByName("debug")`. That is deliberate: it lets `flutter run --release` and sideloaded test builds work without extra setup. It is **not** acceptable for distributing RAVEN to other people or uploading to Google Play.
+
+To create a real release key and use it:
+
+```powershell
+keytool -genkey -v -keystore raven-release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias raven
+```
+
+Then create `android/key.properties` (already excluded by `android/.gitignore`) and wire it into `android/app/build.gradle.kts`:
+
+```properties
+storePassword=<your password>
+keyPassword=<your password>
+keyAlias=raven
+storeFile=../raven-release.jks
+```
+
+```kotlin
+// at the top of android/app/build.gradle.kts
+import java.util.Properties
+import java.io.FileInputStream
+
+val keystoreProperties = Properties().apply {
+    val f = rootProject.file("key.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
+android {
+    signingConfigs {
+        create("release") {
+            keyAlias = keystoreProperties.getProperty("keyAlias")
+            keyPassword = keystoreProperties.getProperty("keyPassword")
+            storeFile = keystoreProperties.getProperty("storeFile")?.let { file(it) }
+            storePassword = keystoreProperties.getProperty("storePassword")
+        }
+    }
+    buildTypes {
+        release { signingConfig = signingConfigs.getByName("release") }
+    }
+}
+```
+
+Guards to follow:
+
+- **Never commit** the `.jks` or `key.properties` — losing the key means you can never ship an update to an installed app, and leaking it lets anyone sign a malicious build as RAVEN.
+- Because the current APK uses the debug key, users who install it now must **uninstall before installing** a future properly-signed build. Warn them in release notes.
+- An AAB uploaded to Play must be signed with the upload key you register with Play App Signing; a locally built `--release` APK is for sideloading only.
+- Verify a build before publishing: `apksigner verify --print-certs build\app\outputs\flutter-apk\app-release.apk` should print your key's `CN=...`, not `CN=Android Debug`. `zipalign -c -v 4 <apk>` should report *Verification successful*.
 
 ## Recording notifications on Android
 
