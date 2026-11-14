@@ -10,33 +10,9 @@ RAVEN is a Flutter-first audio workspace for recording, organising, reviewing an
 >
 > **License:** RAVEN is distributed under the **GNU General Public License v3.0**. See [License](#license).
 
-### Download the Android APK
+## Download
 
-**[⬇ Download Raven.apk (release build)](https://www.dropbox.com/scl/fi/m2fvbuz11alzrebv511ie/Raven.apk?rlkey=3ndcd0qlxljylclec52rf4g8u&st=uat0fpuc&dl=1)** — hosted on Dropbox, ~146 MB (arm64-v8a + armeabi-v7a).
-
-| | |
-|---|---|
-| Package | `com.raven.raven` |
-| Version | `0.1.0` (versionCode 1) |
-| Min Android | 8.0 (API 26) |
-| Target Android | 16 (API 36) |
-| ABIs | `arm64-v8a`, `armeabi-v7a` |
-| Size | 145,897,093 bytes (~146 MB) — most of it is the bundled FFmpeg encode/decode libraries |
-| SHA-256 | `42cd214f2d9cb40a86d357d11805eb89eba3838ebb7b7565cd57cb4beffc23d4` |
-| SHA-1 | `00a8ab1f625b27d81983c8260577bf44a07787a2` |
-
-Verify a downloaded copy before installing (PowerShell):
-
-```powershell
-Get-FileHash .\Raven.apk -Algorithm SHA256
-# must print 42CD214F2D9CB40A86D357D11805EB89EBA3838EBB7B7565CD57CB4BEFFC23D4
-```
-
-> ⚠️ **This APK is signed with the Android debug certificate, not a release keystore.** It installs on any device, but it cannot be uploaded to Google Play, and each rebuild signed with a different debug key requires an uninstall before installing over the previous one. See [Release signing](#release-signing-before-publishing) before distributing publicly.
-
-**Installing on a phone:** download the file on the device, then open it from your notifications or Files app. Android will ask you to allow *"Install unknown apps"* for the browser or file manager you used — this is normal for sideloaded APKs, since RAVEN is not yet distributed through Play. The first launch requests microphone permission; recording does not work without it.
-
-Because RAVEN is GPL-3.0, anyone who receives this APK is entitled to the corresponding source code — this repository is that source.
+[⬇ Download RAVEN APK](https://www.dropbox.com/scl/fi/m2fvbuz11alzrebv511ie/Raven.apk?rlkey=3ndcd0qlxljylclec52rf4g8u&st=uat0fpuc&dl=1)
 
 ### Quick build commands
 
@@ -58,7 +34,7 @@ flutter build windows --release
 
 ## Contents
 
-- [Download the Android APK](#download-the-android-apk)
+- [Download](#download)
 - [Who RAVEN is for](#who-raven-is-for)
 - [Everyday scenarios](#everyday-scenarios)
 - [Capability map](#capability-map)
@@ -73,7 +49,6 @@ flutter build windows --release
 - [Engineering references](#engineering-references)
 - [Windows development (Flutter 3.47.5)](#windows-development-flutter-3475)
 - [Android setup notes](#android-setup-notes)
-- [Release signing before publishing](#release-signing-before-publishing)
 - [Recording notifications on Android](#recording-notifications-on-android)
 - [Test plan before release](#test-plan-before-release)
 - [Contributing](#contributing)
